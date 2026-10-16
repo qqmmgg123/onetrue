@@ -57,3 +57,4 @@ key.properties
 .env
 .env.*
 *.pem
+supabase/env.local

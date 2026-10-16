@@ -169,7 +169,7 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                   contentPadding: EdgeInsets.zero,
                   title: const Text('开启静默同步'),
                   subtitle: const Text(
-                    '本地仍是主库；打开 App 后台推拉。当前同步：小区/房间/租户/租约/附加费',
+                    '本地仍是主库；打开 App 后台推拉。当前同步：小区/房间/租户/租约/附加费/账期/抄表/优惠/发票/收款',
                   ),
                   value: _syncEnabled,
                   onChanged: (v) => setState(() => _syncEnabled = v),

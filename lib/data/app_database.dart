@@ -619,7 +619,7 @@ class AppDatabase {
   Future<List<RentPeriod>> periodsForLease(int leaseId) async {
     final rows = await (await database).query(
       'rent_periods',
-      where: 'lease_id = ?',
+      where: 'lease_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId],
       orderBy: 'due_date DESC',
     );
@@ -629,7 +629,7 @@ class AppDatabase {
   Future<List<LeaseExtraItem>> extrasForLease(int leaseId) async {
     final rows = await (await database).query(
       'lease_extras',
-      where: 'lease_id = ?',
+      where: 'lease_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId],
       orderBy: 'sort_order ASC, id ASC',
     );
@@ -647,8 +647,14 @@ class AppDatabase {
 
   Future<void> replaceLeaseExtras(int leaseId, List<LeaseExtraItem> extras) async {
     final db = await database;
+    final gone = DateTime.now().toUtc().toIso8601String();
     await db.transaction((txn) async {
-      await txn.delete('lease_extras', where: 'lease_id = ?', whereArgs: [leaseId]);
+      await txn.update(
+        'lease_extras',
+        {'deleted_at': gone, ..._touchSyncCols()},
+        where: 'lease_id = ? AND deleted_at IS NULL',
+        whereArgs: [leaseId],
+      );
       var i = 0;
       for (final e in extras) {
         final name = e.name.trim();
@@ -671,7 +677,9 @@ class AppDatabase {
         'leases',
         {
           'fixed_extra': sum,
-          'fixed_extra_label': label.length > 40 ? '${label.substring(0, 40)}…' : label,
+          'fixed_extra_label':
+              label.length > 40 ? '${label.substring(0, 40)}…' : label,
+          ..._touchSyncCols(),
         },
         where: 'id = ?',
         whereArgs: [leaseId],
@@ -710,7 +718,11 @@ class AppDatabase {
       for (final row in existing) {
         await txn.update(
           'leases',
-          {'status': 'ended', 'end_date': ymd(DateTime.now())},
+          {
+            'status': 'ended',
+            'end_date': ymd(DateTime.now()),
+            ..._touchSyncCols(),
+          },
           where: 'id = ?',
           whereArgs: [row['id']],
         );
@@ -782,7 +794,7 @@ class AppDatabase {
       final tenantId = old['tenant_id'] as int;
       await txn.update(
         'tenants',
-        {'name': tenantName, 'phone': tenantPhone},
+        {'name': tenantName, 'phone': tenantPhone, ..._touchSyncCols()},
         where: 'id = ?',
         whereArgs: [tenantId],
       );
@@ -797,6 +809,7 @@ class AppDatabase {
           'electric_price': electricPrice ?? old['electric_price'] ?? 0,
           'water_price': waterPrice ?? old['water_price'] ?? 0,
           'gas_price': gasPrice ?? old['gas_price'] ?? 0,
+          ..._touchSyncCols(),
         },
         where: 'id = ?',
         whereArgs: [leaseId],
@@ -810,9 +823,11 @@ class AppDatabase {
               (oldEnd == null ? null : ymd(oldEnd)) ||
           rentDueDay != oldDue;
       if (scheduleChanged) {
-        await txn.delete(
+        final gone = DateTime.now().toUtc().toIso8601String();
+        await txn.update(
           'rent_periods',
-          where: "lease_id = ? AND status != 'paid'",
+          {'deleted_at': gone, ..._touchSyncCols()},
+          where: "lease_id = ? AND status != 'paid' AND deleted_at IS NULL",
           whereArgs: [leaseId],
         );
         await _insertMissingPeriods(
@@ -828,13 +843,13 @@ class AppDatabase {
         // 只改房租：刷新未出单金额，保留账期 id
         final open = await txn.query(
           'rent_periods',
-          where: "lease_id = ? AND status = 'pending'",
+          where: "lease_id = ? AND status = 'pending' AND deleted_at IS NULL",
           whereArgs: [leaseId],
         );
         for (final p in open) {
           await txn.update(
             'rent_periods',
-            {'amount': baseRent},
+            {'amount': baseRent, ..._touchSyncCols()},
             where: 'id = ?',
             whereArgs: [p['id']],
           );
@@ -858,6 +873,7 @@ class AppDatabase {
         'electric_price': electricPrice,
         'water_price': waterPrice,
         'gas_price': gasPrice,
+        ..._touchSyncCols(),
       },
       where: 'id = ?',
       whereArgs: [leaseId],
@@ -875,7 +891,7 @@ class AppDatabase {
     );
     await (await database).update(
       'leases',
-      {'status': 'ended', 'end_date': ymd(end)},
+      {'status': 'ended', 'end_date': ymd(end), ..._touchSyncCols()},
       where: 'id = ?',
       whereArgs: [leaseId],
     );
@@ -896,18 +912,43 @@ class AppDatabase {
       amount: baseRent,
     );
     for (final draft in drafts) {
+      final start = ymd(draft.periodStart);
+      final existing = await txn.query(
+        'rent_periods',
+        where: 'lease_id = ? AND period_start = ?',
+        whereArgs: [leaseId, start],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) {
+        final row = existing.first;
+        final paid = row['status'] == 'paid';
+        // 软删后同起点账期需复活，否则 UNIQUE(lease_id, period_start) 会挡住插入
+        await txn.update(
+          'rent_periods',
+          {
+            'period_end': ymd(draft.periodEnd),
+            'due_date': ymd(draft.dueDate),
+            if (!paid) 'amount': draft.amount,
+            if (!paid) 'status': 'pending',
+            'deleted_at': null,
+            ..._touchSyncCols(),
+          },
+          where: 'id = ?',
+          whereArgs: [row['id']],
+        );
+        continue;
+      }
       await txn.insert(
         'rent_periods',
         {
           'lease_id': leaseId,
-          'period_start': ymd(draft.periodStart),
+          'period_start': start,
           'period_end': ymd(draft.periodEnd),
           'due_date': ymd(draft.dueDate),
           'amount': draft.amount,
           'status': 'pending',
           ..._newSyncCols(),
         },
-        conflictAlgorithm: ConflictAlgorithm.ignore,
       );
     }
   }
@@ -927,6 +968,7 @@ class AppDatabase {
       JOIN properties pr ON pr.id = r.property_id
       JOIN tenants t ON t.id = l.tenant_id
       WHERE p.status IN ('pending', 'invoiced') AND l.status = 'active'
+        AND p.deleted_at IS NULL AND l.deleted_at IS NULL
       ORDER BY p.due_date ASC
     ''');
     return rows
@@ -954,7 +996,7 @@ class AppDatabase {
       final amount = rows.first['amount'] as num;
       await txn.update(
         'rent_periods',
-        {'status': 'paid'},
+        {'status': 'paid', ..._touchSyncCols()},
         where: 'id = ?',
         whereArgs: [periodId],
       );
@@ -963,21 +1005,24 @@ class AppDatabase {
         'amount': amount,
         'paid_at': DateTime.now().toIso8601String(),
         'note': note,
+        ..._newSyncCols(),
       });
     });
   }
 
   Future<void> markUnpaid(int periodId) async {
     final db = await database;
+    final now = DateTime.now().toUtc().toIso8601String();
     await db.transaction((txn) async {
-      await txn.delete(
+      await txn.update(
         'payments',
-        where: 'period_id = ?',
+        {'deleted_at': now, ..._touchSyncCols()},
+        where: 'period_id = ? AND deleted_at IS NULL',
         whereArgs: [periodId],
       );
       await txn.update(
         'rent_periods',
-        {'status': 'pending'},
+        {'status': 'pending', ..._touchSyncCols()},
         where: 'id = ?',
         whereArgs: [periodId],
       );
@@ -997,7 +1042,7 @@ class AppDatabase {
   Future<RentPeriod?> getPeriod(int id) async {
     final rows = await (await database).query(
       'rent_periods',
-      where: 'id = ?',
+      where: 'id = ? AND deleted_at IS NULL',
       whereArgs: [id],
     );
     if (rows.isEmpty) return null;
@@ -1019,7 +1064,7 @@ class AppDatabase {
       JOIN rooms r ON r.id = l.room_id
       JOIN properties pr ON pr.id = r.property_id
       JOIN tenants t ON t.id = l.tenant_id
-      WHERE p.id = ?
+      WHERE p.id = ? AND p.deleted_at IS NULL
     ''', [periodId]);
     if (rows.isEmpty) return null;
     final r = rows.first;
@@ -1090,7 +1135,7 @@ class AppDatabase {
     final db = await database;
     final existing = await db.query(
       'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND period_id = ?',
+      where: 'lease_id = ? AND kind = ? AND period_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId, kind, periodId],
       orderBy: 'recorded_at DESC',
       limit: 1,
@@ -1103,6 +1148,8 @@ class AppDatabase {
           'reading': reading,
           'recorded_at': DateTime.now().toIso8601String(),
           'note': note,
+          'deleted_at': null,
+          ..._touchSyncCols(),
         },
         where: 'id = ?',
         whereArgs: [id],
@@ -1131,21 +1178,29 @@ class AppDatabase {
     final db = await database;
     final prevNote = '上期#$periodId';
 
-    // 清掉本账期本期、本账期上期标签，以及旧版无账期 id 的「上期读数」
-    await db.delete(
-      'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND period_id = ?',
-      whereArgs: [leaseId, kind, periodId],
+    // 软删旧读数，便于同步到远端
+    final gone = DateTime.now().toUtc().toIso8601String();
+    Future<void> softDelete(String where, List<Object?> args) async {
+      await db.update(
+        'meter_readings',
+        {'deleted_at': gone, ..._touchSyncCols()},
+        where: '$where AND deleted_at IS NULL',
+        whereArgs: args,
+      );
+    }
+
+    await softDelete(
+      'lease_id = ? AND kind = ? AND period_id = ?',
+      [leaseId, kind, periodId],
     );
-    await db.delete(
-      'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND note = ?',
-      whereArgs: [leaseId, kind, prevNote],
-    );
-    await db.delete(
-      'meter_readings',
-      where: "lease_id = ? AND kind = ? AND note = '上期读数'",
-      whereArgs: [leaseId, kind],
+    await softDelete('lease_id = ? AND kind = ? AND note = ?', [
+      leaseId,
+      kind,
+      prevNote,
+    ]);
+    await softDelete(
+      "lease_id = ? AND kind = ? AND note = '上期读数'",
+      [leaseId, kind],
     );
 
     var prev = previous;
@@ -1154,6 +1209,7 @@ class AppDatabase {
       final prior = await db.query(
         'meter_readings',
         where: "lease_id = ? AND kind = ? AND recorded_at < ? "
+            "AND deleted_at IS NULL "
             "AND (note IS NULL OR note NOT LIKE '上期#%')",
         whereArgs: [
           leaseId,
@@ -1191,9 +1247,13 @@ class AppDatabase {
   }
 
   Future<void> deleteInvoicesForPeriod(int periodId) async {
-    await (await database).delete(
+    await (await database).update(
       'invoices',
-      where: 'period_id = ?',
+      {
+        'deleted_at': DateTime.now().toUtc().toIso8601String(),
+        ..._touchSyncCols(),
+      },
+      where: 'period_id = ? AND deleted_at IS NULL',
       whereArgs: [periodId],
     );
   }
@@ -1201,7 +1261,7 @@ class AppDatabase {
   Future<List<MeterReading>> recentMeterReadings(int leaseId, {int limit = 20}) async {
     final rows = await (await database).query(
       'meter_readings',
-      where: 'lease_id = ?',
+      where: 'lease_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId],
       orderBy: 'recorded_at DESC',
       limit: limit,
@@ -1230,7 +1290,7 @@ class AppDatabase {
     final db = await database;
     final currentRows = await db.query(
       'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND period_id = ?',
+      where: 'lease_id = ? AND kind = ? AND period_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId, kind, period.id],
       orderBy: 'recorded_at DESC',
       limit: 1,
@@ -1242,7 +1302,7 @@ class AppDatabase {
 
     final taggedPrev = await db.query(
       'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND note = ?',
+      where: 'lease_id = ? AND kind = ? AND note = ? AND deleted_at IS NULL',
       whereArgs: [leaseId, kind, '上期#${period.id}'],
       orderBy: 'id DESC',
       limit: 1,
@@ -1258,6 +1318,7 @@ class AppDatabase {
     final prevRows = await db.query(
       'meter_readings',
       where: "lease_id = ? AND kind = ? AND recorded_at < ? "
+          "AND deleted_at IS NULL "
           "AND (note IS NULL OR note NOT LIKE '上期#%')",
       whereArgs: [leaseId, kind, currentAt],
       orderBy: 'recorded_at DESC',
@@ -1278,11 +1339,38 @@ class AppDatabase {
     String note = '',
   }) async {
     final db = await database;
+    final existing = await db.query(
+      'period_adjustments',
+      where: "period_id = ? AND type = 'discount'",
+      whereArgs: [periodId],
+      limit: 1,
+    );
     if (amount <= 0) {
-      await db.delete(
+      if (existing.isNotEmpty) {
+        await db.update(
+          'period_adjustments',
+          {
+            'deleted_at': DateTime.now().toUtc().toIso8601String(),
+            'amount': 0,
+            ..._touchSyncCols(),
+          },
+          where: 'id = ?',
+          whereArgs: [existing.first['id']],
+        );
+      }
+      return;
+    }
+    if (existing.isNotEmpty) {
+      await db.update(
         'period_adjustments',
-        where: "period_id = ? AND type = 'discount'",
-        whereArgs: [periodId],
+        {
+          'amount': amount,
+          'note': note,
+          'deleted_at': null,
+          ..._touchSyncCols(),
+        },
+        where: 'id = ?',
+        whereArgs: [existing.first['id']],
       );
       return;
     }
@@ -1293,15 +1381,15 @@ class AppDatabase {
         'type': 'discount',
         'amount': amount,
         'note': note,
+        ..._newSyncCols(),
       },
-      conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
   Future<double> discountForPeriod(int periodId) async {
     final rows = await (await database).query(
       'period_adjustments',
-      where: "period_id = ? AND type = 'discount'",
+      where: "period_id = ? AND type = 'discount' AND deleted_at IS NULL",
       whereArgs: [periodId],
       limit: 1,
     );
@@ -1312,7 +1400,7 @@ class AppDatabase {
   Future<String> discountNoteForPeriod(int periodId) async {
     final rows = await (await database).query(
       'period_adjustments',
-      where: "period_id = ? AND type = 'discount'",
+      where: "period_id = ? AND type = 'discount' AND deleted_at IS NULL",
       whereArgs: [periodId],
       limit: 1,
     );
@@ -1337,7 +1425,7 @@ class AppDatabase {
   Future<StoredInvoice?> latestInvoiceForPeriod(int periodId) async {
     final rows = await (await database).query(
       'invoices',
-      where: 'period_id = ?',
+      where: 'period_id = ? AND deleted_at IS NULL',
       whereArgs: [periodId],
       orderBy: 'id DESC',
       limit: 1,
@@ -1363,7 +1451,7 @@ class AppDatabase {
   }) async {
     await (await database).update(
       'rent_periods',
-      {'amount': amount, 'status': status},
+      {'amount': amount, 'status': status, ..._touchSyncCols()},
       where: 'id = ?',
       whereArgs: [periodId],
     );
