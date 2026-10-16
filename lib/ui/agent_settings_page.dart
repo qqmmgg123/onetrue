@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../agent/agent_settings.dart';
+import '../sync/sync_settings.dart';
 
 class AgentSettingsPage extends StatefulWidget {
   const AgentSettingsPage({super.key});
@@ -17,8 +19,12 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
   final _asrBaseUrl = TextEditingController();
   final _asrApiKey = TextEditingController();
   final _asrModel = TextEditingController();
+  final _supabaseUrl = TextEditingController();
+  final _supabaseAnon = TextEditingController();
+  final _ownerId = TextEditingController();
   bool _useLlm = false;
   bool _useCloudAsr = true;
+  bool _syncEnabled = false;
   bool _loading = true;
 
   @override
@@ -29,7 +35,9 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
 
   Future<void> _load() async {
     final s = AgentSettings.instance;
+    final sync = SyncSettings.instance;
     await s.load();
+    await sync.load();
     if (!mounted) return;
     setState(() {
       _baseUrl.text = s.baseUrl;
@@ -41,6 +49,10 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
       _asrModel.text = s.asrModel;
       _useLlm = s.useLlm;
       _useCloudAsr = s.useCloudAsr;
+      _syncEnabled = sync.enabled;
+      _supabaseUrl.text = sync.supabaseUrl;
+      _supabaseAnon.text = sync.anonKey;
+      _ownerId.text = sync.ownerId;
       _loading = false;
     });
   }
@@ -54,6 +66,9 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
     _asrBaseUrl.dispose();
     _asrApiKey.dispose();
     _asrModel.dispose();
+    _supabaseUrl.dispose();
+    _supabaseAnon.dispose();
+    _ownerId.dispose();
     super.dispose();
   }
 
@@ -148,6 +163,57 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
                 const SizedBox(height: 24),
+                Text('数据同步（Supabase）',
+                    style: Theme.of(context).textTheme.titleSmall),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('开启静默同步'),
+                  subtitle: const Text(
+                    '本地仍是主库；打开 App 后台推拉。当前同步：小区/房间/租户/租约/附加费',
+                  ),
+                  value: _syncEnabled,
+                  onChanged: (v) => setState(() => _syncEnabled = v),
+                ),
+                TextField(
+                  controller: _supabaseUrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Supabase Project URL',
+                    hintText: 'https://xxxx.supabase.co',
+                  ),
+                ),
+                TextField(
+                  controller: _supabaseAnon,
+                  decoration: const InputDecoration(
+                    labelText: 'anon public Key',
+                    hintText: 'eyJ...',
+                  ),
+                  obscureText: true,
+                ),
+                TextField(
+                  controller: _ownerId,
+                  decoration: const InputDecoration(
+                    labelText: '本机 owner_id（多端请保持一致）',
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: _ownerId.text));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('owner_id 已复制')),
+                      );
+                    },
+                    icon: const Icon(Icons.copy, size: 18),
+                    label: const Text('复制 owner_id'),
+                  ),
+                ),
+                Text(
+                  '在 Supabase SQL Editor 执行仓库里 supabase/schema.sql，'
+                  '再填 URL 与 anon key。多台手机要共享数据时，把同一 owner_id 粘到每台。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 24),
                 FilledButton(
                   onPressed: () async {
                     await AgentSettings.instance.save(
@@ -160,6 +226,12 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                       asrBaseUrl: _asrBaseUrl.text,
                       asrModel: _asrModel.text,
                       asrApiKey: _asrApiKey.text,
+                    );
+                    await SyncSettings.instance.save(
+                      enabled: _syncEnabled,
+                      supabaseUrl: _supabaseUrl.text,
+                      anonKey: _supabaseAnon.text,
+                      ownerId: _ownerId.text,
                     );
                     if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(

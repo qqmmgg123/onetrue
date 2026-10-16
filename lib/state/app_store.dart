@@ -5,6 +5,8 @@ import '../billing/billing_service.dart';
 import '../data/app_database.dart';
 import '../domain/models.dart';
 import '../reminders/reminder_service.dart';
+import '../sync/sync_service.dart';
+import '../sync/sync_settings.dart';
 import '../ui/format.dart';
 
 class AppStore extends ChangeNotifier {
@@ -34,12 +36,25 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
     try {
       await _reminders.init();
+      await SyncSettings.instance.load();
       await reload();
+      // 不挡首屏：后台静默同步
+      // ignore: unawaited_futures
+      silentSync();
     } catch (e) {
       error = e.toString();
       loading = false;
       notifyListeners();
     }
+  }
+
+  /// 打开 App / 手动触发：推本地 dirty + 拉远端更新。
+  Future<SyncReport> silentSync() async {
+    final report = await SyncService(db: _db).syncSilent();
+    if (report.ok && (report.pushed > 0 || report.pulled > 0)) {
+      await reload();
+    }
+    return report;
   }
 
   Future<void> reload() async {

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:uuid/uuid.dart';
 
 import '../agent/agent_models.dart';
 import '../agent/chat_memory.dart';
@@ -10,6 +11,8 @@ import '../billing/bill_models.dart';
 import '../billing/period_generator.dart' hide dateOnly;
 import '../domain/models.dart';
 import '../ui/format.dart';
+
+const _uuid = Uuid();
 
 class MeterPair {
   const MeterPair({required this.previous, required this.current});
@@ -63,7 +66,7 @@ class AppDatabase {
     final path = p.join(dir.path, 'rent_agent.db');
     _db = await openDatabase(
       path,
-      version: 4,
+      version: 5,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -72,11 +75,13 @@ class AppDatabase {
         await _upgradeToV2(db);
         await _upgradeToV3(db);
         await _upgradeToV4(db);
+        await _upgradeToV5(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) await _upgradeToV2(db);
         if (oldVersion < 3) await _upgradeToV3(db);
         if (oldVersion < 4) await _upgradeToV4(db);
+        if (oldVersion < 5) await _upgradeToV5(db);
       },
     );
     return _db!;
@@ -260,8 +265,129 @@ class AppDatabase {
     ''');
   }
 
+  /// 同步元数据：uuid 跨端主键，updated_at/LWW，deleted_at 软删，dirty 待上传。
+  Future<void> _upgradeToV5(Database db) async {
+    const tables = [
+      'properties',
+      'rooms',
+      'tenants',
+      'leases',
+      'lease_extras',
+      'rent_periods',
+      'meter_readings',
+      'period_adjustments',
+      'invoices',
+      'payments',
+    ];
+    for (final t in tables) {
+      await _tryExec(db, 'ALTER TABLE $t ADD COLUMN uuid TEXT');
+      await _tryExec(db, 'ALTER TABLE $t ADD COLUMN updated_at TEXT');
+      await _tryExec(db, 'ALTER TABLE $t ADD COLUMN deleted_at TEXT');
+      await _tryExec(
+        db,
+        'ALTER TABLE $t ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1',
+      );
+    }
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final t in tables) {
+      final rows = await db.query(t, columns: ['id', 'uuid']);
+      for (final r in rows) {
+        final id = r['id'] as int;
+        final existing = r['uuid'] as String?;
+        await db.update(
+          t,
+          {
+            if (existing == null || existing.isEmpty) 'uuid': _uuid.v4(),
+            'updated_at': now,
+            'dirty': 1,
+          },
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+      await _tryExec(
+        db,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_${t}_uuid ON $t(uuid)',
+      );
+    }
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    ''');
+  }
+
+  Future<void> _tryExec(Database db, String sql) async {
+    try {
+      await db.execute(sql);
+    } catch (_) {}
+  }
+
+  Map<String, Object?> _newSyncCols() => {
+        'uuid': _uuid.v4(),
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+        'dirty': 1,
+      };
+
+  Map<String, Object?> _touchSyncCols() => {
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+        'dirty': 1,
+      };
+
+  Future<void> markSynced(String table, int localId) async {
+    await (await database).update(
+      table,
+      {'dirty': 0},
+      where: 'id = ?',
+      whereArgs: [localId],
+    );
+  }
+
+  Future<String?> getSyncState(String key) async {
+    final rows = await (await database).query(
+      'sync_state',
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['value'] as String?;
+  }
+
+  Future<void> setSyncState(String key, String value) async {
+    await (await database).insert(
+      'sync_state',
+      {'key': key, 'value': value},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, Object?>>> dirtyRows(String table) async {
+    return (await database).query(
+      table,
+      where: 'dirty = 1',
+      orderBy: 'id ASC',
+    );
+  }
+
+  Future<Map<String, Object?>?> rowByUuid(String table, String uuid) async {
+    final rows = await (await database).query(
+      table,
+      where: 'uuid = ?',
+      whereArgs: [uuid],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first;
+  }
+
   Future<List<Property>> listProperties() async {
-    final rows = await (await database).query('properties', orderBy: 'id DESC');
+    final rows = await (await database).query(
+      'properties',
+      where: 'deleted_at IS NULL',
+      orderBy: 'id DESC',
+    );
     return rows
         .map(
           (r) => Property(
@@ -277,11 +403,20 @@ class AppDatabase {
     return (await database).insert('properties', {
       'name': name,
       'address': address,
+      ..._newSyncCols(),
     });
   }
 
   Future<void> deleteProperty(int id) async {
-    await (await database).delete('properties', where: 'id = ?', whereArgs: [id]);
+    await (await database).update(
+      'properties',
+      {
+        'deleted_at': DateTime.now().toUtc().toIso8601String(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   Future<void> updateProperty({
@@ -289,7 +424,7 @@ class AppDatabase {
     required String name,
     String? address,
   }) async {
-    final patch = <String, Object?>{'name': name};
+    final patch = <String, Object?>{'name': name, ..._touchSyncCols()};
     if (address != null) patch['address'] = address;
     await (await database).update(
       'properties',
@@ -303,7 +438,7 @@ class AppDatabase {
     final db = await database;
     final rooms = await db.query(
       'rooms',
-      where: 'property_id = ?',
+      where: 'property_id = ? AND deleted_at IS NULL',
       whereArgs: [propertyId],
       orderBy: 'label COLLATE NOCASE',
     );
@@ -316,7 +451,7 @@ class AppDatabase {
       );
       final leaseRows = await db.query(
         'leases',
-        where: "room_id = ? AND status = 'active'",
+        where: "room_id = ? AND status = 'active' AND deleted_at IS NULL",
         whereArgs: [room.id],
         orderBy: 'id DESC',
         limit: 1,
@@ -344,11 +479,20 @@ class AppDatabase {
     return (await database).insert('rooms', {
       'property_id': propertyId,
       'label': label,
+      ..._newSyncCols(),
     });
   }
 
   Future<void> deleteRoom(int id) async {
-    await (await database).delete('rooms', where: 'id = ?', whereArgs: [id]);
+    await (await database).update(
+      'rooms',
+      {
+        'deleted_at': DateTime.now().toUtc().toIso8601String(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   Future<Room?> getRoom(int id) async {
@@ -452,7 +596,7 @@ class AppDatabase {
   Future<Lease?> activeLeaseForRoom(int roomId) async {
     final rows = await (await database).query(
       'leases',
-      where: "room_id = ? AND status = 'active'",
+      where: "room_id = ? AND status = 'active' AND deleted_at IS NULL",
       whereArgs: [roomId],
       orderBy: 'id DESC',
       limit: 1,
@@ -514,6 +658,7 @@ class AppDatabase {
           'name': name,
           'amount': e.amount,
           'sort_order': e.sortOrder != 0 ? e.sortOrder : i,
+          ..._newSyncCols(),
         });
         i++;
       }
@@ -573,6 +718,7 @@ class AppDatabase {
       final tenantId = await txn.insert('tenants', {
         'name': tenantName,
         'phone': tenantPhone,
+        ..._newSyncCols(),
       });
       final sum = items.fold<double>(0, (a, b) => a + b.amount);
       final label = items.isEmpty
@@ -592,6 +738,7 @@ class AppDatabase {
         'gas_price': gasPrice,
         'fixed_extra': sum,
         'fixed_extra_label': label,
+        ..._newSyncCols(),
       });
       var i = 0;
       for (final e in items) {
@@ -601,6 +748,7 @@ class AppDatabase {
           'name': e.name.trim(),
           'amount': e.amount,
           'sort_order': i++,
+          ..._newSyncCols(),
         });
       }
       await _insertMissingPeriods(txn, leaseId, startDate, endDate, rentDueDay, baseRent);
@@ -757,6 +905,7 @@ class AppDatabase {
           'due_date': ymd(draft.dueDate),
           'amount': draft.amount,
           'status': 'pending',
+          ..._newSyncCols(),
         },
         conflictAlgorithm: ConflictAlgorithm.ignore,
       );
@@ -926,6 +1075,7 @@ class AppDatabase {
       'recorded_at': (recordedAt ?? DateTime.now()).toIso8601String(),
       'period_id': periodId,
       'note': note,
+      ..._newSyncCols(),
     });
   }
 
@@ -1180,6 +1330,7 @@ class AppDatabase {
       'total': total,
       'lines_json': linesJson,
       'issued_at': DateTime.now().toIso8601String(),
+      ..._newSyncCols(),
     });
   }
 

@@ -63,9 +63,24 @@ class _AppShellState extends State<AppShell> {
                     );
                   }
                 }
+              } else if (value == 'sync') {
+                final r = await store.silentSync();
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      r.error == 'sync_disabled'
+                          ? '未开启同步：到对话设置里填 Supabase 并打开开关'
+                          : r.ok
+                              ? '同步完成：上传 ${r.pushed} · 下载 ${r.pulled}'
+                              : '同步失败：${r.error}',
+                    ),
+                  ),
+                );
               }
             },
             itemBuilder: (context) => const [
+              PopupMenuItem(value: 'sync', child: Text('立即同步')),
               PopupMenuItem(value: 'ping', child: Text('8 秒后测试闹钟')),
               PopupMenuItem(value: 'seed', child: Text('填入演示数据')),
             ],
