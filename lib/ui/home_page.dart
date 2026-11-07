@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../domain/models.dart';
 import '../state/app_store.dart';
 import 'bill_page.dart';
+import 'busy.dart';
 import 'format.dart';
 
 class HomePage extends StatelessWidget {
@@ -108,7 +109,13 @@ class DueTile extends StatelessWidget {
         title: Text(
           '${ymdCn(item.period.dueDate)}  ${item.roomLabel}  应收 ${formatYuan(item.period.amount)}',
         ),
-        subtitle: Text('${item.propertyName} · ${item.tenantName} · 点进结算'),
+        subtitle: Text(
+          [
+            item.propertyName,
+            if (item.period.remark.trim().isNotEmpty) item.period.remark.trim(),
+            '点进结算',
+          ].join(' · '),
+        ),
         onTap: () {
           Navigator.of(context).push(
             MaterialPageRoute(
@@ -118,7 +125,11 @@ class DueTile extends StatelessWidget {
         },
         trailing: TextButton(
           onPressed: () async {
-            await store.markPaid(item.period.id);
+            await runBusy(
+              context,
+              message: '正在记账…',
+              task: () => store.markPaid(item.period.id),
+            );
             if (context.mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -17,9 +18,12 @@ import '../agent/agent_tools.dart';
 import '../agent/chat_memory.dart';
 import '../agent/cloud_asr.dart';
 import '../agent/simple_recorder.dart';
+import '../agent/vision_client.dart';
+import '../agent/vosk_asr.dart';
 import '../data/app_database.dart';
 import '../state/app_store.dart';
 import 'agent_settings_page.dart';
+import 'busy.dart';
 
 const _welcomeText = '可以像微信一样随便聊，慢慢把事说清楚就行。\n'
     '例如：\n'
@@ -27,6 +31,7 @@ const _welcomeText = '可以像微信一样随便聊，慢慢把事说清楚就�
     '· 房租两千八，每月 10 号收\n'
     '· 302 电表 1180 到 1234\n'
     '· 这个月心情好，302 少收 200\n'
+    '· 也可点图片：附上电表照片，再说「帮我读出来录入 201」\n'
     '写操作会先让你确认。点右上角「新对话」可开干净会话。';
 
 class ChatPage extends StatefulWidget {
@@ -64,13 +69,17 @@ class _ChatPageState extends State<ChatPage> {
   Timer? _ampTimer;
   bool _systemAsrOk = false;
   bool _useCloudThisHold = false;
-  /// 云端级联失败后，下一次按住改走系统语音（非大模型）。
+  bool _useVoskThisHold = false;
+  /// 云端级联失败后：先强制下一次用离线 Vosk；再失败才系统语音。
+  bool _forceVoskNextHold = false;
   bool _forceSystemNextHold = false;
   String? _recordPath;
   bool _engineStarted = false;
   double _soundLevel = 0; // 0~1，用于脉冲条
   double _peakSound = 0;
   Completer<void>? _engineReady;
+  /// 待发送的附图（发送时再看图理解）
+  File? _pendingImage;
 
   AgentOrchestrator _ensureOrch(AppStore store) {
     return _orch ??= AgentOrchestrator(AgentToolRunner(store));
@@ -96,7 +105,7 @@ class _ChatPageState extends State<ChatPage> {
       if (showError && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('请允许麦克风权限（设置 → 应用 → 收租助手 → 权限）'),
+            content: Text('请允许麦克风权限（设置 → 应用 → 缘初 → 权限）'),
           ),
         );
       }
@@ -118,16 +127,19 @@ class _ChatPageState extends State<ChatPage> {
     if (mounted) setState(() {});
   }
 
-  /// 优先云端级联；云端失败后的下一次强制系统语音。
-  bool get _shouldUseCloudAsr {
-    if (_forceSystemNextHold) return false;
-    return AgentSettings.instance.hasCloudAsr;
-  }
+  /// 有云端 Key 时默认走云端级联；失败后可强制 Vosk / 系统语音。
+  bool get _shouldUseCloudAsr =>
+      AgentSettings.instance.hasCloudAsr &&
+      !_forceVoskNextHold &&
+      !_forceSystemNextHold;
 
   String _voiceUnavailableTip() {
-    return '没有可用的语音识别。请到「对话设置」填写 Groq 和/或硅基流动 Key，'
-        '并开启云端语音；若手机有系统语音也会作为兜底。也可先用键盘。';
+    return '没有可用的语音识别。请在 env.local 配置百度/Groq/SenseVoice，'
+        '或等离线 Vosk 模型下载后重试；也可先用键盘。';
   }
+
+  String get _asrPipelineHint =>
+      '百度→Groq→SenseVoice→离线Vosk→系统语音';
 
   Future<void> _bootstrap() async {
     await AgentSettings.instance.load();
@@ -316,28 +328,98 @@ class _ChatPageState extends State<ChatPage> {
       return;
     }
 
-    _useCloudThisHold = _shouldUseCloudAsr;
-    if (!_useCloudThisHold && !_systemAsrOk) {
+    _useCloudThisHold = false;
+    _useVoskThisHold = false;
+
+    if (_forceVoskNextHold ||
+        (!_shouldUseCloudAsr && !_forceSystemNextHold)) {
+      // 强制 Vosk，或没有云端 Key 时优先试离线
+      if (_forceVoskNextHold || !AgentSettings.instance.hasCloudAsr) {
+        final ok = await _ensureVoskReady();
+        _forceVoskNextHold = false;
+        if (ok) {
+          _useVoskThisHold = true;
+          await _startVoskListen();
+          return;
+        }
+        // 离线失败则继续尝试系统语音
+        _forceSystemNextHold = true;
+      }
+    }
+
+    if (_shouldUseCloudAsr) {
+      _useCloudThisHold = true;
+      await _startCloudRecord();
+      return;
+    }
+
+    if (_systemAsrOk || _forceSystemNextHold) {
       _forceSystemNextHold = false;
+      await _startSystemListen();
+      return;
+    }
+
+    _markEngineReady(false);
+    if (mounted) {
+      setState(() => _listening = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(_voiceUnavailableTip()),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    }
+  }
+
+  Future<bool> _ensureVoskReady() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      if (mounted) {
+        setState(() => _partialVoice = '准备离线识别…');
+      }
+      await VoskAsr.instance.prepare(
+        onProgress: (p, tip) {
+          if (!mounted) return;
+          setState(() => _partialVoice = tip);
+        },
+      );
+      return true;
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('离线模型未就绪：$e'),
+            duration: const Duration(seconds: 6),
+          ),
+        );
+      }
+      return false;
+    }
+  }
+
+  Future<void> _startVoskListen() async {
+    try {
+      await VoskAsr.instance.startListening(
+        onPartial: (t) {
+          if (!mounted || !_listening) return;
+          if (!_engineStarted) _markEngineReady(true);
+          setState(() {
+            _partialVoice = t;
+            _soundLevel = t.isEmpty ? 0.2 : 0.55;
+            if (t.isNotEmpty) _peakSound = 0.5;
+          });
+        },
+      );
+      _markEngineReady(true);
+      _peakSound = 0.3;
+    } catch (e) {
       _markEngineReady(false);
       if (mounted) {
         setState(() => _listening = false);
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(_voiceUnavailableTip()),
-            duration: const Duration(seconds: 5),
-          ),
+          SnackBar(content: Text('无法开始离线识别：$e')),
         );
       }
-      return;
-    }
-
-    if (_useCloudThisHold) {
-      await _startCloudRecord();
-    } else {
-      // 已切到系统语音兜底，用完清掉强制标记
-      _forceSystemNextHold = false;
-      await _startSystemListen();
     }
   }
 
@@ -457,9 +539,35 @@ class _ChatPageState extends State<ChatPage> {
 
     if (_useCloudThisHold) {
       await _finishCloudHold(send: send);
+    } else if (_useVoskThisHold) {
+      await _finishVoskHold(send: send);
     } else {
       await _finishSystemHold(send: send);
     }
+  }
+
+  Future<void> _finishVoskHold({required bool send}) async {
+    final text = await VoskAsr.instance.stopListening();
+    if (!mounted) return;
+    setState(() {
+      _listening = false;
+      _partialVoice = '';
+      _soundLevel = 0;
+      _engineStarted = false;
+      _useVoskThisHold = false;
+    });
+    if (!send) return;
+    if (text.isEmpty) {
+      _forceSystemNextHold = true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('离线未识别出文字。请再按住说一次（将试系统语音），或用键盘'),
+        ),
+      );
+      return;
+    }
+    _input.text = text;
+    await _send();
   }
 
   Future<void> _finishSystemHold({required bool send}) async {
@@ -542,44 +650,26 @@ class _ChatPageState extends State<ChatPage> {
 
     setState(() {
       _transcribing = true;
-      _partialVoice = '正在转写（Groq→SenseVoice）…';
+      _partialVoice = '正在转写…';
     });
     try {
-      final result =
-          await CloudAsr(AgentSettings.instance).transcribeFile(File(path));
+      final result = await CloudAsr(AgentSettings.instance).transcribeFile(
+        File(path),
+        onEngine: (name) {
+          if (!mounted) return;
+          setState(() => _partialVoice = '正在试 $name…');
+        },
+      );
       if (!mounted) return;
       if (result.text.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('云端没有识别出文字，请再说一次')),
-        );
+        _offerVoskFallback('云端没有识别出文字');
         return;
       }
       _input.text = result.text;
       await _send();
     } catch (e) {
       if (!mounted) return;
-      if (_systemAsrOk) {
-        _forceSystemNextHold = true;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '云端未成功（超时/额度/异常），下次按住将用系统语音。\n$e',
-            ),
-            duration: const Duration(seconds: 6),
-          ),
-        );
-      } else {
-        // 无系统语音可调：不再走本地，直接提示键盘
-        _forceSystemNextHold = false;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '云端未成功，且本机无系统语音可用，请用键盘输入。\n$e',
-            ),
-            duration: const Duration(seconds: 6),
-          ),
-        );
-      }
+      _offerVoskFallback('云端级联未成功：$e');
     } finally {
       try {
         File(path).deleteSync();
@@ -593,6 +683,39 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  /// 不阻塞转写结束：先提示再按住，模型在后台预热。
+  void _offerVoskFallback(String reason) {
+    if (!mounted) return;
+    final short = reason.length > 120 ? '${reason.substring(0, 120)}…' : reason;
+    if (Platform.isAndroid) {
+      _forceVoskNextHold = true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('$short\n请再按住说一次（离线识别）；模型会在后台准备'),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+      unawaited(VoskAsr.instance.prepare().catchError((_) {}));
+      return;
+    }
+    if (_systemAsrOk) {
+      _forceSystemNextHold = true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('$short\n请再按住说一次（将用系统语音）'),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('$short\n请用键盘输入。'),
+        duration: const Duration(seconds: 6),
+      ),
+    );
+  }
+
   Widget _voicePulse(BuildContext context) {
     final level = _soundLevel;
     return Padding(
@@ -602,14 +725,16 @@ class _ChatPageState extends State<ChatPage> {
         children: [
             Text(
             _transcribing
-                ? '正在转写（Groq→SenseVoice）…'
+                ? '正在转写（$_asrPipelineHint）…'
                 : _partialVoice.isEmpty
-                    ? ((_engineStarted || _speech.isListening)
+                    ? ((_engineStarted ||
+                            _speech.isListening ||
+                            _useVoskThisHold)
                         ? (_useCloudThisHold
-                            ? '正在录音…松手后 Groq→SenseVoice 转写'
-                            : (_forceSystemNextHold
-                                ? '正在用系统语音听…'
-                                : '正在听，请说话…'))
+                            ? '正在录音…松手后云端转写'
+                            : (_useVoskThisHold
+                                ? '正在用离线 Vosk 听…'
+                                : '正在用系统语音听…'))
                         : '正在打开麦克风…')
                     : '识别中：$_partialVoice',
             style: Theme.of(context).textTheme.bodySmall,
@@ -647,21 +772,120 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  Future<void> _attachImage() async {
+    if (_busy || _transcribing || _sessionId == null) return;
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('从相册选图'),
+              subtitle: const Text('作为附件；发送时按你的说明看图做事'),
+              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('拍照'),
+              onTap: () => Navigator.pop(ctx, ImageSource.camera),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null) return;
+    final x = await ImagePicker().pickImage(
+      source: source,
+      maxWidth: 1280,
+      imageQuality: 70,
+    );
+    if (x == null) return;
+    if (!mounted) return;
+    setState(() {
+      _pendingImage = File(x.path);
+      // 保持当前语音/键盘模式；默认仍是按住说话
+    });
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          _voiceMode
+              ? '已附上图片。按住说话说明要求，松开发送（如：读出水表录入 401）'
+              : '已附上图片。写上要求后点发送（如：读出水表录入 401）',
+        ),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
   Future<void> _send() async {
-    final text = _input.text.trim();
-    if (text.isEmpty || _busy || _sessionId == null) return;
+    final typed = _input.text.trim();
+    final image = _pendingImage;
+    if ((typed.isEmpty && image == null) || _busy || _sessionId == null) {
+      return;
+    }
     final store = context.read<AppStore>();
     final orch = _ensureOrch(store);
     await AgentSettings.instance.load();
 
+    var textForAgent = typed;
+    var textForBubble = typed;
+    if (image != null) {
+      final vision = VisionClient(AgentSettings.instance);
+      if (!vision.available) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              '附图识图需要：免费智谱 ZHIPU_API_KEY（open.bigmodel.cn），'
+              '或 DeepSeek LLM_API_KEY（高级·付费，官方 deepseek-flash）。'
+              '填好后重新打包。',
+            ),
+            duration: Duration(seconds: 6),
+          ),
+        );
+        return;
+      }
+      try {
+        final result = await runBusy(
+          context,
+          message: '正在识图…',
+          task: () => vision.understand(
+                image: image,
+                userText: typed.isEmpty
+                    ? '请读出图中电表/水表等读数或关键金额'
+                    : typed,
+              ),
+        );
+        final ask = typed.isEmpty ? '请根据附图理解执行合适操作' : typed;
+        textForAgent =
+            '$ask\n\n【附图理解 · ${result.source}】\n${result.text}\n'
+            '请根据附图理解执行用户要求；写操作仍须先提议确认。';
+        textForBubble = '$ask\n\n📷 已附图（${result.source}）\n${result.text}';
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('看图失败：$e'),
+            duration: const Duration(seconds: 6),
+          ),
+        );
+        return;
+      }
+    }
+
     final sessionId = _sessionId!;
-    final userMsg = ChatMessage(role: ChatRole.user, text: text);
+    final userMsg = ChatMessage(role: ChatRole.user, text: textForBubble);
     final prior = List<ChatMessage>.from(_messages);
 
     setState(() {
       _messages.add(userMsg);
       _messageIds.add(null);
       _input.clear();
+      _pendingImage = null;
       _busy = true;
     });
     _scrollToEnd();
@@ -670,7 +894,7 @@ class _ChatPageState extends State<ChatPage> {
       StoredChatMessage(
         sessionId: sessionId,
         role: ChatRole.user,
-        text: text,
+        text: textForBubble,
         createdAt: DateTime.now(),
       ),
     );
@@ -680,13 +904,15 @@ class _ChatPageState extends State<ChatPage> {
 
     // 首条用户话当作标题
     if (prior.length <= 1) {
-      final title = text.length > 18 ? '${text.substring(0, 18)}…' : text;
+      final titleSeed = typed.isNotEmpty ? typed : textForBubble;
+      final title =
+          titleSeed.length > 18 ? '${titleSeed.substring(0, 18)}…' : titleSeed;
       await _db.updateChatSessionTitle(sessionId, title);
     }
 
     try {
       final turn = await orch.handleTurn(
-        userText: text,
+        userText: textForAgent,
         priorMessages: prior,
         sticky: _sticky,
       );
@@ -743,43 +969,49 @@ class _ChatPageState extends State<ChatPage> {
     final msgId = index < _messageIds.length ? _messageIds[index] : null;
     setState(() => _busy = true);
     try {
-      final result = await orch.confirm(action);
-      if (!mounted) return;
-      if (msgId != null) {
-        await _db.updateChatMessageConfirmation(id: msgId, confirmed: true);
-      }
-      // 登记/改约成功后清掉 create_lease 便签，避免后续改附加费仍走「新建租约」
-      if (action.tool == 'create_lease' ||
-          action.tool == 'update_lease' ||
-          action.tool == 'set_lease_extras' ||
-          action.tool == 'apply_period_discount' ||
-          action.tool.startsWith('record_meter')) {
-        _sticky = SessionSticky(
-          propertyName: _sticky.propertyName,
-          roomLabel: _sticky.roomLabel,
-          summary: _sticky.summary,
-        );
-        await _db.updateChatSessionSticky(_sessionId!, _sticky);
-      }
-      final follow = ChatMessage(role: ChatRole.assistant, text: result);
-      final aid = await _db.insertChatMessage(
-        StoredChatMessage(
-          sessionId: _sessionId!,
-          role: ChatRole.assistant,
-          text: follow.text,
-          createdAt: DateTime.now(),
-        ),
+      await runBusy(
+        context,
+        message: '正在执行…',
+        task: () async {
+          final result = await orch.confirm(action);
+          if (!mounted) return;
+          if (msgId != null) {
+            await _db.updateChatMessageConfirmation(
+              id: msgId,
+              confirmed: true,
+            );
+          }
+          // 任意写操作确认后清掉意图/租约草稿槽，只保留房号与摘要，避免后续话被「登记租约」劫持
+          if (writeTools.contains(action.tool)) {
+            _sticky = SessionSticky(
+              propertyName: _sticky.propertyName,
+              roomLabel: _sticky.roomLabel,
+              summary: _sticky.summary,
+            );
+            await _db.updateChatSessionSticky(_sessionId!, _sticky);
+          }
+          final follow = ChatMessage(role: ChatRole.assistant, text: result);
+          final aid = await _db.insertChatMessage(
+            StoredChatMessage(
+              sessionId: _sessionId!,
+              role: ChatRole.assistant,
+              text: follow.text,
+              createdAt: DateTime.now(),
+            ),
+          );
+          if (!mounted) return;
+          setState(() {
+            _messages[index] = ChatMessage(
+              role: ChatRole.assistant,
+              text: _messages[index].text,
+              pending: action,
+              confirmed: true,
+            );
+            _messages.add(follow);
+            _messageIds.add(aid);
+          });
+        },
       );
-      setState(() {
-        _messages[index] = ChatMessage(
-          role: ChatRole.assistant,
-          text: _messages[index].text,
-          pending: action,
-          confirmed: true,
-        );
-        _messages.add(follow);
-        _messageIds.add(aid);
-      });
     } catch (e) {
       if (!mounted) return;
       final err = ChatMessage(role: ChatRole.assistant, text: '执行失败：$e');
@@ -831,13 +1063,12 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _scrollToEnd() {
+    // reverse:true 时 offset 0 就是最新消息，无需滚到底
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
-      _scroll.animateTo(
-        _scroll.position.maxScrollExtent + 80,
-        duration: const Duration(milliseconds: 250),
-        curve: Curves.easeOut,
-      );
+      if (_scroll.offset != 0) {
+        _scroll.jumpTo(0);
+      }
     });
   }
 
@@ -932,10 +1163,12 @@ class _ChatPageState extends State<ChatPage> {
         Expanded(
           child: ListView.builder(
             controller: _scroll,
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+            // 从下往上堆：打开即见最新，避免首屏空白要往下拉
+            reverse: true,
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
             itemCount: _messages.length + (_busy ? 1 : 0),
             itemBuilder: (context, i) {
-              if (_busy && i == _messages.length) {
+              if (_busy && i == 0) {
                 return const Padding(
                   padding: EdgeInsets.all(12),
                   child: Align(
@@ -944,7 +1177,9 @@ class _ChatPageState extends State<ChatPage> {
                   ),
                 );
               }
-              final m = _messages[i];
+              final msgIndex =
+                  _messages.length - 1 - (i - (_busy ? 1 : 0));
+              final m = _messages[msgIndex];
               final isUser = m.role == ChatRole.user;
               return Align(
                 alignment:
@@ -979,14 +1214,14 @@ class _ChatPageState extends State<ChatPage> {
                             FilledButton(
                               onPressed: _busy
                                   ? null
-                                  : () => _confirm(i, m.pending!),
+                                  : () => _confirm(msgIndex, m.pending!),
                               child: const Text('确认执行'),
                             ),
                             const SizedBox(width: 8),
                             TextButton(
                               onPressed: _busy
                                   ? null
-                                  : () => _cancel(i, m.pending!),
+                                  : () => _cancel(msgIndex, m.pending!),
                               child: const Text('取消'),
                             ),
                           ],
@@ -1017,6 +1252,39 @@ class _ChatPageState extends State<ChatPage> {
         ),
         const Divider(height: 1),
         if (_listening || _transcribing) _voicePulse(context),
+        if (_pendingImage != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.file(
+                    _pendingImage!,
+                    width: 56,
+                    height: 56,
+                    fit: BoxFit.cover,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    _voiceMode
+                        ? '已附图 · 按住说话说明要求后松开'
+                        : '已附图 · 写上要求后点发送',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '去掉图片',
+                  onPressed: _busy
+                      ? null
+                      : () => setState(() => _pendingImage = null),
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+          ),
         SafeArea(
           top: false,
           child: Padding(
@@ -1075,7 +1343,16 @@ class _ChatPageState extends State<ChatPage> {
                           ),
                         ),
                 ),
-                const SizedBox(width: 4),
+                const SizedBox(width: 2),
+                IconButton(
+                  tooltip: '附图（看图做事）',
+                  onPressed: _busy || _transcribing ? null : _attachImage,
+                  icon: Icon(
+                    _pendingImage == null
+                        ? Icons.image_outlined
+                        : Icons.image,
+                  ),
+                ),
                 IconButton(
                   tooltip: _voiceMode ? '切换键盘' : '切换语音',
                   onPressed: _busy || _transcribing

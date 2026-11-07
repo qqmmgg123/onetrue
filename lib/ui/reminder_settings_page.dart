@@ -89,7 +89,7 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
                       padding: EdgeInsets.all(12),
                       child: Text(
                         '系统未允许精确闹钟，提醒可能被推迟。'
-                        '请到系统设置里给「收租助手」打开精确闹钟权限。',
+                        '请到系统设置里给「缘初」打开精确闹钟权限。',
                       ),
                     ),
                   ),

@@ -34,7 +34,7 @@ class _DesktopApp extends StatelessWidget {
     return ChangeNotifierProvider.value(
       value: store,
       child: MaterialApp(
-        title: '收租助手',
+        title: '缘初',
         debugShowCheckedModeBanner: false,
         locale: const Locale('zh', 'CN'),
         supportedLocales: const [Locale('zh', 'CN'), Locale('en')],

@@ -5,6 +5,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:provider/provider.dart';
 
 import 'platform_init.dart';
+import 'share/wechat_share.dart';
 import 'state/app_store.dart';
 import 'ui/app_shell.dart';
 
@@ -16,6 +17,11 @@ Future<void> main() async {
   };
 
   initLocalDatabase();
+  try {
+    await WeChatShare.instance.init();
+  } catch (e) {
+    debugPrint('wechat init: $e');
+  }
   final store = AppStore();
 
   runZonedGuarded(() {
@@ -41,7 +47,7 @@ class RentAgentApp extends StatelessWidget {
     return ChangeNotifierProvider.value(
       value: store,
       child: MaterialApp(
-        title: '收租助手',
+        title: '缘初',
         debugShowCheckedModeBanner: false,
         locale: const Locale('zh', 'CN'),
         supportedLocales: const [

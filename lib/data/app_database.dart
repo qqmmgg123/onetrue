@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:uuid/uuid.dart';
 
 import '../agent/agent_models.dart';
 import '../agent/chat_memory.dart';
@@ -10,6 +11,8 @@ import '../billing/bill_models.dart';
 import '../billing/period_generator.dart' hide dateOnly;
 import '../domain/models.dart';
 import '../ui/format.dart';
+
+const _uuid = Uuid();
 
 class MeterPair {
   const MeterPair({required this.previous, required this.current});
@@ -63,7 +66,7 @@ class AppDatabase {
     final path = p.join(dir.path, 'rent_agent.db');
     _db = await openDatabase(
       path,
-      version: 4,
+      version: 8,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -72,11 +75,19 @@ class AppDatabase {
         await _upgradeToV2(db);
         await _upgradeToV3(db);
         await _upgradeToV4(db);
+        await _upgradeToV5(db);
+        await _upgradeToV6(db);
+        await _upgradeToV7(db);
+        await _upgradeToV8(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) await _upgradeToV2(db);
         if (oldVersion < 3) await _upgradeToV3(db);
         if (oldVersion < 4) await _upgradeToV4(db);
+        if (oldVersion < 5) await _upgradeToV5(db);
+        if (oldVersion < 6) await _upgradeToV6(db);
+        if (oldVersion < 7) await _upgradeToV7(db);
+        if (oldVersion < 8) await _upgradeToV8(db);
       },
     );
     return _db!;
@@ -260,37 +271,221 @@ class AppDatabase {
     ''');
   }
 
-  Future<List<Property>> listProperties() async {
-    final rows = await (await database).query('properties', orderBy: 'id DESC');
-    return rows
-        .map(
-          (r) => Property(
-            id: r['id'] as int,
-            name: r['name'] as String,
-            address: r['address'] as String,
-          ),
-        )
-        .toList();
+  /// 同步元数据：uuid 跨端主键，updated_at/LWW，deleted_at 软删，dirty 待上传。
+  Future<void> _upgradeToV5(Database db) async {
+    const tables = [
+      'properties',
+      'rooms',
+      'tenants',
+      'leases',
+      'lease_extras',
+      'rent_periods',
+      'meter_readings',
+      'period_adjustments',
+      'invoices',
+      'payments',
+    ];
+    for (final t in tables) {
+      await _tryExec(db, 'ALTER TABLE $t ADD COLUMN uuid TEXT');
+      await _tryExec(db, 'ALTER TABLE $t ADD COLUMN updated_at TEXT');
+      await _tryExec(db, 'ALTER TABLE $t ADD COLUMN deleted_at TEXT');
+      await _tryExec(
+        db,
+        'ALTER TABLE $t ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1',
+      );
+    }
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final t in tables) {
+      final rows = await db.query(t, columns: ['id', 'uuid']);
+      for (final r in rows) {
+        final id = r['id'] as int;
+        final existing = r['uuid'] as String?;
+        await db.update(
+          t,
+          {
+            if (existing == null || existing.isEmpty) 'uuid': _uuid.v4(),
+            'updated_at': now,
+            'dirty': 1,
+          },
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+      await _tryExec(
+        db,
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_${t}_uuid ON $t(uuid)',
+      );
+    }
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    ''');
   }
 
-  Future<int> insertProperty(String name, String address) async {
+  Future<void> _upgradeToV6(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE rooms ADD COLUMN video_url TEXT NOT NULL DEFAULT ''",
+    );
+    await _tryExec(
+      db,
+      "ALTER TABLE rooms ADD COLUMN video_poster_url TEXT NOT NULL DEFAULT ''",
+    );
+  }
+
+  Future<void> _upgradeToV7(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE rent_periods ADD COLUMN remark TEXT NOT NULL DEFAULT ''",
+    );
+  }
+
+  Future<void> _upgradeToV8(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE properties ADD COLUMN city TEXT NOT NULL DEFAULT ''",
+    );
+    await _tryExec(
+      db,
+      "ALTER TABLE rooms ADD COLUMN listing_status TEXT NOT NULL DEFAULT 'draft'",
+    );
+    await _tryExec(
+      db,
+      'ALTER TABLE rooms ADD COLUMN listed_at TEXT',
+    );
+  }
+
+  Future<void> _tryExec(Database db, String sql) async {
+    try {
+      await db.execute(sql);
+    } catch (_) {}
+  }
+
+  Map<String, Object?> _newSyncCols() => {
+        'uuid': _uuid.v4(),
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+        'dirty': 1,
+      };
+
+  Map<String, Object?> _touchSyncCols() => {
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+        'dirty': 1,
+      };
+
+  Future<void> markSynced(String table, int localId) async {
+    await (await database).update(
+      table,
+      {'dirty': 0},
+      where: 'id = ?',
+      whereArgs: [localId],
+    );
+  }
+
+  /// 换云端库（如 Supabase→Neon）后强制全量再推。
+  Future<void> markAllSyncDirty() async {
+    const tables = [
+      'properties',
+      'rooms',
+      'tenants',
+      'leases',
+      'lease_extras',
+      'rent_periods',
+      'meter_readings',
+      'period_adjustments',
+      'invoices',
+      'payments',
+    ];
+    final db = await database;
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final t in tables) {
+      await db.update(t, {'dirty': 1, 'updated_at': now});
+    }
+    await setSyncState('last_sync_at', '');
+  }
+
+  Future<String?> getSyncState(String key) async {
+    final rows = await (await database).query(
+      'sync_state',
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['value'] as String?;
+  }
+
+  Future<void> setSyncState(String key, String value) async {
+    await (await database).insert(
+      'sync_state',
+      {'key': key, 'value': value},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, Object?>>> dirtyRows(String table) async {
+    return (await database).query(
+      table,
+      where: 'dirty = 1',
+      orderBy: 'id ASC',
+    );
+  }
+
+  Future<Map<String, Object?>?> rowByUuid(String table, String uuid) async {
+    final rows = await (await database).query(
+      table,
+      where: 'uuid = ?',
+      whereArgs: [uuid],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first;
+  }
+
+  Future<List<Property>> listProperties() async {
+    final rows = await (await database).query(
+      'properties',
+      where: 'deleted_at IS NULL',
+      orderBy: 'id DESC',
+    );
+    return rows.map(_propertyFrom).toList();
+  }
+
+  Future<int> insertProperty(
+    String name,
+    String address, {
+    String city = '',
+  }) async {
     return (await database).insert('properties', {
       'name': name,
       'address': address,
+      'city': city.trim(),
+      ..._newSyncCols(),
     });
   }
 
   Future<void> deleteProperty(int id) async {
-    await (await database).delete('properties', where: 'id = ?', whereArgs: [id]);
+    await (await database).update(
+      'properties',
+      {
+        'deleted_at': DateTime.now().toUtc().toIso8601String(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   Future<void> updateProperty({
     required int id,
     required String name,
     String? address,
+    String? city,
   }) async {
-    final patch = <String, Object?>{'name': name};
+    final patch = <String, Object?>{'name': name, ..._touchSyncCols()};
     if (address != null) patch['address'] = address;
+    if (city != null) patch['city'] = city.trim();
     await (await database).update(
       'properties',
       patch,
@@ -299,24 +494,52 @@ class AppDatabase {
     );
   }
 
+  /// 退出登录时清空本地业务缓存，避免串号。
+  Future<void> clearBusinessData() async {
+    final db = await database;
+    await db.execute('PRAGMA foreign_keys = OFF');
+    const tables = [
+      'payments',
+      'invoices',
+      'period_adjustments',
+      'meter_readings',
+      'rent_periods',
+      'lease_extras',
+      'leases',
+      'tenants',
+      'rooms',
+      'properties',
+    ];
+    for (final t in tables) {
+      await db.delete(t);
+    }
+    await db.execute('PRAGMA foreign_keys = ON');
+    await setSyncState('last_sync_at', '');
+  }
+
+  /// 是否还有未同步归属的本地业务数据（用于登录后认领）。
+  Future<bool> hasLocalBusinessData() async {
+    final rows = await (await database).rawQuery(
+      'SELECT COUNT(*) AS c FROM properties WHERE deleted_at IS NULL',
+    );
+    final c = rows.first['c'];
+    return (c is int ? c : int.tryParse('$c') ?? 0) > 0;
+  }
+
   Future<List<RoomSnapshot>> roomsForProperty(int propertyId) async {
     final db = await database;
     final rooms = await db.query(
       'rooms',
-      where: 'property_id = ?',
+      where: 'property_id = ? AND deleted_at IS NULL',
       whereArgs: [propertyId],
       orderBy: 'label COLLATE NOCASE',
     );
     final result = <RoomSnapshot>[];
     for (final row in rooms) {
-      final room = Room(
-        id: row['id'] as int,
-        propertyId: row['property_id'] as int,
-        label: row['label'] as String,
-      );
+      final room = _roomFrom(row);
       final leaseRows = await db.query(
         'leases',
-        where: "room_id = ? AND status = 'active'",
+        where: "room_id = ? AND status = 'active' AND deleted_at IS NULL",
         whereArgs: [room.id],
         orderBy: 'id DESC',
         limit: 1,
@@ -344,25 +567,116 @@ class AppDatabase {
     return (await database).insert('rooms', {
       'property_id': propertyId,
       'label': label,
+      ..._newSyncCols(),
     });
   }
 
+  Future<void> updateRoomLabel({
+    required int id,
+    required String label,
+  }) async {
+    await (await database).update(
+      'rooms',
+      {
+        'label': label.trim(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
   Future<void> deleteRoom(int id) async {
-    await (await database).delete('rooms', where: 'id = ?', whereArgs: [id]);
+    await (await database).update(
+      'rooms',
+      {
+        'deleted_at': DateTime.now().toUtc().toIso8601String(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   Future<Room?> getRoom(int id) async {
     final rows = await (await database).query(
       'rooms',
-      where: 'id = ?',
+      where: 'id = ? AND deleted_at IS NULL',
       whereArgs: [id],
     );
     if (rows.isEmpty) return null;
-    final r = rows.first;
+    return _roomFrom(rows.first);
+  }
+
+  Property _propertyFrom(Map<String, Object?> r) {
+    return Property(
+      id: r['id'] as int,
+      name: r['name'] as String,
+      address: r['address'] as String? ?? '',
+      city: r['city'] as String? ?? '',
+    );
+  }
+
+  Room _roomFrom(Map<String, Object?> r) {
+    DateTime? listedAt;
+    final rawListed = r['listed_at'] as String?;
+    if (rawListed != null && rawListed.isNotEmpty) {
+      listedAt = DateTime.tryParse(rawListed);
+    }
     return Room(
       id: r['id'] as int,
       propertyId: r['property_id'] as int,
       label: r['label'] as String,
+      videoUrl: r['video_url'] as String? ?? '',
+      videoPosterUrl: r['video_poster_url'] as String? ?? '',
+      listingStatus: r['listing_status'] as String? ?? kListingDraft,
+      listedAt: listedAt,
+    );
+  }
+
+  Future<void> setRoomListing({
+    required int roomId,
+    required bool listed,
+  }) async {
+    final now = DateTime.now().toUtc().toIso8601String();
+    await (await database).update(
+      'rooms',
+      {
+        'listing_status': listed ? kListingListed : kListingDraft,
+        'listed_at': listed ? now : null,
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [roomId],
+    );
+  }
+
+  Future<String?> roomUuid(int roomId) async {
+    final rows = await (await database).query(
+      'rooms',
+      columns: ['uuid'],
+      where: 'id = ?',
+      whereArgs: [roomId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['uuid'] as String?;
+  }
+
+  Future<void> setRoomVideo({
+    required int roomId,
+    required String videoUrl,
+    String posterUrl = '',
+  }) async {
+    await (await database).update(
+      'rooms',
+      {
+        'video_url': videoUrl,
+        'video_poster_url': posterUrl,
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [roomId],
     );
   }
 
@@ -383,17 +697,14 @@ class AppDatabase {
 
     final result = <RoomSnapshot>[];
     for (final row in rooms) {
-      final room = Room(
-        id: row['id'] as int,
-        propertyId: row['property_id'] as int,
-        label: row['label'] as String,
-      );
-      final lease = await activeLeaseForRoom(room.id);
+      final full = await getRoom(row['id'] as int);
+      if (full == null) continue;
+      final lease = await activeLeaseForRoom(full.id);
       Tenant? tenant;
       if (lease != null) {
         tenant = await getTenant(lease.tenantId);
       }
-      result.add(RoomSnapshot(room: room, lease: lease, tenant: tenant));
+      result.add(RoomSnapshot(room: full, lease: lease, tenant: tenant));
     }
     return result;
   }
@@ -406,12 +717,7 @@ class AppDatabase {
       orderBy: 'id DESC',
     );
     if (rows.isEmpty) return null;
-    final r = rows.first;
-    return Property(
-      id: r['id'] as int,
-      name: r['name'] as String,
-      address: r['address'] as String,
-    );
+    return _propertyFrom(rows.first);
   }
 
   Future<List<Map<String, Object?>>> inventorySummary() async {
@@ -441,18 +747,13 @@ class AppDatabase {
       whereArgs: [id],
     );
     if (rows.isEmpty) return null;
-    final r = rows.first;
-    return Property(
-      id: r['id'] as int,
-      name: r['name'] as String,
-      address: r['address'] as String,
-    );
+    return _propertyFrom(rows.first);
   }
 
   Future<Lease?> activeLeaseForRoom(int roomId) async {
     final rows = await (await database).query(
       'leases',
-      where: "room_id = ? AND status = 'active'",
+      where: "room_id = ? AND status = 'active' AND deleted_at IS NULL",
       whereArgs: [roomId],
       orderBy: 'id DESC',
       limit: 1,
@@ -475,7 +776,7 @@ class AppDatabase {
   Future<List<RentPeriod>> periodsForLease(int leaseId) async {
     final rows = await (await database).query(
       'rent_periods',
-      where: 'lease_id = ?',
+      where: 'lease_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId],
       orderBy: 'due_date DESC',
     );
@@ -485,7 +786,7 @@ class AppDatabase {
   Future<List<LeaseExtraItem>> extrasForLease(int leaseId) async {
     final rows = await (await database).query(
       'lease_extras',
-      where: 'lease_id = ?',
+      where: 'lease_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId],
       orderBy: 'sort_order ASC, id ASC',
     );
@@ -503,8 +804,14 @@ class AppDatabase {
 
   Future<void> replaceLeaseExtras(int leaseId, List<LeaseExtraItem> extras) async {
     final db = await database;
+    final gone = DateTime.now().toUtc().toIso8601String();
     await db.transaction((txn) async {
-      await txn.delete('lease_extras', where: 'lease_id = ?', whereArgs: [leaseId]);
+      await txn.update(
+        'lease_extras',
+        {'deleted_at': gone, ..._touchSyncCols()},
+        where: 'lease_id = ? AND deleted_at IS NULL',
+        whereArgs: [leaseId],
+      );
       var i = 0;
       for (final e in extras) {
         final name = e.name.trim();
@@ -514,6 +821,7 @@ class AppDatabase {
           'name': name,
           'amount': e.amount,
           'sort_order': e.sortOrder != 0 ? e.sortOrder : i,
+          ..._newSyncCols(),
         });
         i++;
       }
@@ -526,7 +834,9 @@ class AppDatabase {
         'leases',
         {
           'fixed_extra': sum,
-          'fixed_extra_label': label.length > 40 ? '${label.substring(0, 40)}…' : label,
+          'fixed_extra_label':
+              label.length > 40 ? '${label.substring(0, 40)}…' : label,
+          ..._touchSyncCols(),
         },
         where: 'id = ?',
         whereArgs: [leaseId],
@@ -565,7 +875,11 @@ class AppDatabase {
       for (final row in existing) {
         await txn.update(
           'leases',
-          {'status': 'ended', 'end_date': ymd(DateTime.now())},
+          {
+            'status': 'ended',
+            'end_date': ymd(DateTime.now()),
+            ..._touchSyncCols(),
+          },
           where: 'id = ?',
           whereArgs: [row['id']],
         );
@@ -573,6 +887,7 @@ class AppDatabase {
       final tenantId = await txn.insert('tenants', {
         'name': tenantName,
         'phone': tenantPhone,
+        ..._newSyncCols(),
       });
       final sum = items.fold<double>(0, (a, b) => a + b.amount);
       final label = items.isEmpty
@@ -592,6 +907,7 @@ class AppDatabase {
         'gas_price': gasPrice,
         'fixed_extra': sum,
         'fixed_extra_label': label,
+        ..._newSyncCols(),
       });
       var i = 0;
       for (final e in items) {
@@ -601,6 +917,7 @@ class AppDatabase {
           'name': e.name.trim(),
           'amount': e.amount,
           'sort_order': i++,
+          ..._newSyncCols(),
         });
       }
       await _insertMissingPeriods(txn, leaseId, startDate, endDate, rentDueDay, baseRent);
@@ -634,7 +951,7 @@ class AppDatabase {
       final tenantId = old['tenant_id'] as int;
       await txn.update(
         'tenants',
-        {'name': tenantName, 'phone': tenantPhone},
+        {'name': tenantName, 'phone': tenantPhone, ..._touchSyncCols()},
         where: 'id = ?',
         whereArgs: [tenantId],
       );
@@ -649,6 +966,7 @@ class AppDatabase {
           'electric_price': electricPrice ?? old['electric_price'] ?? 0,
           'water_price': waterPrice ?? old['water_price'] ?? 0,
           'gas_price': gasPrice ?? old['gas_price'] ?? 0,
+          ..._touchSyncCols(),
         },
         where: 'id = ?',
         whereArgs: [leaseId],
@@ -662,9 +980,11 @@ class AppDatabase {
               (oldEnd == null ? null : ymd(oldEnd)) ||
           rentDueDay != oldDue;
       if (scheduleChanged) {
-        await txn.delete(
+        final gone = DateTime.now().toUtc().toIso8601String();
+        await txn.update(
           'rent_periods',
-          where: "lease_id = ? AND status != 'paid'",
+          {'deleted_at': gone, ..._touchSyncCols()},
+          where: "lease_id = ? AND status != 'paid' AND deleted_at IS NULL",
           whereArgs: [leaseId],
         );
         await _insertMissingPeriods(
@@ -680,13 +1000,13 @@ class AppDatabase {
         // 只改房租：刷新未出单金额，保留账期 id
         final open = await txn.query(
           'rent_periods',
-          where: "lease_id = ? AND status = 'pending'",
+          where: "lease_id = ? AND status = 'pending' AND deleted_at IS NULL",
           whereArgs: [leaseId],
         );
         for (final p in open) {
           await txn.update(
             'rent_periods',
-            {'amount': baseRent},
+            {'amount': baseRent, ..._touchSyncCols()},
             where: 'id = ?',
             whereArgs: [p['id']],
           );
@@ -710,6 +1030,7 @@ class AppDatabase {
         'electric_price': electricPrice,
         'water_price': waterPrice,
         'gas_price': gasPrice,
+        ..._touchSyncCols(),
       },
       where: 'id = ?',
       whereArgs: [leaseId],
@@ -727,7 +1048,7 @@ class AppDatabase {
     );
     await (await database).update(
       'leases',
-      {'status': 'ended', 'end_date': ymd(end)},
+      {'status': 'ended', 'end_date': ymd(end), ..._touchSyncCols()},
       where: 'id = ?',
       whereArgs: [leaseId],
     );
@@ -748,17 +1069,43 @@ class AppDatabase {
       amount: baseRent,
     );
     for (final draft in drafts) {
+      final start = ymd(draft.periodStart);
+      final existing = await txn.query(
+        'rent_periods',
+        where: 'lease_id = ? AND period_start = ?',
+        whereArgs: [leaseId, start],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) {
+        final row = existing.first;
+        final paid = row['status'] == 'paid';
+        // 软删后同起点账期需复活，否则 UNIQUE(lease_id, period_start) 会挡住插入
+        await txn.update(
+          'rent_periods',
+          {
+            'period_end': ymd(draft.periodEnd),
+            'due_date': ymd(draft.dueDate),
+            if (!paid) 'amount': draft.amount,
+            if (!paid) 'status': 'pending',
+            'deleted_at': null,
+            ..._touchSyncCols(),
+          },
+          where: 'id = ?',
+          whereArgs: [row['id']],
+        );
+        continue;
+      }
       await txn.insert(
         'rent_periods',
         {
           'lease_id': leaseId,
-          'period_start': ymd(draft.periodStart),
+          'period_start': start,
           'period_end': ymd(draft.periodEnd),
           'due_date': ymd(draft.dueDate),
           'amount': draft.amount,
           'status': 'pending',
+          ..._newSyncCols(),
         },
-        conflictAlgorithm: ConflictAlgorithm.ignore,
       );
     }
   }
@@ -768,6 +1115,7 @@ class AppDatabase {
     final rows = await db.rawQuery('''
       SELECT
         p.id, p.lease_id, p.period_start, p.period_end, p.due_date, p.amount, p.status,
+        COALESCE(p.remark, '') AS remark,
         r.label AS room_label,
         pr.name AS property_name,
         t.name AS tenant_name,
@@ -778,6 +1126,7 @@ class AppDatabase {
       JOIN properties pr ON pr.id = r.property_id
       JOIN tenants t ON t.id = l.tenant_id
       WHERE p.status IN ('pending', 'invoiced') AND l.status = 'active'
+        AND p.deleted_at IS NULL AND l.deleted_at IS NULL
       ORDER BY p.due_date ASC
     ''');
     return rows
@@ -805,7 +1154,7 @@ class AppDatabase {
       final amount = rows.first['amount'] as num;
       await txn.update(
         'rent_periods',
-        {'status': 'paid'},
+        {'status': 'paid', ..._touchSyncCols()},
         where: 'id = ?',
         whereArgs: [periodId],
       );
@@ -814,21 +1163,24 @@ class AppDatabase {
         'amount': amount,
         'paid_at': DateTime.now().toIso8601String(),
         'note': note,
+        ..._newSyncCols(),
       });
     });
   }
 
   Future<void> markUnpaid(int periodId) async {
     final db = await database;
+    final now = DateTime.now().toUtc().toIso8601String();
     await db.transaction((txn) async {
-      await txn.delete(
+      await txn.update(
         'payments',
-        where: 'period_id = ?',
+        {'deleted_at': now, ..._touchSyncCols()},
+        where: 'period_id = ? AND deleted_at IS NULL',
         whereArgs: [periodId],
       );
       await txn.update(
         'rent_periods',
-        {'status': 'pending'},
+        {'status': 'pending', ..._touchSyncCols()},
         where: 'id = ?',
         whereArgs: [periodId],
       );
@@ -848,7 +1200,7 @@ class AppDatabase {
   Future<RentPeriod?> getPeriod(int id) async {
     final rows = await (await database).query(
       'rent_periods',
-      where: 'id = ?',
+      where: 'id = ? AND deleted_at IS NULL',
       whereArgs: [id],
     );
     if (rows.isEmpty) return null;
@@ -859,6 +1211,7 @@ class AppDatabase {
     final rows = await (await database).rawQuery('''
       SELECT
         p.id, p.lease_id, p.period_start, p.period_end, p.due_date, p.amount, p.status,
+        COALESCE(p.remark, '') AS remark,
         l.room_id, l.tenant_id, l.start_date, l.end_date, l.rent_due_day,
         l.base_rent, l.deposit, l.status AS lease_status,
         l.electric_price, l.water_price, l.gas_price, l.fixed_extra, l.fixed_extra_label,
@@ -870,7 +1223,7 @@ class AppDatabase {
       JOIN rooms r ON r.id = l.room_id
       JOIN properties pr ON pr.id = r.property_id
       JOIN tenants t ON t.id = l.tenant_id
-      WHERE p.id = ?
+      WHERE p.id = ? AND p.deleted_at IS NULL
     ''', [periodId]);
     if (rows.isEmpty) return null;
     final r = rows.first;
@@ -926,6 +1279,7 @@ class AppDatabase {
       'recorded_at': (recordedAt ?? DateTime.now()).toIso8601String(),
       'period_id': periodId,
       'note': note,
+      ..._newSyncCols(),
     });
   }
 
@@ -940,7 +1294,7 @@ class AppDatabase {
     final db = await database;
     final existing = await db.query(
       'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND period_id = ?',
+      where: 'lease_id = ? AND kind = ? AND period_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId, kind, periodId],
       orderBy: 'recorded_at DESC',
       limit: 1,
@@ -953,6 +1307,8 @@ class AppDatabase {
           'reading': reading,
           'recorded_at': DateTime.now().toIso8601String(),
           'note': note,
+          'deleted_at': null,
+          ..._touchSyncCols(),
         },
         where: 'id = ?',
         whereArgs: [id],
@@ -969,41 +1325,66 @@ class AppDatabase {
   }
 
   /// 为账期写入/覆盖「上期+本期」读数对，保证清单能算用量。
+  /// [current]/[previous] 可只传一个：未传的一侧沿用本账期已有值或自动推断。
   Future<void> setPeriodMeterPair({
     required int leaseId,
     required String kind,
     required int periodId,
-    required double current,
+    double? current,
     double? previous,
   }) async {
     final period = await getPeriod(periodId);
     if (period == null) throw StateError('账期不存在');
+    if (current == null && previous == null) {
+      throw StateError('上期/本期读数至少提供一个');
+    }
+
+    final existing = await meterPairForPeriod(leaseId, kind, period);
+    var cur = current ?? existing?.current;
+    var prev = previous ?? existing?.previous;
+
+    // 只改上期、尚无本期时：用上期占位本期，避免无法落库
+    if (cur == null && prev != null) {
+      cur = prev;
+    }
+    if (cur == null) {
+      throw StateError('缺少本期读数');
+    }
+
     final db = await database;
     final prevNote = '上期#$periodId';
 
-    // 清掉本账期本期、本账期上期标签，以及旧版无账期 id 的「上期读数」
-    await db.delete(
-      'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND period_id = ?',
-      whereArgs: [leaseId, kind, periodId],
+    // 软删旧读数，便于同步到远端
+    final gone = DateTime.now().toUtc().toIso8601String();
+    Future<void> softDelete(String where, List<Object?> args) async {
+      await db.update(
+        'meter_readings',
+        {'deleted_at': gone, ..._touchSyncCols()},
+        where: '$where AND deleted_at IS NULL',
+        whereArgs: args,
+      );
+    }
+
+    await softDelete(
+      'lease_id = ? AND kind = ? AND period_id = ?',
+      [leaseId, kind, periodId],
     );
-    await db.delete(
-      'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND note = ?',
-      whereArgs: [leaseId, kind, prevNote],
-    );
-    await db.delete(
-      'meter_readings',
-      where: "lease_id = ? AND kind = ? AND note = '上期读数'",
-      whereArgs: [leaseId, kind],
+    await softDelete('lease_id = ? AND kind = ? AND note = ?', [
+      leaseId,
+      kind,
+      prevNote,
+    ]);
+    await softDelete(
+      "lease_id = ? AND kind = ? AND note = '上期读数'",
+      [leaseId, kind],
     );
 
-    var prev = previous;
-    if (prev == null) {
+    if (prev == null && previous == null) {
       // 自动上期：其他账期的「本期」，或更早读数（排除其它账期的上期标签）
       final prior = await db.query(
         'meter_readings',
         where: "lease_id = ? AND kind = ? AND recorded_at < ? "
+            "AND deleted_at IS NULL "
             "AND (note IS NULL OR note NOT LIKE '上期#%')",
         whereArgs: [
           leaseId,
@@ -1031,7 +1412,7 @@ class AppDatabase {
     await insertMeterReading(
       leaseId: leaseId,
       kind: kind,
-      reading: current,
+      reading: cur,
       periodId: periodId,
       note: '本期',
       recordedAt: period.periodEnd.isAfter(DateTime.now())
@@ -1041,9 +1422,13 @@ class AppDatabase {
   }
 
   Future<void> deleteInvoicesForPeriod(int periodId) async {
-    await (await database).delete(
+    await (await database).update(
       'invoices',
-      where: 'period_id = ?',
+      {
+        'deleted_at': DateTime.now().toUtc().toIso8601String(),
+        ..._touchSyncCols(),
+      },
+      where: 'period_id = ? AND deleted_at IS NULL',
       whereArgs: [periodId],
     );
   }
@@ -1051,7 +1436,7 @@ class AppDatabase {
   Future<List<MeterReading>> recentMeterReadings(int leaseId, {int limit = 20}) async {
     final rows = await (await database).query(
       'meter_readings',
-      where: 'lease_id = ?',
+      where: 'lease_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId],
       orderBy: 'recorded_at DESC',
       limit: limit,
@@ -1080,7 +1465,7 @@ class AppDatabase {
     final db = await database;
     final currentRows = await db.query(
       'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND period_id = ?',
+      where: 'lease_id = ? AND kind = ? AND period_id = ? AND deleted_at IS NULL',
       whereArgs: [leaseId, kind, period.id],
       orderBy: 'recorded_at DESC',
       limit: 1,
@@ -1092,7 +1477,7 @@ class AppDatabase {
 
     final taggedPrev = await db.query(
       'meter_readings',
-      where: 'lease_id = ? AND kind = ? AND note = ?',
+      where: 'lease_id = ? AND kind = ? AND note = ? AND deleted_at IS NULL',
       whereArgs: [leaseId, kind, '上期#${period.id}'],
       orderBy: 'id DESC',
       limit: 1,
@@ -1108,6 +1493,7 @@ class AppDatabase {
     final prevRows = await db.query(
       'meter_readings',
       where: "lease_id = ? AND kind = ? AND recorded_at < ? "
+          "AND deleted_at IS NULL "
           "AND (note IS NULL OR note NOT LIKE '上期#%')",
       whereArgs: [leaseId, kind, currentAt],
       orderBy: 'recorded_at DESC',
@@ -1128,11 +1514,38 @@ class AppDatabase {
     String note = '',
   }) async {
     final db = await database;
+    final existing = await db.query(
+      'period_adjustments',
+      where: "period_id = ? AND type = 'discount'",
+      whereArgs: [periodId],
+      limit: 1,
+    );
     if (amount <= 0) {
-      await db.delete(
+      if (existing.isNotEmpty) {
+        await db.update(
+          'period_adjustments',
+          {
+            'deleted_at': DateTime.now().toUtc().toIso8601String(),
+            'amount': 0,
+            ..._touchSyncCols(),
+          },
+          where: 'id = ?',
+          whereArgs: [existing.first['id']],
+        );
+      }
+      return;
+    }
+    if (existing.isNotEmpty) {
+      await db.update(
         'period_adjustments',
-        where: "period_id = ? AND type = 'discount'",
-        whereArgs: [periodId],
+        {
+          'amount': amount,
+          'note': note,
+          'deleted_at': null,
+          ..._touchSyncCols(),
+        },
+        where: 'id = ?',
+        whereArgs: [existing.first['id']],
       );
       return;
     }
@@ -1143,15 +1556,15 @@ class AppDatabase {
         'type': 'discount',
         'amount': amount,
         'note': note,
+        ..._newSyncCols(),
       },
-      conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
   Future<double> discountForPeriod(int periodId) async {
     final rows = await (await database).query(
       'period_adjustments',
-      where: "period_id = ? AND type = 'discount'",
+      where: "period_id = ? AND type = 'discount' AND deleted_at IS NULL",
       whereArgs: [periodId],
       limit: 1,
     );
@@ -1162,12 +1575,94 @@ class AppDatabase {
   Future<String> discountNoteForPeriod(int periodId) async {
     final rows = await (await database).query(
       'period_adjustments',
-      where: "period_id = ? AND type = 'discount'",
+      where: "period_id = ? AND type = 'discount' AND deleted_at IS NULL",
       whereArgs: [periodId],
       limit: 1,
     );
     if (rows.isEmpty) return '';
     return rows.first['note'] as String? ?? '';
+  }
+
+  /// 本月一次性额外费用（非每月附加费）。type 存为 fee:名称，兼容 UNIQUE(period_id, type)。
+  static String periodFeeType(String name) => 'fee:${name.trim()}';
+
+  Future<List<({String name, double amount})>> listPeriodFees(int periodId) async {
+    final rows = await (await database).query(
+      'period_adjustments',
+      where: "period_id = ? AND type LIKE 'fee:%' AND deleted_at IS NULL",
+      whereArgs: [periodId],
+      orderBy: 'id ASC',
+    );
+    return rows.map((r) {
+      final type = '${r['type']}';
+      final name = type.startsWith('fee:')
+          ? type.substring(4)
+          : ('${r['note']}'.trim().isEmpty ? '额外费用' : '${r['note']}');
+      return (name: name, amount: (r['amount'] as num).toDouble());
+    }).toList();
+  }
+
+  Future<void> upsertPeriodFee({
+    required int periodId,
+    required String name,
+    required double amount,
+  }) async {
+    final n = name.trim();
+    if (n.isEmpty) throw StateError('费用名称不能为空');
+    final type = periodFeeType(n);
+    final db = await database;
+    final existing = await db.query(
+      'period_adjustments',
+      where: 'period_id = ? AND type = ?',
+      whereArgs: [periodId, type],
+      limit: 1,
+    );
+    if (amount <= 0) {
+      if (existing.isNotEmpty) {
+        await db.update(
+          'period_adjustments',
+          {
+            'deleted_at': DateTime.now().toUtc().toIso8601String(),
+            'amount': 0,
+            ..._touchSyncCols(),
+          },
+          where: 'id = ?',
+          whereArgs: [existing.first['id']],
+        );
+      }
+      return;
+    }
+    if (existing.isNotEmpty) {
+      await db.update(
+        'period_adjustments',
+        {
+          'amount': amount,
+          'note': n,
+          'deleted_at': null,
+          ..._touchSyncCols(),
+        },
+        where: 'id = ?',
+        whereArgs: [existing.first['id']],
+      );
+      return;
+    }
+    await db.insert(
+      'period_adjustments',
+      {
+        'period_id': periodId,
+        'type': type,
+        'amount': amount,
+        'note': n,
+        ..._newSyncCols(),
+      },
+    );
+  }
+
+  Future<void> removePeriodFee({
+    required int periodId,
+    required String name,
+  }) async {
+    await upsertPeriodFee(periodId: periodId, name: name, amount: 0);
   }
 
   Future<int> insertInvoice({
@@ -1180,13 +1675,14 @@ class AppDatabase {
       'total': total,
       'lines_json': linesJson,
       'issued_at': DateTime.now().toIso8601String(),
+      ..._newSyncCols(),
     });
   }
 
   Future<StoredInvoice?> latestInvoiceForPeriod(int periodId) async {
     final rows = await (await database).query(
       'invoices',
-      where: 'period_id = ?',
+      where: 'period_id = ? AND deleted_at IS NULL',
       whereArgs: [periodId],
       orderBy: 'id DESC',
       limit: 1,
@@ -1212,7 +1708,7 @@ class AppDatabase {
   }) async {
     await (await database).update(
       'rent_periods',
-      {'amount': amount, 'status': status},
+      {'amount': amount, 'status': status, ..._touchSyncCols()},
       where: 'id = ?',
       whereArgs: [periodId],
     );
@@ -1258,7 +1754,23 @@ class AppDatabase {
         dueDate: parseYmd(r['due_date'] as String)!,
         amount: (r['amount'] as num).toDouble(),
         status: r['status'] as String,
+        remark: '${r['remark'] ?? ''}',
       );
+
+  Future<void> updatePeriodRemark({
+    required int periodId,
+    required String remark,
+  }) async {
+    await (await database).update(
+      'rent_periods',
+      {
+        'remark': remark.trim(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [periodId],
+    );
+  }
 
   // --- chat sessions ---
 

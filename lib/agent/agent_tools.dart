@@ -10,6 +10,7 @@ const writeTools = {
   'rename_property',
   'delete_property',
   'add_room',
+  'rename_room',
   'delete_room',
   'create_lease',
   'update_lease',
@@ -23,11 +24,26 @@ const writeTools = {
   'record_meter_reading',
   'record_meter_readings',
   'apply_period_discount',
+  'set_period_remark',
+  'add_period_fee',
+  'remove_period_fee',
+  'set_period_fees',
   'issue_invoice',
   'unfreeze_invoice',
   'mark_period_paid',
   'mark_period_unpaid',
 };
+
+/// 游客只下发只读 tools，避免模型提议写操作。
+List<Map<String, dynamic>> toolSchemasFor({required bool landlord}) {
+  if (landlord) return toolSchemas;
+  return toolSchemas.where((t) {
+    final fn = t['function'];
+    if (fn is! Map) return false;
+    final name = '${fn['name']}';
+    return !writeTools.contains(name);
+  }).toList();
+}
 
 /// OpenAI-compatible tools schema（发给大模型用）。
 final List<Map<String, dynamic>> toolSchemas = [
@@ -77,6 +93,7 @@ final List<Map<String, dynamic>> toolSchemas = [
         'properties': {
           'name': {'type': 'string'},
           'address': {'type': 'string'},
+          'city': {'type': 'string', 'description': '城市，如杭州'},
         },
         'required': ['name'],
       },
@@ -86,13 +103,14 @@ final List<Map<String, dynamic>> toolSchemas = [
     'type': 'function',
     'function': {
       'name': 'rename_property',
-      'description': '修改小区名称或地址',
+      'description': '修改小区名称、城市或地址',
       'parameters': {
         'type': 'object',
         'properties': {
           'property_name': {'type': 'string', 'description': '原名称'},
           'new_name': {'type': 'string'},
           'address': {'type': 'string'},
+          'city': {'type': 'string'},
         },
         'required': ['property_name', 'new_name'],
       },
@@ -125,6 +143,22 @@ final List<Map<String, dynamic>> toolSchemas = [
           'create_property_if_missing': {'type': 'boolean'},
         },
         'required': ['property_name', 'room_label'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'rename_room',
+      'description': '修改房间号/房间名称',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'room_label': {'type': 'string', 'description': '原房号'},
+          'new_label': {'type': 'string', 'description': '新房号'},
+          'property_name': {'type': 'string', 'description': '所属小区，重名时必填'},
+        },
+        'required': ['room_label', 'new_label'],
       },
     },
   },
@@ -177,7 +211,7 @@ final List<Map<String, dynamic>> toolSchemas = [
           'end_date': {'type': 'string'},
           'auto_create_room': {'type': 'boolean'},
         },
-        'required': ['room_label', 'tenant_name', 'rent_due_day', 'base_rent'],
+        'required': ['room_label', 'rent_due_day', 'base_rent'],
       },
     },
   },
@@ -346,7 +380,9 @@ final List<Map<String, dynamic>> toolSchemas = [
     'type': 'function',
     'function': {
       'name': 'record_meter_reading',
-      'description': '录入单种表读数。若用户一次说了水电多种表，请改用 record_meter_readings。',
+      'description':
+          '录入或修改单种表读数。可只改上期或只改本期（previous_reading / current_reading 可只传一个）。'
+          '若用户一次说了水电多种表，请改用 record_meter_readings。',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -405,6 +441,87 @@ final List<Map<String, dynamic>> toolSchemas = [
           'note': {'type': 'string'},
         },
         'required': ['room_label', 'amount'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'set_period_remark',
+      'description':
+          '设置或修改最近一期未收账期的备注（显示在应收/账期列表）。'
+          'remark 传空字符串表示清空备注。',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'room_label': {'type': 'string'},
+          'property_name': {'type': 'string'},
+          'remark': {'type': 'string', 'description': '备注内容；空则清空'},
+        },
+        'required': ['room_label', 'remark'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'add_period_fee',
+      'description':
+          '给最近一期未收账期加一项一次性额外费用（名称+金额）。'
+          '不是每月附加费；同名则覆盖金额。amount=0 等同删除。',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'room_label': {'type': 'string'},
+          'property_name': {'type': 'string'},
+          'name': {'type': 'string', 'description': '费用名称，如维修费、卫生清扫'},
+          'amount': {'type': 'number'},
+        },
+        'required': ['room_label', 'name', 'amount'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'remove_period_fee',
+      'description': '按名称删除本月一次性额外费用',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'room_label': {'type': 'string'},
+          'property_name': {'type': 'string'},
+          'name': {'type': 'string'},
+        },
+        'required': ['room_label', 'name'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'set_period_fees',
+      'description':
+          '覆盖设置本月全部一次性额外费用列表。空数组=清空。'
+          '与每月附加费（set_lease_extras）无关。',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'room_label': {'type': 'string'},
+          'property_name': {'type': 'string'},
+          'fees': {
+            'type': 'array',
+            'items': {
+              'type': 'object',
+              'properties': {
+                'name': {'type': 'string'},
+                'amount': {'type': 'number'},
+              },
+              'required': ['name', 'amount'],
+            },
+          },
+        },
+        'required': ['room_label', 'fees'],
       },
     },
   },
@@ -488,6 +605,8 @@ class AgentToolRunner {
         return '删除小区「${args['property_name']}」及其全部房间租约';
       case 'add_room':
         return '在「${args['property_name']}」下新增房间 ${args['room_label']}';
+      case 'rename_room':
+        return '把房间 ${args['room_label']} 改名为 ${args['new_label']}';
       case 'delete_room':
         return '删除房间 ${args['room_label']}（含租约账期）';
       case 'create_lease':
@@ -538,6 +657,20 @@ class AgentToolRunner {
         return (a == 0 || a == 0.0)
             ? '清除 ${args['room_label']} 本月优惠'
             : '${args['room_label']} 本月优惠减免 $a';
+      case 'set_period_remark':
+        final r = '${args['remark'] ?? ''}'.trim();
+        return r.isEmpty
+            ? '清空 ${args['room_label']} 本月备注'
+            : '把 ${args['room_label']} 本月备注改为「$r」';
+      case 'add_period_fee':
+        final amt = args['amount'];
+        return (amt == 0 || amt == 0.0)
+            ? '去掉 ${args['room_label']} 本月额外「${args['name']}」'
+            : '给 ${args['room_label']} 加本月额外「${args['name']}」$amt';
+      case 'remove_period_fee':
+        return '去掉 ${args['room_label']} 本月额外「${args['name']}」';
+      case 'set_period_fees':
+        return '设置 ${args['room_label']} 本月额外费用：${_extrasText(args['fees'])}';
       case 'issue_invoice':
         return '为 ${args['room_label']} 最近一期出单冻结清单';
       case 'unfreeze_invoice':
@@ -574,12 +707,16 @@ class AgentToolRunner {
   }
 
   Future<String> commit(PendingAction action) async {
+    if (store.isGuest) {
+      return '游客不能改账本。请先注册/登录成为房东后再操作。';
+    }
     final args = action.args;
     switch (action.tool) {
       case 'add_property':
         await store.addProperty(
           '${args['name']}'.trim(),
           '${args['address'] ?? ''}'.trim(),
+          city: '${args['city'] ?? ''}'.trim(),
         );
         return '已添加小区「${args['name']}」。';
       case 'rename_property':
@@ -590,6 +727,7 @@ class AgentToolRunner {
           id: prop.id,
           name: '${args['new_name']}'.trim(),
           address: args['address']?.toString(),
+          city: args['city']?.toString(),
         );
         return '已改名：${prop.name} → ${args['new_name']}。';
       case 'delete_property':
@@ -605,6 +743,16 @@ class AgentToolRunner {
         );
         await store.addRoom(property.id, '${args['room_label']}'.trim());
         return '已在「${property.name}」添加房间 ${args['room_label']}。';
+      case 'rename_room':
+        final snap = await _resolveOneRoom(
+          '${args['room_label']}'.trim(),
+          args['property_name']?.toString(),
+        );
+        final newLabel = '${args['new_label']}'.trim();
+        if (newLabel.isEmpty) return '新房号不能为空。';
+        final old = snap.room.label;
+        await store.renameRoom(id: snap.room.id, label: newLabel);
+        return '已改房号：$old → $newLabel。';
       case 'delete_room':
         final snap = await _resolveOneRoom(
           '${args['room_label']}'.trim(),
@@ -644,9 +792,10 @@ class AgentToolRunner {
                     )
                   ]
                 : <LeaseExtraItem>[]);
+        final tenantName = '${args['tenant_name'] ?? ''}'.trim();
         await store.saveLease(
           roomId: room.id,
-          tenantName: '${args['tenant_name']}'.trim(),
+          tenantName: tenantName.isEmpty ? '未填写' : tenantName,
           tenantPhone: '${args['tenant_phone'] ?? ''}'.trim(),
           startDate: start,
           endDate: parseYmd(args['end_date']?.toString()),
@@ -766,6 +915,73 @@ class AgentToolRunner {
           note: '${args['note'] ?? '心情减免'}',
         );
         return '已更新优惠。\n${await _previewBill(snap.room.label, null)}';
+      case 'set_period_remark':
+        final snap = await _resolveOneRoom(
+          '${args['room_label']}'.trim(),
+          args['property_name']?.toString(),
+        );
+        final lease = snap.lease;
+        if (lease == null) return '${snap.room.label} 还没有在租租约。';
+        final periodId = await _db.latestOpenPeriodIdForLease(lease.id);
+        if (periodId == null) return '${snap.room.label} 没有未收账期。';
+        final remark = '${args['remark'] ?? ''}'.trim();
+        await store.updatePeriodRemark(periodId: periodId, remark: remark);
+        return remark.isEmpty
+            ? '已清空 ${snap.room.label} 本月备注。'
+            : '已更新 ${snap.room.label} 本月备注：「$remark」。';
+      case 'add_period_fee':
+        final snap = await _resolveOneRoom(
+          '${args['room_label']}'.trim(),
+          args['property_name']?.toString(),
+        );
+        final lease = snap.lease;
+        if (lease == null) return '${snap.room.label} 还没有在租租约。';
+        final periodId = await _db.latestOpenPeriodIdForLease(lease.id);
+        if (periodId == null) return '${snap.room.label} 没有未收账期。';
+        final feeName = '${args['name']}'.trim();
+        final feeAmt = _asDouble(args['amount']) ?? 0;
+        await store.upsertPeriodFee(
+          periodId: periodId,
+          name: feeName,
+          amount: feeAmt,
+        );
+        return feeAmt <= 0
+            ? '已去掉本月额外「$feeName」。\n${await _previewBill(snap.room.label, null)}'
+            : '已加本月额外「$feeName」$feeAmt。\n${await _previewBill(snap.room.label, null)}';
+      case 'remove_period_fee':
+        final snap = await _resolveOneRoom(
+          '${args['room_label']}'.trim(),
+          args['property_name']?.toString(),
+        );
+        final lease = snap.lease;
+        if (lease == null) return '${snap.room.label} 还没有在租租约。';
+        final periodId = await _db.latestOpenPeriodIdForLease(lease.id);
+        if (periodId == null) return '${snap.room.label} 没有未收账期。';
+        final rmName = '${args['name']}'.trim();
+        await store.removePeriodFee(periodId: periodId, name: rmName);
+        return '已去掉本月额外「$rmName」。\n${await _previewBill(snap.room.label, null)}';
+      case 'set_period_fees':
+        final snap = await _resolveOneRoom(
+          '${args['room_label']}'.trim(),
+          args['property_name']?.toString(),
+        );
+        final lease = snap.lease;
+        if (lease == null) return '${snap.room.label} 还没有在租租约。';
+        final periodId = await _db.latestOpenPeriodIdForLease(lease.id);
+        if (periodId == null) return '${snap.room.label} 没有未收账期。';
+        final oldFees = await _db.listPeriodFees(periodId);
+        for (final f in oldFees) {
+          await store.removePeriodFee(periodId: periodId, name: f.name);
+        }
+        for (final e in _parseExtras(args['fees'])) {
+          if (e.amount <= 0) continue;
+          await store.upsertPeriodFee(
+            periodId: periodId,
+            name: e.name,
+            amount: e.amount,
+          );
+        }
+        return '已更新本月额外费用。\n${await _previewBill(snap.room.label, null)}';
       case 'issue_invoice':
         final snap = await _resolveOneRoom(
           '${args['room_label']}'.trim(),
@@ -789,7 +1005,7 @@ class AgentToolRunner {
           return '${snap.room.label} 没有已冻结的账期可解除。';
         }
         final bill = await store.unfreezeBill(periodId);
-        return '已解除冻结，可改抄表/优惠后重新出单。\n${bill.toShareText()}';
+        return '已解除冻结，可改抄表/优惠/额外费用后重新出单。\n${bill.toShareText()}';
       case 'mark_period_paid':
         final label = '${args['room_label']}'.trim();
         final due = store.pending.where((e) => e.roomLabel == label).toList();
@@ -846,15 +1062,22 @@ class AgentToolRunner {
         return '表种请用 电/水/燃气（收到：${r['kind']}）';
       }
       final current = _asDouble(r['current_reading']);
-      if (current == null) return '${meterKindLabel(kind)}表缺少本期读数';
+      final previous = _asDouble(r['previous_reading']);
+      if (current == null && previous == null) {
+        return '${meterKindLabel(kind)}表缺少读数（可只说本月或只说上月）';
+      }
       await store.recordMeterReading(
         leaseId: lease.id,
         kind: kind,
         reading: current,
         periodId: periodId,
-        previousReading: _asDouble(r['previous_reading']),
+        previousReading: previous,
       );
-      done.add(meterKindLabel(kind));
+      final tip = [
+        if (previous != null) '上月$previous',
+        if (current != null) '本月$current',
+      ].join('→');
+      done.add('${meterKindLabel(kind)}表($tip)');
     }
     final bill =
         await _previewBill(snap.room.label, args['property_name']?.toString());
