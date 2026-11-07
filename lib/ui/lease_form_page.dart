@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../domain/models.dart';
 import '../state/app_store.dart';
+import 'busy.dart';
 import 'format.dart';
 
 class _ExtraRow {
@@ -141,9 +142,7 @@ class _LeaseFormPageState extends State<LeaseFormPage> {
           children: [
             TextFormField(
               controller: _name,
-              decoration: const InputDecoration(labelText: '租户姓名'),
-              validator: (v) =>
-                  (v == null || v.trim().isEmpty) ? '请填写姓名' : null,
+              decoration: const InputDecoration(labelText: '租户姓名（可选）'),
             ),
             TextFormField(
               controller: _phone,
@@ -312,21 +311,26 @@ class _LeaseFormPageState extends State<LeaseFormPage> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _saving = true);
     try {
-      await context.read<AppStore>().saveLease(
-            leaseId: widget.lease?.id,
-            roomId: widget.roomId,
-            tenantName: _name.text.trim(),
-            tenantPhone: _phone.text.trim(),
-            startDate: _start,
-            endDate: _end,
-            rentDueDay: int.parse(_dueDay.text.trim()),
-            baseRent: parseYuan(_rent.text)!,
-            deposit: parseYuan(_deposit.text) ?? 0,
-            electricPrice: parseYuan(_electric.text) ?? 0,
-            waterPrice: parseYuan(_water.text) ?? 0,
-            gasPrice: parseYuan(_gas.text) ?? 0,
-            extras: _collectExtras(),
-          );
+      await runBusy(
+        context,
+        message: '正在保存并生成账期…',
+        task: () => context.read<AppStore>().saveLease(
+              leaseId: widget.lease?.id,
+              roomId: widget.roomId,
+              tenantName:
+                  _name.text.trim().isEmpty ? '未填写' : _name.text.trim(),
+              tenantPhone: _phone.text.trim(),
+              startDate: _start,
+              endDate: _end,
+              rentDueDay: int.parse(_dueDay.text.trim()),
+              baseRent: parseYuan(_rent.text)!,
+              deposit: parseYuan(_deposit.text) ?? 0,
+              electricPrice: parseYuan(_electric.text) ?? 0,
+              waterPrice: parseYuan(_water.text) ?? 0,
+              gasPrice: parseYuan(_gas.text) ?? 0,
+              extras: _collectExtras(),
+            ),
+      );
       if (mounted) Navigator.pop(context);
     } finally {
       if (mounted) setState(() => _saving = false);

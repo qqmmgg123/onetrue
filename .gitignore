@@ -58,3 +58,8 @@ key.properties
 .env.*
 *.pem
 supabase/env.local
+supabase/dart_defines.json
+
+# Independent web app (https://github.com/qqmmgg123/onetrue-web)
+/share-web/
+

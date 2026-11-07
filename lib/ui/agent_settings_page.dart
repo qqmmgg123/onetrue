@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../agent/agent_settings.dart';
+import '../agent/llm_providers.dart';
+import '../config/baked_env.dart';
 import '../sync/sync_settings.dart';
 
 class AgentSettingsPage extends StatefulWidget {
@@ -15,17 +17,29 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
   final _baseUrl = TextEditingController();
   final _apiKey = TextEditingController();
   final _model = TextEditingController();
+  final _zhipuKey = TextEditingController();
+  final _zhipuBase = TextEditingController();
+  final _zhipuChatModel = TextEditingController();
+  final _baiduLlmKey = TextEditingController();
+  final _baiduLlmBase = TextEditingController();
+  final _baiduLlmModel = TextEditingController();
+  final _siliconChatModel = TextEditingController();
+  final _oneApiBase = TextEditingController();
+  final _oneApiKey = TextEditingController();
+  final _oneApiModel = TextEditingController();
   final _groqApiKey = TextEditingController();
   final _asrBaseUrl = TextEditingController();
   final _asrApiKey = TextEditingController();
   final _asrModel = TextEditingController();
-  final _supabaseUrl = TextEditingController();
-  final _supabaseAnon = TextEditingController();
+  final _databaseUrl = TextEditingController();
   final _ownerId = TextEditingController();
+  String _llmProvider = LlmProviderId.auto;
   bool _useLlm = false;
   bool _useCloudAsr = true;
   bool _syncEnabled = false;
   bool _loading = true;
+  bool _bundled = false;
+  bool _showDeepseek = false;
 
   @override
   void initState() {
@@ -40,9 +54,21 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
     await sync.load();
     if (!mounted) return;
     setState(() {
+      _bundled = BakedEnv.hasBundle;
+      _llmProvider = s.llmProvider;
       _baseUrl.text = s.baseUrl;
       _apiKey.text = s.apiKey;
       _model.text = s.model;
+      _zhipuKey.text = s.zhipuApiKey;
+      _zhipuBase.text = s.zhipuBaseUrl;
+      _zhipuChatModel.text = s.zhipuChatModel;
+      _baiduLlmKey.text = s.baiduLlmApiKey;
+      _baiduLlmBase.text = s.baiduLlmBaseUrl;
+      _baiduLlmModel.text = s.baiduLlmModel;
+      _siliconChatModel.text = s.siliconChatModel;
+      _oneApiBase.text = s.oneApiBaseUrl;
+      _oneApiKey.text = s.oneApiKey;
+      _oneApiModel.text = s.oneApiModel;
       _groqApiKey.text = s.groqApiKey;
       _asrBaseUrl.text = s.asrBaseUrl;
       _asrApiKey.text = s.asrApiKey;
@@ -50,9 +76,9 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
       _useLlm = s.useLlm;
       _useCloudAsr = s.useCloudAsr;
       _syncEnabled = sync.enabled;
-      _supabaseUrl.text = sync.supabaseUrl;
-      _supabaseAnon.text = sync.anonKey;
+      _databaseUrl.text = sync.databaseUrl;
       _ownerId.text = sync.ownerId;
+      _showDeepseek = s.llmProvider == LlmProviderId.deepseek;
       _loading = false;
     });
   }
@@ -62,14 +88,44 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
     _baseUrl.dispose();
     _apiKey.dispose();
     _model.dispose();
+    _zhipuKey.dispose();
+    _zhipuBase.dispose();
+    _zhipuChatModel.dispose();
+    _baiduLlmKey.dispose();
+    _baiduLlmBase.dispose();
+    _baiduLlmModel.dispose();
+    _siliconChatModel.dispose();
+    _oneApiBase.dispose();
+    _oneApiKey.dispose();
+    _oneApiModel.dispose();
     _groqApiKey.dispose();
     _asrBaseUrl.dispose();
     _asrApiKey.dispose();
     _asrModel.dispose();
-    _supabaseUrl.dispose();
-    _supabaseAnon.dispose();
+    _databaseUrl.dispose();
     _ownerId.dispose();
     super.dispose();
+  }
+
+  String get _providerHint {
+    switch (_llmProvider) {
+      case LlmProviderId.auto:
+        return BakedEnv.hasOneApi || _oneApiBase.text.trim().isNotEmpty
+            ? '已配 One API 时只走网关；否则智谱 → 百度 → 硅基自动切换'
+            : '自动：智谱 → 百度 → 硅基（失败才换下一家）';
+      case LlmProviderId.zhipu:
+        return '仅用智谱 glm-4-flash（免费档，工具调用较稳）';
+      case LlmProviderId.baidu:
+        return '仅用百度千帆（需 BAIDU_LLM_API_KEY）';
+      case LlmProviderId.silicon:
+        return '仅用硅基流动（复用 ASR_API_KEY）';
+      case LlmProviderId.oneapi:
+        return '仅用自建 One API / New API 网关';
+      case LlmProviderId.deepseek:
+        return 'DeepSeek 按量付费';
+      default:
+        return '';
+    }
   }
 
   @override
@@ -81,142 +137,287 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
           : ListView(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
               children: [
+                if (_bundled) ...[
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Text(
+                        '服务商配置已随安装包内置（打包时来自 supabase/env.local）。\n'
+                        '同步数据库：Neon（直连 Postgres）。手机上只需开关与选择对话厂商。',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('启用大模型'),
-                  subtitle: const Text('关闭时用本地说法解析，无需联网 Key'),
+                  subtitle: Text(
+                    _bundled && BakedEnv.hasAnyChatLlmKey
+                        ? '已内置对话 Key（免费级联或网关）'
+                        : '关闭时用本地说法解析，无需联网 Key',
+                  ),
                   value: _useLlm,
                   onChanged: (v) => setState(() => _useLlm = v),
                 ),
                 const SizedBox(height: 8),
-                TextField(
-                  controller: _baseUrl,
+                Text('对话模型', style: Theme.of(context).textTheme.titleSmall),
+                const SizedBox(height: 4),
+                DropdownButtonFormField<String>(
+                  value: LlmProviderId.visibleChoices.contains(_llmProvider) ||
+                          _llmProvider == LlmProviderId.deepseek
+                      ? _llmProvider
+                      : LlmProviderId.auto,
                   decoration: const InputDecoration(
-                    labelText: '对话 API Base URL',
-                    hintText: 'https://api.deepseek.com/v1',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  items: [
+                    ...LlmProviderId.visibleChoices.map(
+                      (id) => DropdownMenuItem(
+                        value: id,
+                        child: Text(LlmProviderId.label(id)),
+                      ),
+                    ),
+                    if (_showDeepseek)
+                      DropdownMenuItem(
+                        value: LlmProviderId.deepseek,
+                        child: Text(LlmProviderId.label(LlmProviderId.deepseek)),
+                      ),
+                  ],
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setState(() => _llmProvider = v);
+                  },
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 6, bottom: 8),
+                  child: Text(
+                    _providerHint,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Colors.grey.shade700,
+                        ),
                   ),
                 ),
-                TextField(
-                  controller: _model,
-                  decoration: const InputDecoration(
-                    labelText: '对话模型名',
-                    hintText: 'deepseek-chat',
+                if (!_bundled) ...[
+                  if (_llmProvider == LlmProviderId.zhipu ||
+                      _llmProvider == LlmProviderId.auto) ...[
+                    TextField(
+                      controller: _zhipuKey,
+                      decoration: const InputDecoration(
+                        labelText: '智谱 API Key',
+                        hintText: 'https://open.bigmodel.cn',
+                      ),
+                      obscureText: true,
+                    ),
+                    TextField(
+                      controller: _zhipuChatModel,
+                      decoration: const InputDecoration(
+                        labelText: '智谱对话模型',
+                        hintText: 'glm-4-flash',
+                      ),
+                    ),
+                  ],
+                  if (_llmProvider == LlmProviderId.baidu ||
+                      _llmProvider == LlmProviderId.auto) ...[
+                    TextField(
+                      controller: _baiduLlmKey,
+                      decoration: const InputDecoration(
+                        labelText: '百度千帆 API Key（对话）',
+                        hintText: 'Bearer，与 ASR 的 AK/SK 不同',
+                      ),
+                      obscureText: true,
+                    ),
+                    TextField(
+                      controller: _baiduLlmModel,
+                      decoration: const InputDecoration(
+                        labelText: '百度对话模型',
+                        hintText: 'ernie-speed-8k',
+                      ),
+                    ),
+                  ],
+                  if (_llmProvider == LlmProviderId.silicon ||
+                      _llmProvider == LlmProviderId.auto) ...[
+                    TextField(
+                      controller: _asrApiKey,
+                      decoration: const InputDecoration(
+                        labelText: '硅基 API Key（对话/ASR 共用）',
+                      ),
+                      obscureText: true,
+                    ),
+                    TextField(
+                      controller: _siliconChatModel,
+                      decoration: const InputDecoration(
+                        labelText: '硅基对话模型',
+                        hintText: 'Qwen/Qwen2.5-7B-Instruct',
+                      ),
+                    ),
+                  ],
+                  if (_llmProvider == LlmProviderId.oneapi ||
+                      _llmProvider == LlmProviderId.auto) ...[
+                    TextField(
+                      controller: _oneApiBase,
+                      decoration: const InputDecoration(
+                        labelText: 'One API Base URL',
+                        hintText: 'https://your-host/v1',
+                      ),
+                    ),
+                    TextField(
+                      controller: _oneApiKey,
+                      decoration: const InputDecoration(
+                        labelText: 'One API Key',
+                      ),
+                      obscureText: true,
+                    ),
+                    TextField(
+                      controller: _oneApiModel,
+                      decoration: const InputDecoration(
+                        labelText: 'One API 模型（可空=网关默认）',
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  ExpansionTile(
+                    initiallyExpanded: _showDeepseek,
+                    title: const Text('高级 · DeepSeek（付费）'),
+                    subtitle: const Text('默认隐藏；需要时再启用'),
+                    onExpansionChanged: (open) {
+                      setState(() {
+                        _showDeepseek = open;
+                        if (open && _llmProvider != LlmProviderId.deepseek) {
+                          // 展开不自动切换；用户可在下拉里选 DeepSeek
+                        }
+                      });
+                    },
+                    children: [
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('使用 DeepSeek 对话'),
+                        value: _llmProvider == LlmProviderId.deepseek,
+                        onChanged: (v) {
+                          setState(() {
+                            _llmProvider = v
+                                ? LlmProviderId.deepseek
+                                : LlmProviderId.auto;
+                            _showDeepseek = true;
+                          });
+                        },
+                      ),
+                      TextField(
+                        controller: _baseUrl,
+                        decoration: const InputDecoration(
+                          labelText: 'DeepSeek Base URL',
+                          hintText: 'https://api.deepseek.com/v1',
+                        ),
+                      ),
+                      TextField(
+                        controller: _model,
+                        decoration: const InputDecoration(
+                          labelText: 'DeepSeek 模型',
+                          hintText: 'deepseek-chat',
+                        ),
+                      ),
+                      TextField(
+                        controller: _apiKey,
+                        decoration: const InputDecoration(
+                          labelText: 'DeepSeek API Key',
+                        ),
+                        obscureText: true,
+                      ),
+                    ],
                   ),
-                ),
-                TextField(
-                  controller: _apiKey,
-                  decoration: const InputDecoration(
-                    labelText: '对话 API Key',
-                    hintText: 'sk-...',
-                  ),
-                  obscureText: true,
-                ),
+                ],
                 const SizedBox(height: 16),
                 Text('语音输入', style: Theme.of(context).textTheme.titleSmall),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('云端语音转写（级联）'),
-                  subtitle: const Text(
-                    '优先 Groq Whisper（5秒）→ SenseVoice（5秒）→ 系统语音（若可用）',
+                  subtitle: Text(
+                    _bundled
+                        ? '百度→Groq→SenseVoice；失败后再离线 Vosk / 系统语音。'
+                        : '开启后按百度→Groq→硅基顺序尝试',
                   ),
                   value: _useCloudAsr,
                   onChanged: (v) => setState(() => _useCloudAsr = v),
                 ),
-                TextField(
-                  controller: _groqApiKey,
-                  decoration: const InputDecoration(
-                    labelText: 'Groq API Key（第一优先）',
-                    hintText: 'console.groq.com 的 gsk-...',
+                if (!_bundled) ...[
+                  TextField(
+                    controller: _groqApiKey,
+                    decoration: const InputDecoration(
+                      labelText: 'Groq API Key（语音）',
+                    ),
+                    obscureText: true,
                   ),
-                  obscureText: true,
-                ),
-                TextField(
-                  controller: _asrBaseUrl,
-                  decoration: const InputDecoration(
-                    labelText: 'SenseVoice Base URL（第二优先）',
-                    hintText: 'https://api.siliconflow.cn/v1',
+                  TextField(
+                    controller: _asrBaseUrl,
+                    decoration: const InputDecoration(
+                      labelText: '硅基 ASR Base URL',
+                      hintText: 'https://api.siliconflow.cn/v1',
+                    ),
                   ),
-                ),
-                TextField(
-                  controller: _asrModel,
-                  decoration: const InputDecoration(
-                    labelText: 'SenseVoice 模型名',
-                    hintText: 'FunAudioLLM/SenseVoiceSmall',
+                  TextField(
+                    controller: _asrModel,
+                    decoration: const InputDecoration(
+                      labelText: 'SenseVoice 模型',
+                      hintText: 'FunAudioLLM/SenseVoiceSmall',
+                    ),
                   ),
-                ),
-                TextField(
-                  controller: _asrApiKey,
-                  decoration: const InputDecoration(
-                    labelText: '硅基流动 API Key',
-                    hintText: 'sk-...',
-                  ),
-                  obscureText: true,
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '级联顺序：\n'
-                  '1) Groq whisper-large-v3-turbo（≤5秒）\n'
-                  '2) 硅基 SenseVoiceSmall（≤5秒）\n'
-                  '3) 系统自带语音识别（非大模型；手机有才用）\n'
-                  '任一步超时/额度不足/报错则试下一步。\n'
-                  'Key 只存在本机。Groq 需能访问国际网络。',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-                const SizedBox(height: 24),
-                Text('数据同步（Supabase）',
-                    style: Theme.of(context).textTheme.titleSmall),
+                ],
+                const SizedBox(height: 16),
+                Text('Neon 同步', style: Theme.of(context).textTheme.titleSmall),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: const Text('开启静默同步'),
-                  subtitle: const Text(
-                    '本地仍是主库；打开 App 后台推拉。当前同步：小区/房间/租户/租约/附加费/账期/抄表/优惠/发票/收款',
-                  ),
+                  title: const Text('启用云端同步'),
                   value: _syncEnabled,
                   onChanged: (v) => setState(() => _syncEnabled = v),
                 ),
-                TextField(
-                  controller: _supabaseUrl,
-                  decoration: const InputDecoration(
-                    labelText: 'Supabase Project URL',
-                    hintText: 'https://xxxx.supabase.co',
+                if (!BakedEnv.hasSyncDb)
+                  TextField(
+                    controller: _databaseUrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Neon DATABASE_URL',
+                      hintText:
+                          'postgresql://user:pass@ep-xxx.region.aws.neon.tech/neondb?sslmode=require',
+                    ),
+                    obscureText: true,
+                    maxLines: 2,
                   ),
-                ),
-                TextField(
-                  controller: _supabaseAnon,
-                  decoration: const InputDecoration(
-                    labelText: 'anon public Key',
-                    hintText: 'eyJ...',
-                  ),
-                  obscureText: true,
-                ),
                 TextField(
                   controller: _ownerId,
+                  readOnly: true,
                   decoration: const InputDecoration(
-                    labelText: '本机 owner_id（多端请保持一致）',
+                    labelText: 'owner_id（登录账号自动绑定）',
+                    helperText: '多端用同一手机号登录即可同步；游客无 owner',
                   ),
                 ),
                 Align(
                   alignment: Alignment.centerLeft,
                   child: TextButton.icon(
-                    onPressed: () {
-                      Clipboard.setData(ClipboardData(text: _ownerId.text));
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('owner_id 已复制')),
-                      );
-                    },
+                    onPressed: _ownerId.text.trim().isEmpty
+                        ? null
+                        : () {
+                            Clipboard.setData(
+                              ClipboardData(text: _ownerId.text),
+                            );
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('owner_id 已复制')),
+                            );
+                          },
                     icon: const Icon(Icons.copy, size: 18),
                     label: const Text('复制 owner_id'),
                   ),
                 ),
-                Text(
-                  '在 Supabase SQL Editor 执行仓库里 supabase/schema.sql，'
-                  '再填 URL 与 anon key。多台手机要共享数据时，把同一 owner_id 粘到每台。',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
+                if (!_bundled)
+                  Text(
+                    '开发调试可在此填写 DATABASE_URL；正式打包请写 supabase/env.local 后用 build_apk.ps1。',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
                 const SizedBox(height: 24),
                 FilledButton(
                   onPressed: () async {
                     await AgentSettings.instance.save(
+                      llmProvider: _llmProvider,
                       baseUrl: _baseUrl.text,
                       apiKey: _apiKey.text,
                       model: _model.text,
@@ -226,12 +427,21 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                       asrBaseUrl: _asrBaseUrl.text,
                       asrModel: _asrModel.text,
                       asrApiKey: _asrApiKey.text,
+                      siliconChatModel: _siliconChatModel.text,
+                      zhipuApiKey: _zhipuKey.text,
+                      zhipuBaseUrl: _zhipuBase.text,
+                      zhipuChatModel: _zhipuChatModel.text,
+                      baiduLlmApiKey: _baiduLlmKey.text,
+                      baiduLlmBaseUrl: _baiduLlmBase.text,
+                      baiduLlmModel: _baiduLlmModel.text,
+                      oneApiBaseUrl: _oneApiBase.text,
+                      oneApiKey: _oneApiKey.text,
+                      oneApiModel: _oneApiModel.text,
                     );
                     await SyncSettings.instance.save(
-                      enabled: _syncEnabled,
-                      supabaseUrl: _supabaseUrl.text,
-                      anonKey: _supabaseAnon.text,
-                      ownerId: _ownerId.text,
+                      enabled: _syncEnabled &&
+                          SyncSettings.instance.ownerId.trim().isNotEmpty,
+                      databaseUrl: _databaseUrl.text,
                     );
                     if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(

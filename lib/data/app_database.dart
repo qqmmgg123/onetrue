@@ -66,7 +66,7 @@ class AppDatabase {
     final path = p.join(dir.path, 'rent_agent.db');
     _db = await openDatabase(
       path,
-      version: 5,
+      version: 8,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -76,12 +76,18 @@ class AppDatabase {
         await _upgradeToV3(db);
         await _upgradeToV4(db);
         await _upgradeToV5(db);
+        await _upgradeToV6(db);
+        await _upgradeToV7(db);
+        await _upgradeToV8(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) await _upgradeToV2(db);
         if (oldVersion < 3) await _upgradeToV3(db);
         if (oldVersion < 4) await _upgradeToV4(db);
         if (oldVersion < 5) await _upgradeToV5(db);
+        if (oldVersion < 6) await _upgradeToV6(db);
+        if (oldVersion < 7) await _upgradeToV7(db);
+        if (oldVersion < 8) await _upgradeToV8(db);
       },
     );
     return _db!;
@@ -318,6 +324,39 @@ class AppDatabase {
     ''');
   }
 
+  Future<void> _upgradeToV6(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE rooms ADD COLUMN video_url TEXT NOT NULL DEFAULT ''",
+    );
+    await _tryExec(
+      db,
+      "ALTER TABLE rooms ADD COLUMN video_poster_url TEXT NOT NULL DEFAULT ''",
+    );
+  }
+
+  Future<void> _upgradeToV7(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE rent_periods ADD COLUMN remark TEXT NOT NULL DEFAULT ''",
+    );
+  }
+
+  Future<void> _upgradeToV8(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE properties ADD COLUMN city TEXT NOT NULL DEFAULT ''",
+    );
+    await _tryExec(
+      db,
+      "ALTER TABLE rooms ADD COLUMN listing_status TEXT NOT NULL DEFAULT 'draft'",
+    );
+    await _tryExec(
+      db,
+      'ALTER TABLE rooms ADD COLUMN listed_at TEXT',
+    );
+  }
+
   Future<void> _tryExec(Database db, String sql) async {
     try {
       await db.execute(sql);
@@ -342,6 +381,28 @@ class AppDatabase {
       where: 'id = ?',
       whereArgs: [localId],
     );
+  }
+
+  /// 换云端库（如 Supabase→Neon）后强制全量再推。
+  Future<void> markAllSyncDirty() async {
+    const tables = [
+      'properties',
+      'rooms',
+      'tenants',
+      'leases',
+      'lease_extras',
+      'rent_periods',
+      'meter_readings',
+      'period_adjustments',
+      'invoices',
+      'payments',
+    ];
+    final db = await database;
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final t in tables) {
+      await db.update(t, {'dirty': 1, 'updated_at': now});
+    }
+    await setSyncState('last_sync_at', '');
   }
 
   Future<String?> getSyncState(String key) async {
@@ -388,21 +449,18 @@ class AppDatabase {
       where: 'deleted_at IS NULL',
       orderBy: 'id DESC',
     );
-    return rows
-        .map(
-          (r) => Property(
-            id: r['id'] as int,
-            name: r['name'] as String,
-            address: r['address'] as String,
-          ),
-        )
-        .toList();
+    return rows.map(_propertyFrom).toList();
   }
 
-  Future<int> insertProperty(String name, String address) async {
+  Future<int> insertProperty(
+    String name,
+    String address, {
+    String city = '',
+  }) async {
     return (await database).insert('properties', {
       'name': name,
       'address': address,
+      'city': city.trim(),
       ..._newSyncCols(),
     });
   }
@@ -423,15 +481,49 @@ class AppDatabase {
     required int id,
     required String name,
     String? address,
+    String? city,
   }) async {
     final patch = <String, Object?>{'name': name, ..._touchSyncCols()};
     if (address != null) patch['address'] = address;
+    if (city != null) patch['city'] = city.trim();
     await (await database).update(
       'properties',
       patch,
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  /// 退出登录时清空本地业务缓存，避免串号。
+  Future<void> clearBusinessData() async {
+    final db = await database;
+    await db.execute('PRAGMA foreign_keys = OFF');
+    const tables = [
+      'payments',
+      'invoices',
+      'period_adjustments',
+      'meter_readings',
+      'rent_periods',
+      'lease_extras',
+      'leases',
+      'tenants',
+      'rooms',
+      'properties',
+    ];
+    for (final t in tables) {
+      await db.delete(t);
+    }
+    await db.execute('PRAGMA foreign_keys = ON');
+    await setSyncState('last_sync_at', '');
+  }
+
+  /// 是否还有未同步归属的本地业务数据（用于登录后认领）。
+  Future<bool> hasLocalBusinessData() async {
+    final rows = await (await database).rawQuery(
+      'SELECT COUNT(*) AS c FROM properties WHERE deleted_at IS NULL',
+    );
+    final c = rows.first['c'];
+    return (c is int ? c : int.tryParse('$c') ?? 0) > 0;
   }
 
   Future<List<RoomSnapshot>> roomsForProperty(int propertyId) async {
@@ -444,11 +536,7 @@ class AppDatabase {
     );
     final result = <RoomSnapshot>[];
     for (final row in rooms) {
-      final room = Room(
-        id: row['id'] as int,
-        propertyId: row['property_id'] as int,
-        label: row['label'] as String,
-      );
+      final room = _roomFrom(row);
       final leaseRows = await db.query(
         'leases',
         where: "room_id = ? AND status = 'active' AND deleted_at IS NULL",
@@ -483,6 +571,21 @@ class AppDatabase {
     });
   }
 
+  Future<void> updateRoomLabel({
+    required int id,
+    required String label,
+  }) async {
+    await (await database).update(
+      'rooms',
+      {
+        'label': label.trim(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
   Future<void> deleteRoom(int id) async {
     await (await database).update(
       'rooms',
@@ -498,15 +601,82 @@ class AppDatabase {
   Future<Room?> getRoom(int id) async {
     final rows = await (await database).query(
       'rooms',
-      where: 'id = ?',
+      where: 'id = ? AND deleted_at IS NULL',
       whereArgs: [id],
     );
     if (rows.isEmpty) return null;
-    final r = rows.first;
+    return _roomFrom(rows.first);
+  }
+
+  Property _propertyFrom(Map<String, Object?> r) {
+    return Property(
+      id: r['id'] as int,
+      name: r['name'] as String,
+      address: r['address'] as String? ?? '',
+      city: r['city'] as String? ?? '',
+    );
+  }
+
+  Room _roomFrom(Map<String, Object?> r) {
+    DateTime? listedAt;
+    final rawListed = r['listed_at'] as String?;
+    if (rawListed != null && rawListed.isNotEmpty) {
+      listedAt = DateTime.tryParse(rawListed);
+    }
     return Room(
       id: r['id'] as int,
       propertyId: r['property_id'] as int,
       label: r['label'] as String,
+      videoUrl: r['video_url'] as String? ?? '',
+      videoPosterUrl: r['video_poster_url'] as String? ?? '',
+      listingStatus: r['listing_status'] as String? ?? kListingDraft,
+      listedAt: listedAt,
+    );
+  }
+
+  Future<void> setRoomListing({
+    required int roomId,
+    required bool listed,
+  }) async {
+    final now = DateTime.now().toUtc().toIso8601String();
+    await (await database).update(
+      'rooms',
+      {
+        'listing_status': listed ? kListingListed : kListingDraft,
+        'listed_at': listed ? now : null,
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [roomId],
+    );
+  }
+
+  Future<String?> roomUuid(int roomId) async {
+    final rows = await (await database).query(
+      'rooms',
+      columns: ['uuid'],
+      where: 'id = ?',
+      whereArgs: [roomId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['uuid'] as String?;
+  }
+
+  Future<void> setRoomVideo({
+    required int roomId,
+    required String videoUrl,
+    String posterUrl = '',
+  }) async {
+    await (await database).update(
+      'rooms',
+      {
+        'video_url': videoUrl,
+        'video_poster_url': posterUrl,
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [roomId],
     );
   }
 
@@ -527,17 +697,14 @@ class AppDatabase {
 
     final result = <RoomSnapshot>[];
     for (final row in rooms) {
-      final room = Room(
-        id: row['id'] as int,
-        propertyId: row['property_id'] as int,
-        label: row['label'] as String,
-      );
-      final lease = await activeLeaseForRoom(room.id);
+      final full = await getRoom(row['id'] as int);
+      if (full == null) continue;
+      final lease = await activeLeaseForRoom(full.id);
       Tenant? tenant;
       if (lease != null) {
         tenant = await getTenant(lease.tenantId);
       }
-      result.add(RoomSnapshot(room: room, lease: lease, tenant: tenant));
+      result.add(RoomSnapshot(room: full, lease: lease, tenant: tenant));
     }
     return result;
   }
@@ -550,12 +717,7 @@ class AppDatabase {
       orderBy: 'id DESC',
     );
     if (rows.isEmpty) return null;
-    final r = rows.first;
-    return Property(
-      id: r['id'] as int,
-      name: r['name'] as String,
-      address: r['address'] as String,
-    );
+    return _propertyFrom(rows.first);
   }
 
   Future<List<Map<String, Object?>>> inventorySummary() async {
@@ -585,12 +747,7 @@ class AppDatabase {
       whereArgs: [id],
     );
     if (rows.isEmpty) return null;
-    final r = rows.first;
-    return Property(
-      id: r['id'] as int,
-      name: r['name'] as String,
-      address: r['address'] as String,
-    );
+    return _propertyFrom(rows.first);
   }
 
   Future<Lease?> activeLeaseForRoom(int roomId) async {
@@ -958,6 +1115,7 @@ class AppDatabase {
     final rows = await db.rawQuery('''
       SELECT
         p.id, p.lease_id, p.period_start, p.period_end, p.due_date, p.amount, p.status,
+        COALESCE(p.remark, '') AS remark,
         r.label AS room_label,
         pr.name AS property_name,
         t.name AS tenant_name,
@@ -1053,6 +1211,7 @@ class AppDatabase {
     final rows = await (await database).rawQuery('''
       SELECT
         p.id, p.lease_id, p.period_start, p.period_end, p.due_date, p.amount, p.status,
+        COALESCE(p.remark, '') AS remark,
         l.room_id, l.tenant_id, l.start_date, l.end_date, l.rent_due_day,
         l.base_rent, l.deposit, l.status AS lease_status,
         l.electric_price, l.water_price, l.gas_price, l.fixed_extra, l.fixed_extra_label,
@@ -1166,15 +1325,32 @@ class AppDatabase {
   }
 
   /// 为账期写入/覆盖「上期+本期」读数对，保证清单能算用量。
+  /// [current]/[previous] 可只传一个：未传的一侧沿用本账期已有值或自动推断。
   Future<void> setPeriodMeterPair({
     required int leaseId,
     required String kind,
     required int periodId,
-    required double current,
+    double? current,
     double? previous,
   }) async {
     final period = await getPeriod(periodId);
     if (period == null) throw StateError('账期不存在');
+    if (current == null && previous == null) {
+      throw StateError('上期/本期读数至少提供一个');
+    }
+
+    final existing = await meterPairForPeriod(leaseId, kind, period);
+    var cur = current ?? existing?.current;
+    var prev = previous ?? existing?.previous;
+
+    // 只改上期、尚无本期时：用上期占位本期，避免无法落库
+    if (cur == null && prev != null) {
+      cur = prev;
+    }
+    if (cur == null) {
+      throw StateError('缺少本期读数');
+    }
+
     final db = await database;
     final prevNote = '上期#$periodId';
 
@@ -1203,8 +1379,7 @@ class AppDatabase {
       [leaseId, kind],
     );
 
-    var prev = previous;
-    if (prev == null) {
+    if (prev == null && previous == null) {
       // 自动上期：其他账期的「本期」，或更早读数（排除其它账期的上期标签）
       final prior = await db.query(
         'meter_readings',
@@ -1237,7 +1412,7 @@ class AppDatabase {
     await insertMeterReading(
       leaseId: leaseId,
       kind: kind,
-      reading: current,
+      reading: cur,
       periodId: periodId,
       note: '本期',
       recordedAt: period.periodEnd.isAfter(DateTime.now())
@@ -1408,6 +1583,88 @@ class AppDatabase {
     return rows.first['note'] as String? ?? '';
   }
 
+  /// 本月一次性额外费用（非每月附加费）。type 存为 fee:名称，兼容 UNIQUE(period_id, type)。
+  static String periodFeeType(String name) => 'fee:${name.trim()}';
+
+  Future<List<({String name, double amount})>> listPeriodFees(int periodId) async {
+    final rows = await (await database).query(
+      'period_adjustments',
+      where: "period_id = ? AND type LIKE 'fee:%' AND deleted_at IS NULL",
+      whereArgs: [periodId],
+      orderBy: 'id ASC',
+    );
+    return rows.map((r) {
+      final type = '${r['type']}';
+      final name = type.startsWith('fee:')
+          ? type.substring(4)
+          : ('${r['note']}'.trim().isEmpty ? '额外费用' : '${r['note']}');
+      return (name: name, amount: (r['amount'] as num).toDouble());
+    }).toList();
+  }
+
+  Future<void> upsertPeriodFee({
+    required int periodId,
+    required String name,
+    required double amount,
+  }) async {
+    final n = name.trim();
+    if (n.isEmpty) throw StateError('费用名称不能为空');
+    final type = periodFeeType(n);
+    final db = await database;
+    final existing = await db.query(
+      'period_adjustments',
+      where: 'period_id = ? AND type = ?',
+      whereArgs: [periodId, type],
+      limit: 1,
+    );
+    if (amount <= 0) {
+      if (existing.isNotEmpty) {
+        await db.update(
+          'period_adjustments',
+          {
+            'deleted_at': DateTime.now().toUtc().toIso8601String(),
+            'amount': 0,
+            ..._touchSyncCols(),
+          },
+          where: 'id = ?',
+          whereArgs: [existing.first['id']],
+        );
+      }
+      return;
+    }
+    if (existing.isNotEmpty) {
+      await db.update(
+        'period_adjustments',
+        {
+          'amount': amount,
+          'note': n,
+          'deleted_at': null,
+          ..._touchSyncCols(),
+        },
+        where: 'id = ?',
+        whereArgs: [existing.first['id']],
+      );
+      return;
+    }
+    await db.insert(
+      'period_adjustments',
+      {
+        'period_id': periodId,
+        'type': type,
+        'amount': amount,
+        'note': n,
+        ..._newSyncCols(),
+      },
+    );
+  }
+
+  Future<void> removePeriodFee({
+    required int periodId,
+    required String name,
+  }) async {
+    await upsertPeriodFee(periodId: periodId, name: name, amount: 0);
+  }
+
   Future<int> insertInvoice({
     required int periodId,
     required double total,
@@ -1497,7 +1754,23 @@ class AppDatabase {
         dueDate: parseYmd(r['due_date'] as String)!,
         amount: (r['amount'] as num).toDouble(),
         status: r['status'] as String,
+        remark: '${r['remark'] ?? ''}',
       );
+
+  Future<void> updatePeriodRemark({
+    required int periodId,
+    required String remark,
+  }) async {
+    await (await database).update(
+      'rent_periods',
+      {
+        'remark': remark.trim(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [periodId],
+    );
+  }
 
   // --- chat sessions ---
 

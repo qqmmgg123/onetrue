@@ -160,7 +160,7 @@ class _CalendarPageState extends State<CalendarPage> {
         title: const Text('打开精确闹钟'),
         content: const Text(
           '小米/Android 12+ 可能禁止精确闹钟，导致收租提醒延迟。\n'
-          '请到系统设置 → 应用 → 收租助手 → 闹钟与提醒（或「使用精确闹钟」）允许。',
+          '请到系统设置 → 应用 → 缘初 → 闹钟与提醒（或「使用精确闹钟」）允许。',
         ),
         actions: [
           TextButton(

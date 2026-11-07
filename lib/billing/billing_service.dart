@@ -26,6 +26,7 @@ class BillingService {
         total: invoice.total,
         invoiceId: invoice.id,
         issuedAt: invoice.issuedAt,
+        remark: ctx.period.remark,
       );
     }
     final lines = await _buildLines(ctx);
@@ -40,6 +41,7 @@ class BillingService {
       dueDate: ctx.period.dueDate,
       lines: lines,
       total: total,
+      remark: ctx.period.remark,
     );
   }
 
@@ -76,6 +78,7 @@ class BillingService {
       total: total,
       invoiceId: invoiceId,
       issuedAt: DateTime.now(),
+      remark: ctx.period.remark,
     );
   }
 
@@ -154,6 +157,20 @@ class BillingService {
           amount: amount,
           detail:
               '$usageName ${_n(usage)} $unit（${_n(pair.previous)}→${_n(pair.current)}）× ${_n(price)}元/$unit',
+        ),
+      );
+    }
+
+    final fees = await _db.listPeriodFees(ctx.period.id);
+    var feeIndex = 0;
+    for (final f in fees) {
+      if (f.amount <= 0) continue;
+      lines.add(
+        BillLine(
+          code: 'period_fee_${feeIndex++}',
+          label: f.name,
+          amount: f.amount,
+          detail: '本月额外（非每月固定）',
         ),
       );
     }

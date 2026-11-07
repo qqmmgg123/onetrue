@@ -1,5 +1,5 @@
 name: rent_agent
-description: 本地收租助手（账本、结算、对话 Agent）
+description: 本地缘初（账本、结算、对话 Agent）
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.0+1
+version: 1.0.1+2
 
 environment:
   sdk: '>=3.0.5 <4.0.0'
@@ -45,8 +45,29 @@ dependencies:
   shared_preferences: 2.2.2
   uuid: 3.0.7
   share_plus: 7.2.1
+  # 微信开放平台：分享网页卡片（标题/描述/缩略图）
+  fluwx: 4.6.3
   speech_to_text: 6.5.1
   permission_handler: 11.0.1
+  # Neon / Postgres 同步（直连，不走 Supabase REST）
+  postgres: 2.6.3
+  crypto: 3.0.3
+  video_player: 2.7.2
+  image_picker: 1.0.4
+  # 附图识图前缩小 JPEG，避免手机大图导致硅基超时后误跳百度 OCR
+  image: 4.1.7
+  # 分享海报二维码
+  qr: 3.0.1
+  # 上传前把 HEVC 等重编码为 H.264 MP4，App/网页都能播
+  video_compress: 3.1.3
+  # 解压 Vosk 离线模型 zip（模型首次按需下载，不打进 APK）
+  archive: 3.4.10
+  package_info_plus: ^4.2.0
+  open_filex: ^5.0.0
+  connectivity_plus: ^5.0.2
+  # 游客广场城市定位
+  geolocator: ^10.1.0
+  geocoding: ^2.1.1
 
 dev_dependencies:
   flutter_test:
@@ -58,6 +79,19 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^2.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/icon/app_icon.png
+  adaptive_icon_background: "#E8E8E8"
+  adaptive_icon_foreground: assets/icon/app_icon.png
+  remove_alpha_ios: true
+
+# fluwx：不打包支付；app_id 运行时用 WECHAT_APP_ID 注册（见 supabase/env.local）
+fluwx:
+  no_pay: true
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

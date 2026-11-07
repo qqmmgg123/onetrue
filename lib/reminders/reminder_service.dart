@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -31,7 +33,8 @@ class ReminderService {
   ReminderService._();
   static final ReminderService instance = ReminderService._();
 
-  static const _channelId = 'rent_alarm_v2';
+  /// 改 channel id 才能让系统重建通道（旧通道关掉声音后改代码无效）。
+  static const _channelId = 'rent_alarm_v3';
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -40,6 +43,7 @@ class ReminderService {
   bool _ready = false;
   bool exactAlarmAllowed = true;
   List<ScheduledAlarm> scheduled = [];
+  Timer? _testTimer;
 
   AndroidFlutterLocalNotificationsPlugin? get _android =>
       _plugin.resolvePlatformSpecificImplementation<
@@ -66,14 +70,12 @@ class ReminderService {
         const InitializationSettings(android: android, iOS: ios),
       );
 
-      // 小米/Android 13+：通知权限
       try {
         await _android?.requestPermission();
       } catch (e) {
         debugPrint('requestPermission: $e');
       }
 
-      // 显式建高优先级闹钟通道（带声音振动）
       try {
         await _android?.createNotificationChannel(
           const AndroidNotificationChannel(
@@ -115,7 +117,6 @@ class ReminderService {
       await _android?.requestPermission();
     } catch (_) {}
     try {
-      // Android 12+ 精确闹钟（小米常默认关）
       final status = await Permission.scheduleExactAlarm.request();
       debugPrint('scheduleExactAlarm: $status');
       if (!status.isGranted) {
@@ -127,9 +128,18 @@ class ReminderService {
     try {
       await Permission.notification.request();
     } catch (_) {}
+    try {
+      // 小米后台杀进程常见：请求忽略电池优化
+      final bat = await Permission.ignoreBatteryOptimizations.status;
+      if (!bat.isGranted) {
+        await Permission.ignoreBatteryOptimizations.request();
+      }
+    } catch (e) {
+      debugPrint('ignoreBatteryOptimizations: $e');
+    }
     await _refreshExactAlarmFlag();
     if (!exactAlarmAllowed) {
-      return '系统未允许「闹钟和提醒」。请到：设置 → 应用设置 → 收租助手 → 闹钟和提醒，打开后重试。';
+      return '系统未允许「闹钟和提醒」。请到：设置 → 应用设置 → 缘初 → 闹钟和提醒，打开后重试。';
     }
     return null;
   }
@@ -138,8 +148,12 @@ class ReminderService {
     final permErr = await ensureAlarmPermissions();
     if (permErr != null) throw StateError(permErr);
 
+    _testTimer?.cancel();
+    await _plugin.cancel(999001);
+    await _plugin.cancel(999002);
+
     final when = tz.TZDateTime.now(tz.local).add(Duration(seconds: seconds));
-    // alarmClock 比 exactAllowWhileIdle 更不易被小米省电杀掉
+    // 系统调度：锁屏/后台时靠它
     try {
       await _plugin.zonedSchedule(
         999001,
@@ -164,6 +178,20 @@ class ReminderService {
             UILocalNotificationDateInterpretation.absoluteTime,
       );
     }
+
+    // 前台兜底：App 还在前台时，部分机型系统闹钟不响/不弹，用 Timer 再推一条
+    _testTimer = Timer(Duration(seconds: seconds), () async {
+      try {
+        await _plugin.show(
+          999002,
+          '收租闹钟测试',
+          '前台兜底提醒（若只看到这条，请检查系统「闹钟和提醒」与通知渠道声音）',
+          _alarmDetails(fullscreen: true),
+        );
+      } catch (e) {
+        debugPrint('test show failed: $e');
+      }
+    });
   }
 
   Future<void> reschedule(List<DueItem> pending) async {
@@ -288,6 +316,8 @@ class ReminderService {
         audioAttributesUsage: AudioAttributesUsage.alarm,
         visibility: NotificationVisibility.public,
         ticker: '收租提醒',
+        // 避免被归到静默组
+        channelShowBadge: true,
       ),
       iOS: const DarwinNotificationDetails(
         presentAlert: true,

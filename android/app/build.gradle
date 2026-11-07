@@ -27,7 +27,8 @@ apply from: "$flutterRoot/packages/flutter_tools/gradle/flutter.gradle"
 
 android {
     namespace "com.local.rent.rent_agent"
-    compileSdkVersion flutter.compileSdkVersion
+    // video_compress / media3 需要 34+
+    compileSdkVersion 34
     ndkVersion flutter.ndkVersion
 
     compileOptions {
@@ -72,4 +73,10 @@ flutter {
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    // 离线中文 ASR（模型首次按需下载，不打进 APK）
+    implementation 'com.alphacephei:vosk-android:0.3.47'
+    // 微信 HEVC → H.264 硬编（比 video_compress 稳）
+    implementation 'androidx.media3:media3-transformer:1.4.1'
+    implementation 'androidx.media3:media3-effect:1.4.1'
+    implementation 'androidx.media3:media3-common:1.4.1'
 }

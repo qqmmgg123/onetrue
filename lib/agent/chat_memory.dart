@@ -202,6 +202,9 @@ int contextWindowForModel(String model) {
     if (k != null && k >= 4) return k * 1024;
   }
   if (m.contains('deepseek')) return 65536;
+  if (m.contains('glm-4') || m.contains('glm4')) return 128000;
+  if (m.contains('qwen')) return 32768;
+  if (m.contains('ernie')) return 8192;
   if (m.contains('gpt-4o') || m.contains('claude')) return 128000;
   if (m.contains('32k')) return 32768;
   return 32768;
@@ -294,16 +297,25 @@ SessionSticky mergeStickyFromUtterance(
     next.intent = 'create_lease';
   } else if (_matchAny(t, ['加房间', '加个房', '新增房间', '添加房间']) ||
       (t.contains('加') && t.contains('房') && !t.contains('房租'))) {
-    next.intent ??= 'add_room';
+    next.intent = 'add_room';
   } else if (_matchAny(t, ['加小区', '新小区', '加个房产', '新增小区'])) {
-    next.intent ??= 'add_property';
+    next.intent = 'add_property';
   } else if (_matchAny(t, ['改租约', '改附加费', '改房租', '改收租日', '更新租约']) ||
       (_matchAny(t, ['附加费', '物业费', '网费']) &&
           _matchAny(t, ['改', '加', '换', '设']))) {
     next.intent = 'update_lease';
-  } else if (_matchAny(t, ['抄表', '电表', '水表', '燃气表'])) {
+  } else if (_matchAny(t, ['抄表', '电表', '水表', '燃气表', '煤气表'])) {
     next.intent = 'meter';
-  } else if (_matchAny(t, ['出单', '算房租', '试算', '少收', '优惠'])) {
+  } else if (_matchAny(t, [
+    '出单',
+    '算房租',
+    '试算',
+    '少收',
+    '优惠',
+    '备注',
+    '解冻',
+    '记已收',
+  ])) {
     next.intent = 'billing';
   }
 
@@ -361,7 +373,12 @@ SessionSticky mergeStickyFromUtterance(
 
   if (pending != null) {
     final a = pending.args;
-    next.intent ??= pending.tool;
+    // create_lease 已凑齐并进入「待确认」后清掉意图，避免后续话被当成继续登记
+    if (pending.tool == 'create_lease') {
+      next.intent = null;
+    } else {
+      next.intent = pending.tool;
+    }
     if (a['property_name'] != null) next.propertyName = '${a['property_name']}';
     if (a['room_label'] != null) next.roomLabel = '${a['room_label']}';
     if (a['tenant_name'] != null) next.tenantName = '${a['tenant_name']}';
@@ -377,6 +394,11 @@ SessionSticky mergeStickyFromUtterance(
     }
   }
 
+  // 槽位已齐却仍标着 create_lease：多半是旧会话残留，清掉以免劫持
+  if (next.intent == 'create_lease' && missingLeaseSlots(next).isEmpty) {
+    next.intent = null;
+  }
+
   return next;
 }
 
@@ -389,7 +411,7 @@ bool _matchAny(String text, List<String> keys) => keys.any(text.contains);
 List<String> missingLeaseSlots(SessionSticky s) {
   final missing = <String>[];
   if (s.roomLabel == null || s.roomLabel!.isEmpty) missing.add('房号');
-  if (s.tenantName == null || s.tenantName!.isEmpty) missing.add('租户叫什么');
+  // 租户姓名可选
   if (s.rentDueDay == null) missing.add('每月几号收租');
   if (s.baseRent == null) missing.add('房租多少');
   return missing;

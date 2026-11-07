@@ -41,6 +41,7 @@ class BillPreview {
     required this.total,
     this.invoiceId,
     this.issuedAt,
+    this.remark = '',
   });
 
   final int periodId;
@@ -54,6 +55,7 @@ class BillPreview {
   final double total;
   final int? invoiceId;
   final DateTime? issuedAt;
+  final String remark;
 
   bool get isIssued => invoiceId != null;
 
@@ -61,10 +63,11 @@ class BillPreview {
     final buf = StringBuffer()
       ..writeln('收租清单')
       ..writeln('$propertyName · $roomLabel')
-      ..writeln('租户：$tenantName')
-      ..writeln('账期：${ymd(periodStart)} ~ ${ymd(periodEnd)}')
-      ..writeln('到期：${ymd(dueDate)}')
-      ..writeln('----------');
+      ..writeln('账期：${ymd(periodStart)} ~ ${ymd(periodEnd)}');
+    if (remark.trim().isNotEmpty) {
+      buf.writeln('备注：$remark');
+    }
+    buf.writeln('----------');
     for (final line in lines) {
       final detail = line.detail.isEmpty ? '' : '（${line.detail}）';
       buf.writeln('${line.label}$detail  ${formatYuan(line.amount)}');

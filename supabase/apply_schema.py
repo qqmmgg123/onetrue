@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Apply supabase/schema.sql using DATABASE_URL or URL+DB password."""
+"""Apply supabase/schema.sql using Neon DATABASE_URL from env.local."""
 
 from __future__ import annotations
 
-import os
-import re
 import sys
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / "env.local"
@@ -27,34 +24,21 @@ def load_env(path: Path) -> dict[str, str]:
     return data
 
 
-def build_dsn(env: dict[str, str]) -> str:
-    if env.get("DATABASE_URL"):
-        return env["DATABASE_URL"]
-    url = env.get("SUPABASE_URL", "").rstrip("/")
-    password = env.get("SUPABASE_DB_PASSWORD", "")
-    if not url or not password:
-        raise SystemExit(
-            "请在 supabase/env.local 填写 DATABASE_URL，"
-            "或同时填写 SUPABASE_URL + SUPABASE_DB_PASSWORD"
-        )
-    # https://xxxx.supabase.co → xxxx
-    host = urlparse(url).hostname or ""
-    m = re.match(r"^([a-z0-9]+)\.supabase\.co$", host)
-    if not m:
-        raise SystemExit(f"无法从 SUPABASE_URL 解析项目 ref: {url}")
-    ref = m.group(1)
-    user = "postgres"
-    # Direct connection
-    return (
-        f"postgresql://{user}:{quote_plus(password)}"
-        f"@db.{ref}.supabase.co:5432/postgres"
-        f"?sslmode=require"
-    )
-
-
 def main() -> None:
     env = load_env(ENV_FILE)
-    dsn = build_dsn(env)
+    dsn = env.get("DATABASE_URL", "").strip()
+    if not dsn:
+        raise SystemExit(
+            "请在 supabase/env.local 填写 Neon 的 DATABASE_URL\n"
+            "例: postgresql://user:pass@ep-xxxx.region.aws.neon.tech/neondb?sslmode=require"
+        )
+    if "supabase.co" in dsn:
+        print(
+            "警告: 当前 DATABASE_URL 仍指向 Supabase。"
+            "国内访问 HTTPS/部分链路不稳；建议改成 Neon 连接串。",
+            file=sys.stderr,
+        )
+
     sql = SCHEMA.read_text(encoding="utf-8")
     try:
         import psycopg2
@@ -73,18 +57,13 @@ def main() -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(sql)
-        print("OK: schema.sql 已执行完成")
+        print("OK: schema.sql 已执行完成（Neon/Postgres）")
     finally:
         conn.close()
 
-    # 顺带写出给 App 用的提示（不含密码）
-    url = env.get("SUPABASE_URL", "")
-    anon = env.get("SUPABASE_ANON_KEY", "")
-    if url and anon:
-        print()
-        print("App「对话设置」可填：")
-        print(f"  Project URL = {url}")
-        print(f"  anon key    = {anon[:12]}…（已配置在 env.local）")
+    print()
+    print("下一步：确认 env.local 里 SYNC_OWNER_ID / SYNC_ENABLED，然后:")
+    print("  .\\build_apk.ps1 -Install")
 
 
 if __name__ == "__main__":

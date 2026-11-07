@@ -13,6 +13,9 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        flutterEngine.plugins.add(VoskAsrPlugin())
+        flutterEngine.plugins.add(VideoProbePlugin())
+        flutterEngine.plugins.add(VideoTranscodePlugin())
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {

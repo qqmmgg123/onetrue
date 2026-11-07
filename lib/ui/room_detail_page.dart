@@ -5,8 +5,10 @@ import '../data/app_database.dart';
 import '../domain/models.dart';
 import '../state/app_store.dart';
 import 'bill_page.dart';
+import 'busy.dart';
 import 'format.dart';
 import 'lease_form_page.dart';
+import 'room_video_thumb.dart';
 
 class RoomDetailPage extends StatefulWidget {
   const RoomDetailPage({super.key, required this.roomId});
@@ -64,7 +66,12 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
       appBar: AppBar(
         title: Text(room?.label ?? '房间'),
         actions: [
-          if (room != null)
+          if (room != null) ...[
+            IconButton(
+              tooltip: '改房号',
+              onPressed: () => _renameRoom(room),
+              icon: const Icon(Icons.edit_outlined),
+            ),
             IconButton(
               tooltip: '删除房间',
               onPressed: () async {
@@ -86,12 +93,17 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
                   ),
                 );
                 if (ok == true && mounted) {
-                  await context.read<AppStore>().removeRoom(room.id);
+                  await runBusy(
+                    context,
+                    message: '正在删除…',
+                    task: () => context.read<AppStore>().removeRoom(room.id),
+                  );
                   if (mounted) Navigator.pop(context);
                 }
               },
               icon: const Icon(Icons.delete_outline),
             ),
+          ],
         ],
       ),
       body: _loading
@@ -100,6 +112,79 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
               children: [
                 if (_property != null) Text(_property!.name),
+                if (room != null) ...[
+                  const SizedBox(height: 8),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('上架到房源广场'),
+                    subtitle: Text(
+                      room.isListed
+                          ? '游客可浏览（建议先填城市并上传视频）'
+                          : '仅自己可见',
+                    ),
+                    value: room.isListed,
+                    onChanged: (v) async {
+                      if (v &&
+                          (_property?.city.trim().isEmpty ?? true) &&
+                          mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('建议先给房产填写城市，方便游客筛选'),
+                          ),
+                        );
+                      }
+                      await runBusy(
+                        context,
+                        message: v ? '正在上架…' : '正在下架…',
+                        task: () => context.read<AppStore>().setRoomListing(
+                              roomId: room.id,
+                              listed: v,
+                            ),
+                      );
+                      await _load();
+                    },
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: _lease == null
+                          ? Text(
+                              '空房 · 月租 ${formatYuan(0)}',
+                              style: Theme.of(context).textTheme.titleMedium,
+                            )
+                          : Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '${_tenant?.name ?? ''}  ${_tenant?.phone ?? ''}',
+                                  style:
+                                      Theme.of(context).textTheme.titleMedium,
+                                ),
+                                Text(
+                                  '每月${_lease!.rentDueDay}号 · 房租 ${formatYuan(_lease!.baseRent)} · 押金 ${formatYuan(_lease!.deposit)}',
+                                ),
+                                Text(
+                                  '电${_lease!.electricPrice}/水${_lease!.waterPrice}/燃${_lease!.gasPrice}',
+                                ),
+                                if (_lease!.effectiveExtras.isNotEmpty)
+                                  Text(
+                                    '附加费：${_lease!.effectiveExtras.map((e) => '${e.name} ${formatYuan(e.amount)}').join(' · ')}',
+                                  ),
+                                Text(
+                                  '起 ${ymdCn(_lease!.startDate)}${_lease!.endDate == null ? ' · 未填结束' : ' 至 ${ymdCn(_lease!.endDate!)}'}',
+                                ),
+                              ],
+                            ),
+                    ),
+                    if (_room != null) ...[
+                      const SizedBox(width: 12),
+                      RoomVideoThumb.fromRoom(_room!, onClosed: _load),
+                    ],
+                  ],
+                ),
                 const SizedBox(height: 12),
                 if (_lease == null)
                   FilledButton(
@@ -107,24 +192,6 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
                     child: const Text('登记租约'),
                   )
                 else ...[
-                  Text(
-                    '${_tenant?.name ?? ''}  ${_tenant?.phone ?? ''}',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  Text(
-                    '每月${_lease!.rentDueDay}号 · 房租 ${formatYuan(_lease!.baseRent)} · 押金 ${formatYuan(_lease!.deposit)}',
-                  ),
-                  Text(
-                    '电${_lease!.electricPrice}/水${_lease!.waterPrice}/燃${_lease!.gasPrice}',
-                  ),
-                  if (_lease!.effectiveExtras.isNotEmpty)
-                    Text(
-                      '附加费：${_lease!.effectiveExtras.map((e) => '${e.name} ${formatYuan(e.amount)}').join(' · ')}',
-                    ),
-                  Text(
-                    '起 ${ymdCn(_lease!.startDate)}${_lease!.endDate == null ? ' · 未填结束' : ' 至 ${ymdCn(_lease!.endDate!)}'}',
-                  ),
-                  const SizedBox(height: 8),
                   OutlinedButton(
                     onPressed: _editLease,
                     child: const Text('改租约 / 单价 / 附加费 / 租户'),
@@ -135,7 +202,8 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
                     child: const Text('办理退租'),
                   ),
                   const SizedBox(height: 16),
-                  Text('账期（点进结算）', style: Theme.of(context).textTheme.titleMedium),
+                  Text('账期（点进结算）',
+                      style: Theme.of(context).textTheme.titleMedium),
                   const SizedBox(height: 8),
                   ..._periods.map((p) {
                     final paid = p.isPaid;
@@ -144,7 +212,12 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
                       title: Text(
                         '${ymdCn(p.dueDate)}  ${formatYuan(p.amount)}  ${paid ? '已收' : (p.status == 'invoiced' ? '已出单' : '未收')}',
                       ),
-                      subtitle: Text('${ymdCn(p.periodStart)} – ${ymdCn(p.periodEnd)}'),
+                      subtitle: Text(
+                        [
+                          '${ymdCn(p.periodStart)} – ${ymdCn(p.periodEnd)}',
+                          if (p.remark.trim().isNotEmpty) p.remark.trim(),
+                        ].join(' · '),
+                      ),
                       onTap: () async {
                         await Navigator.of(context).push(
                           MaterialPageRoute(
@@ -155,12 +228,18 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
                       },
                       trailing: TextButton(
                         onPressed: () async {
-                          if (paid) {
-                            await context.read<AppStore>().markUnpaid(p.id);
-                          } else {
-                            await context.read<AppStore>().markPaid(p.id);
-                          }
-                          await _load();
+                          await runBusy(
+                            context,
+                            message: paid ? '正在撤销…' : '正在记账…',
+                            task: () async {
+                              if (paid) {
+                                await context.read<AppStore>().markUnpaid(p.id);
+                              } else {
+                                await context.read<AppStore>().markPaid(p.id);
+                              }
+                              await _load();
+                            },
+                          );
                         },
                         child: Text(paid ? '撤销' : '记已收'),
                       ),
@@ -172,7 +251,42 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
     );
   }
 
-  String _md(DateTime d) => md(d);
+  Future<void> _renameRoom(Room room) async {
+    final label = TextEditingController(text: room.label);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('改房号'),
+        content: TextField(
+          controller: label,
+          decoration: const InputDecoration(labelText: '房号，如 302'),
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && label.text.trim().isNotEmpty && mounted) {
+      final n = label.text.trim();
+      await runBusy(
+        context,
+        message: '正在保存…',
+        task: () async {
+          await context.read<AppStore>().renameRoom(id: room.id, label: n);
+          await _load();
+        },
+      );
+    }
+    label.dispose();
+  }
 
   Future<void> _editLease() async {
     if (_room == null) return;
@@ -210,8 +324,14 @@ class _RoomDetailPageState extends State<RoomDetailPage> {
       ),
     );
     if (ok == true && mounted) {
-      await context.read<AppStore>().endLease(leaseId: lease.id);
-      await _load();
+      await runBusy(
+        context,
+        message: '正在退租…',
+        task: () async {
+          await context.read<AppStore>().endLease(leaseId: lease.id);
+          await _load();
+        },
+      );
     }
   }
 }

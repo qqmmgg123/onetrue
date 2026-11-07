@@ -3,23 +3,71 @@ class Property {
     required this.id,
     required this.name,
     required this.address,
+    this.city = '',
   });
 
   final int id;
   final String name;
   final String address;
+
+  /// 城市名，如「杭州」，用于广场筛选。
+  final String city;
 }
+
+/// 房间上架状态：draft=仅自己可见，listed=游客广场可见。
+const kListingDraft = 'draft';
+const kListingListed = 'listed';
 
 class Room {
   const Room({
     required this.id,
     required this.propertyId,
     required this.label,
+    this.videoUrl = '',
+    this.videoPosterUrl = '',
+    this.listingStatus = kListingDraft,
+    this.listedAt,
   });
 
   final int id;
   final int propertyId;
   final String label;
+
+  /// 房间视频公开地址（七牛或 R2）；空表示尚未上传。
+  final String videoUrl;
+  final String videoPosterUrl;
+  final String listingStatus;
+  final DateTime? listedAt;
+
+  bool get hasVideo => videoUrl.trim().isNotEmpty;
+  bool get isListed => listingStatus == kListingListed;
+}
+
+/// 游客广场上的只读房源（来自 Neon，不进本地房东库）。
+class MarketplaceListing {
+  const MarketplaceListing({
+    required this.roomUuid,
+    required this.propertyUuid,
+    required this.propertyName,
+    required this.city,
+    required this.address,
+    required this.roomLabel,
+    this.videoUrl = '',
+    this.videoPosterUrl = '',
+    this.listedAt,
+  });
+
+  final String roomUuid;
+  final String propertyUuid;
+  final String propertyName;
+  final String city;
+  final String address;
+  final String roomLabel;
+  final String videoUrl;
+  final String videoPosterUrl;
+  final DateTime? listedAt;
+
+  bool get hasVideo => videoUrl.trim().isNotEmpty;
 }
 
 class Tenant {
@@ -118,6 +166,7 @@ class RentPeriod {
     required this.dueDate,
     required this.amount,
     required this.status,
+    this.remark = '',
   });
 
   final int id;
@@ -127,6 +176,9 @@ class RentPeriod {
   final DateTime dueDate;
   final double amount;
   final String status;
+
+  /// 本月房租备注（显示在应收/账期列表）。
+  final String remark;
 
   bool get isPaid => status == 'paid';
   bool get isOpen => status == 'pending' || status == 'invoiced';
