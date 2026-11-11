@@ -1,3 +1,5 @@
+import 'note_title.dart';
+
 class Property {
   const Property({
     required this.id,
@@ -10,13 +12,157 @@ class Property {
   final String name;
   final String address;
 
-  /// 城市名，如「杭州」，用于广场筛选。
+  /// 城市名，如「杭州」，用于市集筛选。
   final String city;
 }
 
-/// 房间上架状态：draft=仅自己可见，listed=游客广场可见。
+/// 房间上架状态：draft=仅自己可见，listed=市集可见。
 const kListingDraft = 'draft';
 const kListingListed = 'listed';
+
+/// 笔记形态。
+const kNoteKindNote = 'note';
+const kNoteKindMemo = 'memo';
+const kNoteKindSchedule = 'schedule';
+const kNoteKindArticle = 'article';
+
+const kNoteFormatPlain = 'plain';
+const kNoteFormatQuill = 'quill';
+
+class Note {
+  const Note({
+    required this.id,
+    required this.uuid,
+    required this.kind,
+    this.title = '',
+    required this.body,
+    this.format = kNoteFormatPlain,
+    this.scheduleAt,
+    this.remindAt,
+    this.recurFreq = '',
+    this.recurInterval = 1,
+    this.recurByday,
+    this.recurUntil,
+    this.recurCount,
+    this.remindOffsetMin = 0,
+    this.listingStatus = kListingDraft,
+    this.listedAt,
+    this.city = '',
+    this.parentUuid,
+    this.sortOrder = 0,
+    this.sourceNoteUuids = const [],
+    required this.updatedAt,
+  });
+
+  final int id;
+  final String uuid;
+  final String kind;
+  final String title;
+  final String body;
+  final String format;
+  final DateTime? scheduleAt;
+  final DateTime? remindAt;
+  /// once/daily/weekly/monthly/yearly；空视为 once。
+  final String recurFreq;
+  final int recurInterval;
+  /// 如 MO；仅 weekly。
+  final String? recurByday;
+  final DateTime? recurUntil;
+  final int? recurCount;
+  /// 日程：相对开始时间的提前分钟（≥0）。
+  final int remindOffsetMin;
+  final String listingStatus;
+  final DateTime? listedAt;
+  final String city;
+  final String? parentUuid;
+  final int sortOrder;
+  final List<String> sourceNoteUuids;
+  final DateTime updatedAt;
+
+  bool get isListed => listingStatus == kListingListed;
+  bool get hasTitle => title.trim().isNotEmpty;
+
+  /// 列表展示用：有标题用标题；否则从正文纯文本抽首行（兼容 Quill JSON）。
+  String get displayTitle => suggestNoteTitle(
+        title: title,
+        body: body,
+        fallback: kindLabel,
+        maxLen: 36,
+      );
+
+  String get kindLabel {
+    switch (kind) {
+      case kNoteKindMemo:
+        return '备忘';
+      case kNoteKindSchedule:
+        return '日程';
+      case kNoteKindArticle:
+        return '文章';
+      default:
+        return '随笔';
+    }
+  }
+}
+
+/// 市集上架文章（Neon 只读）。
+class MarketplaceArticle {
+  const MarketplaceArticle({
+    required this.noteUuid,
+    required this.title,
+    required this.body,
+    required this.format,
+    this.city = '',
+    this.listedAt,
+    this.ownerId = '',
+    this.viewCount = 0,
+  });
+
+  final String noteUuid;
+  final String title;
+  final String body;
+  final String format;
+  final String city;
+  final DateTime? listedAt;
+  final String ownerId;
+  /// 他人访问次数（不含作者本人）。
+  final int viewCount;
+
+  String get displayTitle =>
+      title.trim().isNotEmpty ? title.trim() : '无标题文章';
+}
+
+/// 本机「近期阅读」记录。
+class ArticleReadRecord {
+  const ArticleReadRecord({
+    required this.noteUuid,
+    required this.title,
+    required this.body,
+    required this.format,
+    this.city = '',
+    this.ownerId = '',
+    required this.lastReadAt,
+  });
+
+  final String noteUuid;
+  final String title;
+  final String body;
+  final String format;
+  final String city;
+  final String ownerId;
+  final DateTime lastReadAt;
+
+  String get displayTitle =>
+      title.trim().isNotEmpty ? title.trim() : '无标题文章';
+
+  MarketplaceArticle toArticle() => MarketplaceArticle(
+        noteUuid: noteUuid,
+        title: title,
+        body: body,
+        format: format,
+        city: city,
+        ownerId: ownerId,
+      );
+}
 
 class Room {
   const Room({

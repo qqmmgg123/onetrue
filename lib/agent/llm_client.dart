@@ -90,7 +90,7 @@ class LlmClient {
     ];
 
     final preamble = StringBuffer()
-      ..writeln('当前账本摘要：')
+      ..writeln('当前笔记本摘要：')
       ..writeln(inventoryContext);
     final stickyBlock = sticky?.toPromptBlock() ?? '';
     if (stickyBlock.isNotEmpty) {
@@ -101,18 +101,16 @@ class LlmClient {
     if (rolledSummary != null && rolledSummary.trim().isNotEmpty) {
       preamble
         ..writeln()
-        ..writeln('更早对话摘要（原文已截断，事实以便签和账本为准）：')
+        ..writeln('更早对话摘要（原文已截断，事实以便签和笔记本为准）：')
         ..writeln(rolledSummary);
     }
     preamble
       ..writeln()
       ..writeln(
-        '下面是本会话近期对话。房东可能分多句慢慢说，请承接上下文追问补全，不要要求对方按固定格式重说。',
+        '下面是本会话近期对话。用户可能分多句慢慢说，请承接上下文；'
+        '闲聊直接答，笔记读写用 tools。不要要求对方按固定格式重说。',
       )
       ..writeln(
-        '若便签里写着「当前意图」，只表示多轮补全中的提示；'
-        '房东本句若是抄表/优惠/备注/改附加费/出单等，必须按本句意图调用对应 tool，'
-        '不要沿用已结束的「登记租约」。房间已有在租约时禁止再 create_lease。'
         '历史里标注「已确认执行/已取消」的操作不要重复提议。',
       );
     messages.add({'role': 'system', 'content': preamble.toString()});
@@ -126,7 +124,7 @@ class LlmClient {
         } else if (m.confirmed == false) {
           content = '$content\n（已取消：${m.pending!.tool}）';
         } else {
-          content = '$content\n（待房东点确认，尚未执行：${m.pending!.tool}）';
+          content = '$content\n（待用户点确认，尚未执行：${m.pending!.tool}）';
         }
       }
       messages.add({

@@ -1,5 +1,5 @@
 name: rent_agent
-description: 本地缘初（账本、结算、对话 Agent）
+description: 醍醐（账本、笔记、对话助手）
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -68,6 +68,7 @@ dependencies:
   # 游客广场城市定位
   geolocator: ^10.1.0
   geocoding: ^2.1.1
+  flutter_quill: 7.3.3
 
 dev_dependencies:
   flutter_test:

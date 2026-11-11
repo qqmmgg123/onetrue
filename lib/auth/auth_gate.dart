@@ -14,7 +14,7 @@ Future<bool> requireLandlord(BuildContext context, {String? message}) async {
     builder: (ctx) => AlertDialog(
       title: const Text('需要注册登录'),
       content: Text(
-        message ?? '浏览房源和对话无需登录；管理物业、房间、租约请先注册成为房东。',
+        message ?? '浏览市集和对话无需登录；写笔记、上架文章请先注册登录。',
       ),
       actions: [
         TextButton(

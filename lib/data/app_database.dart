@@ -66,7 +66,7 @@ class AppDatabase {
     final path = p.join(dir.path, 'rent_agent.db');
     _db = await openDatabase(
       path,
-      version: 8,
+      version: 13,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -79,6 +79,11 @@ class AppDatabase {
         await _upgradeToV6(db);
         await _upgradeToV7(db);
         await _upgradeToV8(db);
+        await _upgradeToV9(db);
+        await _upgradeToV10(db);
+        await _upgradeToV11(db);
+        await _upgradeToV12(db);
+        await _upgradeToV13(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) await _upgradeToV2(db);
@@ -88,6 +93,11 @@ class AppDatabase {
         if (oldVersion < 6) await _upgradeToV6(db);
         if (oldVersion < 7) await _upgradeToV7(db);
         if (oldVersion < 8) await _upgradeToV8(db);
+        if (oldVersion < 9) await _upgradeToV9(db);
+        if (oldVersion < 10) await _upgradeToV10(db);
+        if (oldVersion < 11) await _upgradeToV11(db);
+        if (oldVersion < 12) await _upgradeToV12(db);
+        if (oldVersion < 13) await _upgradeToV13(db);
       },
     );
     return _db!;
@@ -271,7 +281,8 @@ class AppDatabase {
     ''');
   }
 
-  /// 同步元数据：uuid 跨端主键，updated_at/LWW，deleted_at 软删，dirty 待上传。
+  /// 同步元数据：uuid 跨端主键，updated_at，deleted_at 软删。
+  /// dirty 列为历史遗留（v5），新逻辑不读写，保留列以免旧机 DROP 失败。
   Future<void> _upgradeToV5(Database db) async {
     const tables = [
       'properties',
@@ -357,6 +368,104 @@ class AppDatabase {
     );
   }
 
+  Future<void> _upgradeToV9(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL DEFAULT 'note',
+        title TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        format TEXT NOT NULL DEFAULT 'plain',
+        schedule_at TEXT,
+        remind_at TEXT,
+        listing_status TEXT NOT NULL DEFAULT 'draft',
+        listed_at TEXT,
+        city TEXT NOT NULL DEFAULT '',
+        parent_uuid TEXT,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        source_note_uuids TEXT NOT NULL DEFAULT '[]',
+        uuid TEXT,
+        updated_at TEXT,
+        deleted_at TEXT,
+        dirty INTEGER NOT NULL DEFAULT 1
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS reminder_inbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        source TEXT NOT NULL,
+        fire_at TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        ref_period_id INTEGER,
+        ref_note_uuid TEXT,
+        read_at TEXT
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(kind)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_reminder_inbox_unread '
+      'ON reminder_inbox(fire_at) WHERE read_at IS NULL',
+    );
+  }
+
+  Future<void> _upgradeToV10(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE chat_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent'",
+    );
+    await _tryExec(
+      db,
+      'ALTER TABLE chat_sessions ADD COLUMN ref_key TEXT',
+    );
+    await _tryExec(
+      db,
+      'CREATE INDEX IF NOT EXISTS idx_chat_sessions_kind_ref '
+      'ON chat_sessions(kind, ref_key)',
+    );
+  }
+
+  Future<void> _upgradeToV11(Database db) async {
+    await _tryExec(db, "ALTER TABLE notes ADD COLUMN recur_freq TEXT NOT NULL DEFAULT ''");
+    await _tryExec(
+      db,
+      'ALTER TABLE notes ADD COLUMN recur_interval INTEGER NOT NULL DEFAULT 1',
+    );
+    await _tryExec(db, 'ALTER TABLE notes ADD COLUMN recur_byday TEXT');
+    await _tryExec(db, 'ALTER TABLE notes ADD COLUMN recur_until TEXT');
+    await _tryExec(db, 'ALTER TABLE notes ADD COLUMN recur_count INTEGER');
+    await _tryExec(
+      db,
+      'ALTER TABLE notes ADD COLUMN remind_offset_min INTEGER NOT NULL DEFAULT 0',
+    );
+  }
+
+  Future<void> _upgradeToV12(Database db) async {
+    // 醍醐页不再使用本地闹钟收件箱；系统通知仍由 ReminderService 直接排程。
+    await _tryExec(db, 'DROP TABLE IF EXISTS reminder_inbox');
+  }
+
+  Future<void> _upgradeToV13(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS article_reads (
+        note_uuid TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        format TEXT NOT NULL DEFAULT 'plain',
+        city TEXT NOT NULL DEFAULT '',
+        owner_id TEXT NOT NULL DEFAULT '',
+        last_read_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_article_reads_last '
+      'ON article_reads(last_read_at DESC)',
+    );
+  }
+
   Future<void> _tryExec(Database db, String sql) async {
     try {
       await db.execute(sql);
@@ -366,44 +475,11 @@ class AppDatabase {
   Map<String, Object?> _newSyncCols() => {
         'uuid': _uuid.v4(),
         'updated_at': DateTime.now().toUtc().toIso8601String(),
-        'dirty': 1,
       };
 
   Map<String, Object?> _touchSyncCols() => {
         'updated_at': DateTime.now().toUtc().toIso8601String(),
-        'dirty': 1,
       };
-
-  Future<void> markSynced(String table, int localId) async {
-    await (await database).update(
-      table,
-      {'dirty': 0},
-      where: 'id = ?',
-      whereArgs: [localId],
-    );
-  }
-
-  /// 换云端库（如 Supabase→Neon）后强制全量再推。
-  Future<void> markAllSyncDirty() async {
-    const tables = [
-      'properties',
-      'rooms',
-      'tenants',
-      'leases',
-      'lease_extras',
-      'rent_periods',
-      'meter_readings',
-      'period_adjustments',
-      'invoices',
-      'payments',
-    ];
-    final db = await database;
-    final now = DateTime.now().toUtc().toIso8601String();
-    for (final t in tables) {
-      await db.update(t, {'dirty': 1, 'updated_at': now});
-    }
-    await setSyncState('last_sync_at', '');
-  }
 
   Future<String?> getSyncState(String key) async {
     final rows = await (await database).query(
@@ -421,14 +497,6 @@ class AppDatabase {
       'sync_state',
       {'key': key, 'value': value},
       conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-  }
-
-  Future<List<Map<String, Object?>>> dirtyRows(String table) async {
-    return (await database).query(
-      table,
-      where: 'dirty = 1',
-      orderBy: 'id ASC',
     );
   }
 
@@ -509,6 +577,7 @@ class AppDatabase {
       'tenants',
       'rooms',
       'properties',
+      'notes',
     ];
     for (final t in tables) {
       await db.delete(t);
@@ -519,11 +588,18 @@ class AppDatabase {
 
   /// 是否还有未同步归属的本地业务数据（用于登录后认领）。
   Future<bool> hasLocalBusinessData() async {
-    final rows = await (await database).rawQuery(
+    final db = await database;
+    final props = await db.rawQuery(
       'SELECT COUNT(*) AS c FROM properties WHERE deleted_at IS NULL',
     );
-    final c = rows.first['c'];
-    return (c is int ? c : int.tryParse('$c') ?? 0) > 0;
+    final notes = await db.rawQuery(
+      'SELECT COUNT(*) AS c FROM notes WHERE deleted_at IS NULL',
+    );
+    int count(List<Map<String, Object?>> rows) {
+      final c = rows.first['c'];
+      return c is int ? c : int.tryParse('$c') ?? 0;
+    }
+    return count(props) > 0 || count(notes) > 0;
   }
 
   Future<List<RoomSnapshot>> roomsForProperty(int propertyId) async {
@@ -1774,9 +1850,14 @@ class AppDatabase {
 
   // --- chat sessions ---
 
-  Future<List<ChatSession>> listChatSessions() async {
+  Future<List<ChatSession>> listChatSessions({
+    String kind = kChatKindAgent,
+    String? refKey,
+  }) async {
     final rows = await (await database).query(
       'chat_sessions',
+      where: refKey == null ? 'kind = ?' : 'kind = ? AND ref_key = ?',
+      whereArgs: refKey == null ? [kind] : [kind, refKey],
       orderBy: 'updated_at DESC',
     );
     return rows.map(_sessionFrom).toList();
@@ -1802,9 +1883,27 @@ class AppDatabase {
         'sticky_json': session.sticky.encode(),
         'created_at': session.createdAt.toIso8601String(),
         'updated_at': session.updatedAt.toIso8601String(),
+        'kind': session.kind,
+        'ref_key': session.refKey,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+  }
+
+  /// 清空某类会话（找 AI 或某笔记下的 AI）。保留 [preserveSessionId] 时先不动它再删其余。
+  Future<int> deleteAllChatSessions({
+    String kind = kChatKindAgent,
+    String? refKey,
+    String? preserveSessionId,
+  }) async {
+    final list = await listChatSessions(kind: kind, refKey: refKey);
+    var n = 0;
+    for (final s in list) {
+      if (preserveSessionId != null && s.id == preserveSessionId) continue;
+      await deleteChatSession(s.id);
+      n++;
+    }
+    return n;
   }
 
   Future<void> updateChatSessionSticky(String id, SessionSticky sticky) async {
@@ -1850,6 +1949,8 @@ class AppDatabase {
   /// [preserveSessionId] 当前正在用的会话不会被删。
   Future<ChatPruneReport> pruneChatStorage({
     String? preserveSessionId,
+    String kind = kChatKindAgent,
+    String? refKey,
     int maxSessions = 40,
     int maxMessagesPerSession = 250,
   }) async {
@@ -1858,7 +1959,7 @@ class AppDatabase {
     var trimmedMessages = 0;
 
     // 会话按 updated_at DESC；保留最近若干个，并始终保住当前会话
-    final sessions = await listChatSessions();
+    final sessions = await listChatSessions(kind: kind, refKey: refKey);
     final keep = <String>{};
     for (final s in sessions) {
       if (keep.length >= maxSessions) break;
@@ -1871,7 +1972,7 @@ class AppDatabase {
       deletedSessions++;
     }
 
-    final remaining = await listChatSessions();
+    final remaining = await listChatSessions(kind: kind, refKey: refKey);
     for (final s in remaining) {
       final countRows = await db.rawQuery(
         'SELECT COUNT(*) AS c FROM chat_messages WHERE session_id = ?',
@@ -1958,6 +2059,8 @@ class AppDatabase {
         sticky: SessionSticky.decode(r['sticky_json'] as String?),
         createdAt: DateTime.parse(r['created_at'] as String),
         updatedAt: DateTime.parse(r['updated_at'] as String),
+        kind: (r['kind'] as String?) ?? kChatKindAgent,
+        refKey: r['ref_key'] as String?,
       );
 
   StoredChatMessage _messageFrom(Map<String, Object?> r) {
@@ -1987,5 +2090,284 @@ class AppDatabase {
       confirmed: conf == null ? null : conf == 1,
       createdAt: DateTime.parse(r['created_at'] as String),
     );
+  }
+
+  Note _noteFrom(Map<String, Object?> r) {
+    List<String> sources = const [];
+    final raw = r['source_note_uuids'] as String? ?? '[]';
+    try {
+      final list = jsonDecode(raw);
+      if (list is List) {
+        sources = list.map((e) => '$e').where((s) => s.isNotEmpty).toList();
+      }
+    } catch (_) {}
+    DateTime? parseTs(Object? v) {
+      if (v == null) return null;
+      final s = '$v'.trim();
+      if (s.isEmpty) return null;
+      return DateTime.tryParse(s);
+    }
+
+    return Note(
+      id: r['id'] as int,
+      uuid: r['uuid'] as String? ?? '',
+      kind: r['kind'] as String? ?? kNoteKindNote,
+      title: r['title'] as String? ?? '',
+      body: r['body'] as String? ?? '',
+      format: r['format'] as String? ?? kNoteFormatPlain,
+      scheduleAt: parseTs(r['schedule_at']),
+      remindAt: parseTs(r['remind_at']),
+      recurFreq: r['recur_freq'] as String? ?? '',
+      recurInterval: (r['recur_interval'] as int?) ?? 1,
+      recurByday: r['recur_byday'] as String?,
+      recurUntil: parseTs(r['recur_until']),
+      recurCount: r['recur_count'] as int?,
+      remindOffsetMin: (r['remind_offset_min'] as int?) ?? 0,
+      listingStatus: r['listing_status'] as String? ?? kListingDraft,
+      listedAt: parseTs(r['listed_at']),
+      city: r['city'] as String? ?? '',
+      parentUuid: r['parent_uuid'] as String?,
+      sortOrder: (r['sort_order'] as int?) ?? 0,
+      sourceNoteUuids: sources,
+      updatedAt: parseTs(r['updated_at']) ?? DateTime.now().toUtc(),
+    );
+  }
+
+  Future<List<Note>> listNotes({String? kind}) async {
+    final where = StringBuffer('deleted_at IS NULL');
+    final args = <Object?>[];
+    if (kind != null && kind.trim().isNotEmpty) {
+      where.write(' AND kind = ?');
+      args.add(kind.trim());
+    }
+    final rows = await (await database).query(
+      'notes',
+      where: where.toString(),
+      whereArgs: args.isEmpty ? null : args,
+      orderBy: 'updated_at DESC, id DESC',
+    );
+    return rows.map(_noteFrom).toList();
+  }
+
+  Future<Note?> noteById(int id) async {
+    final rows = await (await database).query(
+      'notes',
+      where: 'id = ? AND deleted_at IS NULL',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return _noteFrom(rows.first);
+  }
+
+  Future<Note?> noteByUuid(String uuid) async {
+    final rows = await (await database).query(
+      'notes',
+      where: 'uuid = ? AND deleted_at IS NULL',
+      whereArgs: [uuid],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return _noteFrom(rows.first);
+  }
+
+  Future<int> insertNote({
+    required String kind,
+    String title = '',
+    required String body,
+    String format = kNoteFormatPlain,
+    DateTime? scheduleAt,
+    DateTime? remindAt,
+    String recurFreq = '',
+    int recurInterval = 1,
+    String? recurByday,
+    DateTime? recurUntil,
+    int? recurCount,
+    int remindOffsetMin = 0,
+    String listingStatus = kListingDraft,
+    DateTime? listedAt,
+    String city = '',
+    String? parentUuid,
+    int sortOrder = 0,
+    List<String> sourceNoteUuids = const [],
+  }) async {
+    return (await database).insert('notes', {
+      'kind': kind,
+      'title': title,
+      'body': body,
+      'format': format,
+      'schedule_at': scheduleAt?.toUtc().toIso8601String(),
+      'remind_at': remindAt?.toUtc().toIso8601String(),
+      'recur_freq': recurFreq,
+      'recur_interval': recurInterval < 1 ? 1 : recurInterval,
+      'recur_byday': recurByday,
+      'recur_until': recurUntil?.toUtc().toIso8601String(),
+      'recur_count': recurCount,
+      'remind_offset_min': remindOffsetMin < 0 ? 0 : remindOffsetMin,
+      'listing_status': listingStatus,
+      'listed_at': listedAt?.toUtc().toIso8601String(),
+      'city': city.trim(),
+      'parent_uuid': parentUuid,
+      'sort_order': sortOrder,
+      'source_note_uuids': jsonEncode(sourceNoteUuids),
+      ..._newSyncCols(),
+    });
+  }
+
+  Future<void> updateNote({
+    required int id,
+    String? kind,
+    String? title,
+    String? body,
+    String? format,
+    DateTime? scheduleAt,
+    bool clearScheduleAt = false,
+    DateTime? remindAt,
+    bool clearRemindAt = false,
+    String? recurFreq,
+    int? recurInterval,
+    String? recurByday,
+    bool clearRecurByday = false,
+    DateTime? recurUntil,
+    bool clearRecurUntil = false,
+    int? recurCount,
+    bool clearRecurCount = false,
+    int? remindOffsetMin,
+    String? listingStatus,
+    DateTime? listedAt,
+    bool clearListedAt = false,
+    String? city,
+    String? parentUuid,
+    int? sortOrder,
+    List<String>? sourceNoteUuids,
+  }) async {
+    final patch = <String, Object?>{..._touchSyncCols()};
+    if (kind != null) patch['kind'] = kind;
+    if (title != null) patch['title'] = title;
+    if (body != null) patch['body'] = body;
+    if (format != null) patch['format'] = format;
+    if (clearScheduleAt) {
+      patch['schedule_at'] = null;
+    } else if (scheduleAt != null) {
+      patch['schedule_at'] = scheduleAt.toUtc().toIso8601String();
+    }
+    if (clearRemindAt) {
+      patch['remind_at'] = null;
+    } else if (remindAt != null) {
+      patch['remind_at'] = remindAt.toUtc().toIso8601String();
+    }
+    if (recurFreq != null) patch['recur_freq'] = recurFreq;
+    if (recurInterval != null) {
+      patch['recur_interval'] = recurInterval < 1 ? 1 : recurInterval;
+    }
+    if (clearRecurByday) {
+      patch['recur_byday'] = null;
+    } else if (recurByday != null) {
+      patch['recur_byday'] = recurByday;
+    }
+    if (clearRecurUntil) {
+      patch['recur_until'] = null;
+    } else if (recurUntil != null) {
+      patch['recur_until'] = recurUntil.toUtc().toIso8601String();
+    }
+    if (clearRecurCount) {
+      patch['recur_count'] = null;
+    } else if (recurCount != null) {
+      patch['recur_count'] = recurCount;
+    }
+    if (remindOffsetMin != null) {
+      patch['remind_offset_min'] = remindOffsetMin < 0 ? 0 : remindOffsetMin;
+    }
+    if (listingStatus != null) patch['listing_status'] = listingStatus;
+    if (clearListedAt) {
+      patch['listed_at'] = null;
+    } else if (listedAt != null) {
+      patch['listed_at'] = listedAt.toUtc().toIso8601String();
+    }
+    if (city != null) patch['city'] = city.trim();
+    if (parentUuid != null) patch['parent_uuid'] = parentUuid;
+    if (sortOrder != null) patch['sort_order'] = sortOrder;
+    if (sourceNoteUuids != null) {
+      patch['source_note_uuids'] = jsonEncode(sourceNoteUuids);
+    }
+    await (await database).update(
+      'notes',
+      patch,
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> deleteNote(int id) async {
+    await (await database).update(
+      'notes',
+      {
+        'deleted_at': DateTime.now().toUtc().toIso8601String(),
+        ..._touchSyncCols(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> setNoteListed(int id, {required bool listed, String? city}) async {
+    await updateNote(
+      id: id,
+      listingStatus: listed ? kListingListed : kListingDraft,
+      listedAt: listed ? DateTime.now().toUtc() : null,
+      clearListedAt: !listed,
+      city: city,
+    );
+  }
+
+  Future<void> upsertArticleRead({
+    required String noteUuid,
+    required String title,
+    required String body,
+    required String format,
+    String city = '',
+    String ownerId = '',
+    DateTime? lastReadAt,
+  }) async {
+    final at = (lastReadAt ?? DateTime.now()).toUtc().toIso8601String();
+    final db = await database;
+    await db.insert(
+      'article_reads',
+      {
+        'note_uuid': noteUuid,
+        'title': title,
+        'body': body,
+        'format': format,
+        'city': city,
+        'owner_id': ownerId,
+        'last_read_at': at,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<ArticleReadRecord>> listArticleReads({int limit = 100}) async {
+    final rows = await (await database).query(
+      'article_reads',
+      orderBy: 'last_read_at DESC',
+      limit: limit,
+    );
+    return rows.map((r) {
+      return ArticleReadRecord(
+        noteUuid: r['note_uuid'] as String? ?? '',
+        title: r['title'] as String? ?? '',
+        body: r['body'] as String? ?? '',
+        format: r['format'] as String? ?? kNoteFormatPlain,
+        city: r['city'] as String? ?? '',
+        ownerId: r['owner_id'] as String? ?? '',
+        lastReadAt: DateTime.tryParse(r['last_read_at'] as String? ?? '') ??
+            DateTime.now().toUtc(),
+      );
+    }).toList();
+  }
+
+  Future<ArticleReadRecord?> latestArticleRead() async {
+    final list = await listArticleReads(limit: 1);
+    return list.isEmpty ? null : list.first;
   }
 }

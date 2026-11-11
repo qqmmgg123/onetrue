@@ -138,16 +138,15 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
               children: [
                 if (_bundled) ...[
-                  Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: Text(
-                        '服务商配置已随安装包内置（打包时来自 supabase/env.local）。\n'
-                        '同步数据库：Neon（直连 Postgres）。手机上只需开关与选择对话厂商。',
-                        style: Theme.of(context).textTheme.bodyMedium,
-                      ),
-                    ),
+                  Text(
+                    '服务商配置已随安装包内置（打包时来自 supabase/env.local）。\n'
+                    '同步数据库：Neon（直连 Postgres）。手机上只需开关与选择对话厂商。',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: const Color(0xFF666666),
+                        ),
                   ),
+                  const SizedBox(height: 12),
+                  const Divider(height: 1),
                   const SizedBox(height: 12),
                 ],
                 SwitchListTile(

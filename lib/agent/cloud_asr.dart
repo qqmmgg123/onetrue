@@ -140,7 +140,7 @@ class CloudAsr {
               : settings.groqAsrModel.trim(),
           apiKey: groqKey,
           language: 'zh',
-          prompt: '以下是简体中文普通话。房租、电费、水费、抄表、账期。',
+          prompt: '以下是简体中文普通话。笔记、备忘、日程、提醒。',
         ),
       );
     }

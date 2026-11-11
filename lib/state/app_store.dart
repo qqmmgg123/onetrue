@@ -6,6 +6,7 @@ import '../billing/bill_models.dart';
 import '../billing/billing_service.dart';
 import '../data/app_database.dart';
 import '../domain/models.dart';
+import '../domain/note_title.dart';
 import '../reminders/reminder_service.dart';
 import '../sync/sync_service.dart';
 import '../sync/sync_settings.dart';
@@ -31,12 +32,16 @@ class AppStore extends ChangeNotifier {
   String? error;
   List<Property> properties = [];
   List<DueItem> pending = [];
+  List<Note> notes = [];
+  List<ArticleReadRecord> articleReads = [];
 
-  /// 游客广场房源。
+  /// 市集房源 / 文章。
   List<MarketplaceListing> marketplace = [];
+  List<MarketplaceArticle> marketplaceArticles = [];
   bool marketplaceLoading = false;
   String? marketplaceError;
   String marketplaceCity = '';
+  bool marketplaceCityReady = false;
 
   BillingService get billing => _billing;
   AppDatabase get db => _db;
@@ -59,8 +64,8 @@ class AppStore extends ChangeNotifier {
         // ignore: unawaited_futures
         Future<void>.delayed(const Duration(seconds: 1), refreshMarketplace);
       } else {
-        // ignore: unawaited_futures
-        Future<void>.delayed(const Duration(seconds: 4), silentSync);
+        // 打开即拉当前用户云端缓存（增量/全量）
+        await refreshMyCache();
       }
     } catch (e) {
       error = e.toString();
@@ -69,83 +74,113 @@ class AppStore extends ChangeNotifier {
     }
   }
 
-  /// 打开 App / 手动触发。
-  /// [fullPull] 手动同步：先拉后推；未改脏跟线上，有本地改动按时间戳比新旧。
-  Future<SyncReport> silentSync({
-    bool fullPull = false,
+  /// 拉取当前登录用户云端数据覆盖本地缓存（市集不走这里）。
+  Future<SyncReport> refreshMyCache({
+    bool forceFull = false,
     void Function(String message)? onProgress,
   }) async {
     if (!_auth.isLandlord) {
       return SyncReport(error: 'sync_disabled');
     }
-    final report = await SyncService(db: _db).syncSilent(
-      fullPull: fullPull,
+    final report = await SyncService(db: _db).refreshMyCache(
+      forceFull: forceFull,
       onProgress: onProgress,
     );
     if (report.ok) {
       onProgress?.call('刷新界面…');
       await reload();
-      if (fullPull && properties.isNotEmpty) {
-        final names = properties.map((p) => p.name).join('、');
-        onProgress?.call('当前房产：$names');
-      }
     }
     return report;
+  }
+
+  /// 本地业务写入后按行直推 Neon；失败抛错（需联网）。
+  Future<void> _publish(List<SyncRef> refs) async {
+    if (!_auth.isLandlord) return;
+    if (refs.isEmpty) return;
+    final report = await SyncService(db: _db).pushLocalRows(refs);
+    if (!report.ok) {
+      throw StateError(report.error ?? '上传失败，请检查网络后重试');
+    }
+  }
+
+  Future<void> _publishLease(int leaseId) async {
+    final sync = SyncService(db: _db);
+    await _publish(await sync.refsForLease(leaseId));
+  }
+
+  Future<void> _publishPeriod(int periodId) async {
+    final sync = SyncService(db: _db);
+    final period = await _db.getPeriod(periodId);
+    final refs = await sync.refsForPeriod(periodId);
+    if (period != null) {
+      refs.addAll(await sync.refsForLease(period.leaseId));
+    }
+    await _publish(refs);
   }
 
   Future<void> reload() async {
     if (isGuest) {
       properties = [];
       pending = [];
+      notes = [];
+      articleReads = await _db.listArticleReads();
       loading = false;
       error = null;
       notifyListeners();
       return;
     }
+    // 房产/账期数据仍保留在本地库（兼容旧版同步），UI 不再展示；提醒只排笔记。
     properties = await _db.listProperties();
-    for (final p in properties) {
-      final rooms = await _db.roomsForProperty(p.id);
-      for (final snap in rooms) {
-        if (snap.lease != null) {
-          await _billing.syncOpenPeriodAmounts(snap.lease!.id);
-        }
-      }
-    }
-    pending = await _db.pendingDues();
-    await _reminders.reschedule(pending);
+    pending = const [];
+    notes = await _db.listNotes();
+    articleReads = await _db.listArticleReads();
+    await _reminders.reschedule(const [], notes: notes);
     loading = false;
     error = null;
     notifyListeners();
   }
 
   Future<void> refreshMarketplace({String? city}) async {
-    if (city != null) marketplaceCity = city.trim();
+    if (city != null) {
+      marketplaceCity = city.trim();
+      marketplaceCityReady = true;
+    }
     marketplaceLoading = true;
     marketplaceError = null;
     notifyListeners();
     try {
-      marketplace = await SyncService(db: _db).fetchListedRooms(
-        city: marketplaceCity.isEmpty ? null : marketplaceCity,
-      );
+      final sync = SyncService(db: _db);
+      List<MarketplaceArticle> articles = [];
+      try {
+        articles = await sync.fetchListedArticles();
+      } catch (_) {
+        articles = [];
+      }
+      marketplace = [];
+      marketplaceArticles = articles;
     } catch (e) {
       marketplaceError = e.toString();
       marketplace = [];
+      marketplaceArticles = [];
     } finally {
       marketplaceLoading = false;
       notifyListeners();
     }
   }
 
-  /// 注册/登录成功后：可选认领本机旧数据，再全量同步。
+  /// 注册/登录成功后：可选认领本机旧数据，再全量拉取。
   Future<void> onLoggedIn({bool claimLocalData = false}) async {
     if (claimLocalData) {
-      await _db.markAllSyncDirty();
+      final report = await SyncService(db: _db).uploadAllLocal();
+      if (!report.ok) {
+        throw StateError(report.error ?? '认领本机数据上传失败');
+      }
     } else if (await _db.hasLocalBusinessData()) {
       // 不认领则清空，避免旧 owner 数据混进新账号
       await _db.clearBusinessData();
     }
     await reload();
-    await silentSync(fullPull: true);
+    await refreshMyCache(forceFull: true);
     notifyListeners();
   }
 
@@ -154,9 +189,155 @@ class AppStore extends ChangeNotifier {
     await _db.clearBusinessData();
     properties = [];
     pending = [];
+    notes = [];
     notifyListeners();
     await refreshMarketplace();
   }
+
+  Future<List<Note>> notesOf({String? kind}) => _db.listNotes(kind: kind);
+
+  Future<int> addNote({
+    required String kind,
+    String title = '',
+    required String body,
+    String format = kNoteFormatPlain,
+    DateTime? scheduleAt,
+    DateTime? remindAt,
+    String recurFreq = '',
+    int recurInterval = 1,
+    String? recurByday,
+    DateTime? recurUntil,
+    int? recurCount,
+    int remindOffsetMin = 0,
+    String city = '',
+    List<String> sourceNoteUuids = const [],
+  }) async {
+    final resolved = resolveNoteTitleForSave(
+      kind: kind,
+      title: title,
+      body: body,
+    );
+    final id = await _db.insertNote(
+      kind: kind,
+      title: resolved,
+      body: body,
+      format: format,
+      scheduleAt: scheduleAt,
+      remindAt: remindAt,
+      recurFreq: recurFreq,
+      recurInterval: recurInterval,
+      recurByday: recurByday,
+      recurUntil: recurUntil,
+      recurCount: recurCount,
+      remindOffsetMin: remindOffsetMin,
+      city: city,
+      sourceNoteUuids: sourceNoteUuids,
+    );
+    await _publish([(table: 'notes', id: id)]);
+    await reload();
+    return id;
+  }
+
+  Future<void> saveNote({
+    required int id,
+    String? kind,
+    String? title,
+    String? body,
+    String? format,
+    DateTime? scheduleAt,
+    bool clearScheduleAt = false,
+    DateTime? remindAt,
+    bool clearRemindAt = false,
+    String? recurFreq,
+    int? recurInterval,
+    String? recurByday,
+    bool clearRecurByday = false,
+    DateTime? recurUntil,
+    bool clearRecurUntil = false,
+    int? recurCount,
+    bool clearRecurCount = false,
+    int? remindOffsetMin,
+    String? city,
+    List<String>? sourceNoteUuids,
+  }) async {
+    final existing = await _db.noteById(id);
+    final nextKind = kind ?? existing?.kind ?? kNoteKindNote;
+    final nextBody = body ?? existing?.body ?? '';
+    final nextTitle = title != null
+        ? resolveNoteTitleForSave(
+            kind: nextKind,
+            title: title,
+            body: nextBody,
+          )
+        : title;
+    await _db.updateNote(
+      id: id,
+      kind: kind,
+      title: nextTitle,
+      body: body,
+      format: format,
+      scheduleAt: scheduleAt,
+      clearScheduleAt: clearScheduleAt,
+      remindAt: remindAt,
+      clearRemindAt: clearRemindAt,
+      recurFreq: recurFreq,
+      recurInterval: recurInterval,
+      recurByday: recurByday,
+      clearRecurByday: clearRecurByday,
+      recurUntil: recurUntil,
+      clearRecurUntil: clearRecurUntil,
+      recurCount: recurCount,
+      clearRecurCount: clearRecurCount,
+      remindOffsetMin: remindOffsetMin,
+      city: city,
+      sourceNoteUuids: sourceNoteUuids,
+    );
+    await _publish([(table: 'notes', id: id)]);
+    await reload();
+  }
+
+  Future<void> removeNote(int id) async {
+    await _db.deleteNote(id);
+    await _publish([(table: 'notes', id: id)]);
+    await reload();
+  }
+
+  Future<void> setNoteListing({
+    required int noteId,
+    required bool listed,
+    String? city,
+  }) async {
+    await _db.setNoteListed(noteId, listed: listed, city: city);
+    await _publish([(table: 'notes', id: noteId)]);
+    await reload();
+  }
+
+  /// 打开文章详情时：记本机近期阅读；非作者则远端 +1 访问。
+  Future<void> recordArticleOpen(MarketplaceArticle article) async {
+    await _db.upsertArticleRead(
+      noteUuid: article.noteUuid,
+      title: article.title,
+      body: article.body,
+      format: article.format,
+      city: article.city,
+      ownerId: article.ownerId,
+    );
+    articleReads = await _db.listArticleReads();
+    notifyListeners();
+    final viewer = user?.id;
+    final owner = article.ownerId.trim();
+    if (owner.isNotEmpty && viewer != null && viewer == owner) {
+      return;
+    }
+    // ignore: unawaited_futures
+    SyncService(db: _db).incrementArticleView(
+      noteUuid: article.noteUuid,
+      viewerId: viewer,
+    );
+  }
+
+  ArticleReadRecord? get latestArticleRead =>
+      articleReads.isEmpty ? null : articleReads.first;
 
   List<DueItem> get overdue {
     final today = dateOnly(DateTime.now());
@@ -182,12 +363,14 @@ class AppStore extends ChangeNotifier {
 
   Future<int> addProperty(String name, String address, {String city = ''}) async {
     final id = await _db.insertProperty(name, address, city: city);
+    await _publish([(table: 'properties', id: id)]);
     await reload();
     return id;
   }
 
   Future<void> removeProperty(int id) async {
     await _db.deleteProperty(id);
+    await _publish([(table: 'properties', id: id)]);
     await reload();
   }
 
@@ -203,6 +386,7 @@ class AppStore extends ChangeNotifier {
       address: address,
       city: city,
     );
+    await _publish([(table: 'properties', id: id)]);
     await reload();
   }
 
@@ -212,6 +396,7 @@ class AppStore extends ChangeNotifier {
 
   Future<int> addRoom(int propertyId, String label) async {
     final id = await _db.insertRoom(propertyId, label);
+    await _publish([(table: 'rooms', id: id)]);
     await reload();
     return id;
   }
@@ -221,11 +406,13 @@ class AppStore extends ChangeNotifier {
     required String label,
   }) async {
     await _db.updateRoomLabel(id: id, label: label);
+    await _publish([(table: 'rooms', id: id)]);
     await reload();
   }
 
   Future<void> removeRoom(int id) async {
     await _db.deleteRoom(id);
+    await _publish([(table: 'rooms', id: id)]);
     await reload();
   }
 
@@ -234,6 +421,7 @@ class AppStore extends ChangeNotifier {
     required bool listed,
   }) async {
     await _db.setRoomListing(roomId: roomId, listed: listed);
+    await _publish([(table: 'rooms', id: roomId)]);
     await reload();
   }
 
@@ -252,8 +440,9 @@ class AppStore extends ChangeNotifier {
     double gasPrice = 0,
     List<LeaseExtraItem> extras = const [],
   }) async {
+    late final int id;
     if (leaseId == null) {
-      await _db.saveNewLease(
+      id = await _db.saveNewLease(
         roomId: roomId,
         tenantName: tenantName,
         tenantPhone: tenantPhone,
@@ -268,6 +457,7 @@ class AppStore extends ChangeNotifier {
         extras: extras,
       );
     } else {
+      id = leaseId;
       await _db.updateLease(
         leaseId: leaseId,
         tenantName: tenantName,
@@ -284,6 +474,23 @@ class AppStore extends ChangeNotifier {
       );
       await _billing.syncOpenPeriodAmounts(leaseId);
     }
+    // 新登记会结束同房旧约，一并推送该房全部租约树
+    final db = await _db.database;
+    final roomLeases = await db.query(
+      'leases',
+      columns: ['id'],
+      where: 'room_id = ?',
+      whereArgs: [roomId],
+    );
+    final sync = SyncService(db: _db);
+    final refs = <SyncRef>[(table: 'rooms', id: roomId)];
+    for (final row in roomLeases) {
+      refs.addAll(await sync.refsForLease(row['id'] as int));
+    }
+    if (roomLeases.every((r) => r['id'] != id)) {
+      refs.addAll(await sync.refsForLease(id));
+    }
+    await _publish(refs);
     await reload();
   }
 
@@ -293,6 +500,7 @@ class AppStore extends ChangeNotifier {
   }) async {
     await _db.replaceLeaseExtras(leaseId, extras);
     await _billing.syncOpenPeriodAmounts(leaseId);
+    await _publishLease(leaseId);
     await reload();
   }
 
@@ -301,6 +509,7 @@ class AppStore extends ChangeNotifier {
     DateTime? endDate,
   }) async {
     await _db.endLease(leaseId: leaseId, endDate: endDate);
+    await _publishLease(leaseId);
     await reload();
   }
 
@@ -317,6 +526,7 @@ class AppStore extends ChangeNotifier {
       gasPrice: gasPrice,
     );
     await _billing.syncOpenPeriodAmounts(leaseId);
+    await _publishLease(leaseId);
     await reload();
   }
 
@@ -347,6 +557,7 @@ class AppStore extends ChangeNotifier {
       previous: previousReading,
     );
     await _billing.syncOpenPeriodAmounts(leaseId);
+    await _publishPeriod(openId);
     await reload();
   }
 
@@ -364,6 +575,7 @@ class AppStore extends ChangeNotifier {
     }
     await _db.upsertDiscount(periodId: periodId, amount: amount, note: note);
     await _billing.syncOpenPeriodAmounts(period.leaseId);
+    await _publishPeriod(periodId);
     await reload();
   }
 
@@ -375,6 +587,7 @@ class AppStore extends ChangeNotifier {
     final period = await _db.getPeriod(periodId);
     if (period == null) throw StateError('账期不存在');
     await _db.updatePeriodRemark(periodId: periodId, remark: remark);
+    await _publish([(table: 'rent_periods', id: periodId)]);
     await reload();
   }
 
@@ -393,6 +606,7 @@ class AppStore extends ChangeNotifier {
     }
     await _db.upsertPeriodFee(periodId: periodId, name: name, amount: amount);
     await _billing.syncOpenPeriodAmounts(period.leaseId);
+    await _publishPeriod(periodId);
     await reload();
   }
 
@@ -408,6 +622,7 @@ class AppStore extends ChangeNotifier {
 
   Future<BillPreview> issueBill(int periodId) async {
     final bill = await _billing.issuePeriod(periodId);
+    await _publishPeriod(periodId);
     await reload();
     return bill;
   }
@@ -424,17 +639,20 @@ class AppStore extends ChangeNotifier {
       status: 'pending',
     );
     await _billing.syncOpenPeriodAmounts(period.leaseId);
+    await _publishPeriod(periodId);
     await reload();
     return previewBill(periodId);
   }
 
   Future<void> markPaid(int periodId) async {
     await _db.markPaid(periodId);
+    await _publishPeriod(periodId);
     await reload();
   }
 
   Future<void> markUnpaid(int periodId) async {
     await _db.markUnpaid(periodId);
+    await _publishPeriod(periodId);
     await reload();
   }
 

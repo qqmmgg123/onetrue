@@ -26,9 +26,11 @@ class SyncReport {
 
 typedef SyncProgress = void Function(String message);
 
-/// 静默双向同步（LWW）：直连 Neon/Postgres。
-/// 后台：先推 dirty 再拉；手动全量：先拉后推。
-/// 未改脏跟线上；有本地改动按 updated_at；上传带乐观锁防旧盖新。
+/// 待上传的本地行（表名 + 本地 id）。
+typedef SyncRef = ({String table, int id});
+
+/// 服务端权威同步：本地 SQLite 仅缓存。
+/// 写入后按行直推 Neon；打开/回前台只拉并覆盖本地。无 dirty 队列、无 LWW。
 class SyncService {
   SyncService({
     AppDatabase? db,
@@ -39,10 +41,9 @@ class SyncService {
   final AppDatabase _db;
   final SyncSettings _settings;
 
-  /// 互斥：同时只跑一路。静默遇忙则跳过；手动可中止静默并插队。
+  /// 互斥：同时只跑一路推/拉。
   static Completer<void>? _lock;
   static bool _abortFlag = false;
-  static bool _runningFull = false;
 
   bool get _aborted => _abortFlag;
 
@@ -58,6 +59,7 @@ class SyncService {
     'period_adjustments',
     'invoices',
     'payments',
+    'notes',
   ];
 
   static const _tableLabel = {
@@ -71,108 +73,226 @@ class SyncService {
     'period_adjustments': '优惠/费用',
     'invoices': '清单',
     'payments': '收款',
+    'notes': '笔记',
   };
 
-  /// [fullPull]=true：手动全量——先拉后推；未改脏跟线上，有本地改动按 updated_at 比新旧。
-  Future<SyncReport> syncSilent({
-    bool fullPull = false,
+  /// 打开/回前台/刷新：只拉「当前登录用户」数据覆盖本地缓存。
+  /// [forceFull] 或无 last_sync_at / 游标过久 → 全量；否则按 updated_at 增量。
+  Future<SyncReport> refreshMyCache({
+    bool forceFull = false,
     SyncProgress? onProgress,
   }) async {
     void tip(String m) => onProgress?.call(m);
-
     tip('检查同步配置…');
     await _settings.load();
     if (!_settings.configured) {
       return SyncReport(error: 'sync_disabled');
     }
 
-    // 静默：已有同步在跑直接跳过，不排队（避免拖慢「立即同步」）
-    if (!fullPull && _lock != null) {
-      return SyncReport();
-    }
-
-    // 手动：若后台静默在跑则中止并插队；若上一次也是手动则等待结束
-    if (fullPull && _lock != null) {
-      if (!_runningFull) {
-        tip('正在结束后台同步…');
-        _abortFlag = true;
-      } else {
-        tip('等待上一次同步结束…');
-      }
+    if (_lock != null) {
+      tip('等待上一次同步结束…');
       await _lock!.future;
     }
 
     final held = Completer<void>();
     _lock = held;
-    _runningFull = fullPull;
     _abortFlag = false;
     final report = SyncReport();
     PostgreSQLConnection? conn;
     try {
       await _db.database;
-      tip('连接 Neon 数据库…');
+      tip('连接数据库…');
       conn = await _openWithRetry();
-      if (_aborted) {
-        tip('已让路');
-        return report;
-      }
-      tip('检查远端是否为空库…');
-      await _rematerializeIfRemoteEmpty(conn);
 
-      if (fullPull) {
-        tip('下载线上数据（全量）…');
-        report.pulled = await _pullRemote(
-          conn,
-          full: true,
-          onProgress: tip,
-        );
-        if (_aborted) {
-          tip('已中止');
-          return report;
+      final since = await _db.getSyncState('last_sync_at');
+      var full = forceFull || since == null || since.isEmpty;
+      if (!full) {
+        final t = DateTime.tryParse(since);
+        if (t == null ||
+            DateTime.now().toUtc().difference(t.toUtc()).inDays >= 7) {
+          full = true;
         }
-        tip('上传本地未同步改动…');
-        final push = await _pushDirty(conn, onProgress: tip);
-        report.pushed = push.$1;
-        report.skipped = push.$2;
-      } else {
-        tip('上传本地改动…');
-        final push = await _pushDirty(conn, onProgress: tip);
-        report.pushed = push.$1;
-        report.skipped = push.$2;
-        if (_aborted) {
-          tip('已中止');
-          return report;
-        }
-        tip('下载线上更新…');
-        report.pulled = await _pullRemote(conn, full: false, onProgress: tip);
       }
-
-      if (_aborted) {
-        tip('已中止');
-        return report;
-      }
-      tip('写入同步时间…');
+      tip(full ? '下载我的数据（全量）…' : '下载我的数据（增量）…');
+      report.pulled = await _pullRemote(
+        conn,
+        full: full,
+        onProgress: tip,
+      );
       await _db.setSyncState(
         'last_sync_at',
         DateTime.now().toUtc().toIso8601String(),
       );
-      tip('同步完成');
+      tip('刷新完成');
     } catch (e, st) {
-      debugPrint('sync failed: $e\n$st');
+      debugPrint('refreshMyCache failed: $e\n$st');
       report.error = '$e';
-      tip('同步失败');
+      tip('刷新失败');
     } finally {
       try {
         await conn?.close();
       } catch (_) {}
       if (identical(_lock, held)) {
         _lock = null;
-        _runningFull = false;
       }
       _abortFlag = false;
       held.complete();
     }
     return report;
+  }
+
+  /// 业务写入后：按行直推 Neon（含父行）。失败返回 error。
+  Future<SyncReport> pushLocalRows(
+    List<SyncRef> refs, {
+    SyncProgress? onProgress,
+  }) async {
+    void tip(String m) => onProgress?.call(m);
+    await _settings.load();
+    if (!_settings.configured) {
+      return SyncReport(error: '未登录或未配置同步，无法保存到云端');
+    }
+    if (refs.isEmpty) return SyncReport();
+
+    if (_lock != null) {
+      await _lock!.future;
+    }
+    final held = Completer<void>();
+    _lock = held;
+    _abortFlag = false;
+    final report = SyncReport();
+    PostgreSQLConnection? conn;
+    try {
+      tip('上传…');
+      conn = await _openWithRetry();
+      final ordered = _orderedUnique(refs);
+      for (final ref in ordered) {
+        if (_aborted) break;
+        final label = _tableLabel[ref.table] ?? ref.table;
+        tip('上传$label…');
+        final ok = await _upsertLocalById(conn, ref.table, ref.id);
+        if (ok) {
+          report.pushed++;
+        } else {
+          report.skipped++;
+        }
+      }
+      if (report.pushed == 0 && report.skipped > 0) {
+        report.error = '部分数据未能上传，请稍后重试';
+      }
+      tip('上传完成');
+    } catch (e, st) {
+      debugPrint('pushLocalRows failed: $e\n$st');
+      report.error = '$e';
+    } finally {
+      try {
+        await conn?.close();
+      } catch (_) {}
+      if (identical(_lock, held)) {
+        _lock = null;
+      }
+      _abortFlag = false;
+      held.complete();
+    }
+    return report;
+  }
+
+  /// 登录认领：按表顺序上传全部本地业务行。
+  Future<SyncReport> uploadAllLocal({SyncProgress? onProgress}) async {
+    final refs = <SyncRef>[];
+    final db = await _db.database;
+    for (final table in _syncOrder) {
+      final rows = await db.query(table, columns: ['id']);
+      for (final r in rows) {
+        refs.add((table: table, id: r['id'] as int));
+      }
+    }
+    onProgress?.call('上传本机数据（${refs.length} 条）…');
+    return pushLocalRows(refs, onProgress: onProgress);
+  }
+
+  /// 租约整树（含租户/附加费/账期及账期子表），供登记/改约后上传。
+  Future<List<SyncRef>> refsForLease(int leaseId) async {
+    final db = await _db.database;
+    final leases = await db.query(
+      'leases',
+      where: 'id = ?',
+      whereArgs: [leaseId],
+      limit: 1,
+    );
+    if (leases.isEmpty) return const [];
+    final lease = leases.first;
+    final refs = <SyncRef>[
+      (table: 'leases', id: leaseId),
+      (table: 'tenants', id: lease['tenant_id'] as int),
+      (table: 'rooms', id: lease['room_id'] as int),
+    ];
+    for (final r in await db.query(
+      'lease_extras',
+      columns: ['id'],
+      where: 'lease_id = ?',
+      whereArgs: [leaseId],
+    )) {
+      refs.add((table: 'lease_extras', id: r['id'] as int));
+    }
+    final periods = await db.query(
+      'rent_periods',
+      columns: ['id'],
+      where: 'lease_id = ?',
+      whereArgs: [leaseId],
+    );
+    for (final p in periods) {
+      refs.addAll(await refsForPeriod(p['id'] as int));
+    }
+    for (final r in await db.query(
+      'meter_readings',
+      columns: ['id'],
+      where: 'lease_id = ? AND period_id IS NULL',
+      whereArgs: [leaseId],
+    )) {
+      refs.add((table: 'meter_readings', id: r['id'] as int));
+    }
+    return refs;
+  }
+
+  /// 账期及其抄表/调账/清单/收款。
+  Future<List<SyncRef>> refsForPeriod(int periodId) async {
+    final refs = <SyncRef>[(table: 'rent_periods', id: periodId)];
+    final db = await _db.database;
+    for (final table in [
+      'meter_readings',
+      'period_adjustments',
+      'invoices',
+      'payments',
+    ]) {
+      final rows = await db.query(
+        table,
+        columns: ['id'],
+        where: 'period_id = ?',
+        whereArgs: [periodId],
+      );
+      for (final r in rows) {
+        refs.add((table: table, id: r['id'] as int));
+      }
+    }
+    return refs;
+  }
+
+  List<SyncRef> _orderedUnique(List<SyncRef> refs) {
+    final seen = <String>{};
+    final list = <SyncRef>[];
+    for (final r in refs) {
+      final key = '${r.table}:${r.id}';
+      if (seen.add(key)) list.add(r);
+    }
+    list.sort((a, b) {
+      final ai = _syncOrder.indexOf(a.table);
+      final bi = _syncOrder.indexOf(b.table);
+      final ao = ai < 0 ? 999 : ai;
+      final bo = bi < 0 ? 999 : bi;
+      if (ao != bo) return ao.compareTo(bo);
+      return a.id.compareTo(b.id);
+    });
+    return list;
   }
 
   Future<PostgreSQLConnection> _openWithRetry() async {
@@ -187,65 +307,6 @@ class SyncService {
       }
     }
     throw StateError('连接 Neon 失败（已重试）：$last');
-  }
-
-  /// Neon 空库时，本地可能仍是 dirty=0（以前在 Supabase 标过已同步），需整表重推。
-  Future<void> _rematerializeIfRemoteEmpty(PostgreSQLConnection conn) async {
-    final rows = await conn.query(
-      'SELECT COUNT(*)::int AS c FROM properties '
-      'WHERE owner_id = CAST(@owner AS uuid)',
-      substitutionValues: {'owner': _settings.ownerId},
-    );
-    final raw = rows.isEmpty ? 0 : rows.first[0];
-    final remoteCount = raw is int ? raw : int.tryParse('$raw') ?? 0;
-    if (remoteCount > 0) return;
-    final local = await (await _db.database).rawQuery(
-      'SELECT COUNT(*) AS c FROM properties WHERE deleted_at IS NULL',
-    );
-    final localCount = (local.first['c'] as int?) ?? 0;
-    if (localCount <= 0) return;
-    debugPrint('sync: remote empty, mark all dirty for Neon rematerialize');
-    await _db.markAllSyncDirty();
-  }
-
-  Future<(int, int)> _pushDirty(
-    PostgreSQLConnection conn, {
-    SyncProgress? onProgress,
-  }) async {
-    var count = 0;
-    var skipped = 0;
-    for (final table in _syncOrder) {
-      if (_aborted) break;
-      final rows = await _db.dirtyRows(table);
-      if (rows.isEmpty) continue;
-      final label = _tableLabel[table] ?? table;
-      onProgress?.call('上传$label（${rows.length} 条）…');
-      for (final row in rows) {
-        if (_aborted) break;
-        // 先补推父行，避免 leases.room_id 等外键在远端不存在
-        final okParents = await _ensureParentsRemote(conn, table, row);
-        if (!okParents) {
-          skipped++;
-          continue;
-        }
-        final payload = await _toRemotePayload(table, row);
-        if (payload == null) {
-          skipped++;
-          continue;
-        }
-        final wrote = await _upsertRemote(conn, table, payload);
-        if (!wrote) {
-          // 线上更新：不盖写，改为拉回线上并清掉本地 dirty
-          onProgress?.call('线上$label更新，保留线上版本');
-          await _pullOneByUuid(conn, table, '${payload['id']}');
-          skipped++;
-          continue;
-        }
-        await _db.markSynced(table, row['id'] as int);
-        count++;
-      }
-    }
-    return (count, skipped);
   }
 
   Future<bool> _ensureParentsRemote(
@@ -296,12 +357,11 @@ class SyncService {
     if (!await _ensureParentsRemote(conn, table, row)) return false;
     final payload = await _toRemotePayload(table, row);
     if (payload == null) return false;
-    // 父行若线上更新：不盖写，但外键目标已存在，视为成功
     await _upsertRemote(conn, table, payload);
     return true;
   }
 
-  /// 乐观锁：仅当本地 updated_at ≥ 线上时才盖写；否则返回 false。
+  /// 直写远端：冲突则覆盖（服务端权威写入，无乐观锁）。
   Future<bool> _upsertRemote(
     PostgreSQLConnection conn,
     String table,
@@ -318,27 +378,12 @@ class SyncService {
         .where((k) => k != 'id')
         .map((k) => '$k = EXCLUDED.$k')
         .join(', ');
-    final result = await conn.query(
+    await conn.query(
       'INSERT INTO $table ($cols) VALUES ($ph) '
-      'ON CONFLICT (id) DO UPDATE SET $updates '
-      'WHERE $table.updated_at <= EXCLUDED.updated_at '
-      'RETURNING id',
+      'ON CONFLICT (id) DO UPDATE SET $updates',
       substitutionValues: values,
     );
-    return result.isNotEmpty;
-  }
-
-  Future<void> _pullOneByUuid(
-    PostgreSQLConnection conn,
-    String table,
-    String uuid,
-  ) async {
-    final rows = await conn.query(
-      'SELECT * FROM $table WHERE id = CAST(@id AS uuid) LIMIT 1',
-      substitutionValues: {'id': uuid},
-    );
-    if (rows.isEmpty) return;
-    await _applyRemoteRow(table, _mapRow(rows.first), preferRemoteIfClean: true);
+    return true;
   }
 
   Object? _pgValue(Object? v) {
@@ -468,6 +513,28 @@ class SyncService {
           'name': row['name'],
           'phone': row['phone'] ?? '',
         };
+      case 'notes':
+        return {
+          ...base,
+          'kind': row['kind'] ?? 'note',
+          'title': row['title'] ?? '',
+          'body': row['body'] ?? '',
+          'format': row['format'] ?? 'plain',
+          'schedule_at': row['schedule_at'],
+          'remind_at': row['remind_at'],
+          'recur_freq': row['recur_freq'] ?? '',
+          'recur_interval': row['recur_interval'] ?? 1,
+          'recur_byday': row['recur_byday'],
+          'recur_until': row['recur_until'],
+          'recur_count': row['recur_count'],
+          'remind_offset_min': row['remind_offset_min'] ?? 0,
+          'listing_status': row['listing_status'] ?? 'draft',
+          'listed_at': row['listed_at'],
+          'city': row['city'] ?? '',
+          'parent_uuid': row['parent_uuid'],
+          'sort_order': row['sort_order'] ?? 0,
+          'source_note_uuids': row['source_note_uuids'] ?? '[]',
+        };
       case 'leases':
         final room = await _uuidOf('rooms', row['room_id'] as int);
         final tenant = await _uuidOf('tenants', row['tenant_id'] as int);
@@ -582,34 +649,6 @@ class SyncService {
     return row['id'] as int?;
   }
 
-  /// LWW：
-  /// - 本地未改脏（dirty=0）：跟线上（修控制台改名但时间戳未变/未脏本地挡更新）
-  /// - 本地有改动：仅当线上 updated_at 更新时才覆盖本地
-  bool _shouldSkipPull(
-    Map<String, Object?>? local,
-    String remoteUpdated, {
-    bool preferRemoteIfClean = true,
-  }) {
-    if (local == null) return false;
-    final dirty = (local['dirty'] as int? ?? 0) == 1;
-    if (preferRemoteIfClean && !dirty) return false;
-    final localTs = _parseTs(local['updated_at']);
-    final remoteTs = _parseTs(remoteUpdated);
-    // 本地有未上传修改且不比线上旧 → 保留本地
-    if (dirty && !localTs.isBefore(remoteTs)) return true;
-    if (localTs.isAfter(remoteTs)) return true;
-    return false;
-  }
-
-  DateTime _parseTs(Object? raw) {
-    if (raw is DateTime) return raw.toUtc();
-    final s = '${raw ?? ''}'.trim();
-    if (s.isEmpty) return DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
-    final parsed = DateTime.tryParse(s);
-    if (parsed != null) return parsed.toUtc();
-    return DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
-  }
-
   Future<bool> _upsertByUuid(
     String table,
     String uuid,
@@ -620,7 +659,6 @@ class SyncService {
     final row = {
       ...data,
       'uuid': uuid,
-      'dirty': 0,
     };
     if (local == null) {
       await db.insert(table, row);
@@ -642,22 +680,14 @@ class SyncService {
     return s;
   }
 
+  /// 远程覆盖本地缓存（服务端权威）。
   Future<bool> _applyRemoteRow(
     String table,
-    Map<String, dynamic> remote, {
-    bool preferRemoteIfClean = true,
-  }) async {
+    Map<String, dynamic> remote,
+  ) async {
     final uuid = '${remote['id']}';
     final remoteUpdated = '${remote['updated_at']}';
     var local = await _db.rowByUuid(table, uuid);
-    if (_shouldSkipPull(
-      local,
-      remoteUpdated,
-      preferRemoteIfClean: preferRemoteIfClean,
-    )) {
-      return false;
-    }
-
     final db = await _db.database;
 
     switch (table) {
@@ -864,18 +894,47 @@ class SyncService {
           },
           local,
         );
+      case 'notes':
+        return _upsertByUuid(
+          table,
+          uuid,
+          {
+            'kind': remote['kind'] ?? 'note',
+            'title': remote['title'] ?? '',
+            'body': remote['body'] ?? '',
+            'format': remote['format'] ?? 'plain',
+            'schedule_at': remote['schedule_at'],
+            'remind_at': remote['remind_at'],
+            'recur_freq': remote['recur_freq'] ?? '',
+            'recur_interval': remote['recur_interval'] ?? 1,
+            'recur_byday': remote['recur_byday'],
+            'recur_until': remote['recur_until'],
+            'recur_count': remote['recur_count'],
+            'remind_offset_min': remote['remind_offset_min'] ?? 0,
+            'listing_status': remote['listing_status'] ?? 'draft',
+            'listed_at': remote['listed_at'],
+            'city': remote['city'] ?? '',
+            'parent_uuid': remote['parent_uuid']?.toString(),
+            'sort_order': remote['sort_order'] ?? 0,
+            'source_note_uuids': remote['source_note_uuids'] is String
+                ? remote['source_note_uuids']
+                : '${remote['source_note_uuids'] ?? '[]'}',
+            'updated_at': remoteUpdated,
+            'deleted_at': remote['deleted_at'],
+          },
+          local,
+        );
       default:
         return false;
     }
   }
 
-  /// 游客广场：只读拉取已上架房源（不按当前 owner 过滤，不写入本地库）。
-  /// 正式版应改为公开 API；一期测试仍直连 Neon。
+  /// 市集：只读拉取已上架房源（不按当前 owner 过滤，不写入本地库）。
   Future<List<MarketplaceListing>> fetchListedRooms({String? city}) async {
     await _settings.load();
     final url = _settings.databaseUrl.trim();
     if (url.isEmpty) {
-      throw StateError('未配置数据库，无法浏览广场房源');
+      throw StateError('未配置数据库，无法浏览市集房源');
     }
     final conn = await NeonEndpoint.parse(url).open();
     try {
@@ -902,6 +961,169 @@ class SyncService {
         LIMIT 200
         ''',
         substitutionValues: {'city': cityFilter},
+      );
+      return rows.map((row) {
+        DateTime? listedAt;
+        final raw = row[8];
+        if (raw is DateTime) {
+          listedAt = raw.toUtc();
+        } else if (raw != null) {
+          listedAt = DateTime.tryParse('$raw');
+        }
+        return MarketplaceListing(
+          roomUuid: '${row[0]}',
+          propertyUuid: '${row[1]}',
+          propertyName: '${row[2] ?? ''}',
+          city: '${row[3] ?? ''}',
+          address: '${row[4] ?? ''}',
+          roomLabel: '${row[5] ?? ''}',
+          videoUrl: '${row[6] ?? ''}',
+          videoPosterUrl: '${row[7] ?? ''}',
+          listedAt: listedAt,
+        );
+      }).toList();
+    } finally {
+      await conn.close();
+    }
+  }
+
+  /// 市集：已上架文章。
+  Future<List<MarketplaceArticle>> fetchListedArticles({
+    String? city,
+    String? ownerId,
+  }) async {
+    await _settings.load();
+    final url = _settings.databaseUrl.trim();
+    if (url.isEmpty) {
+      throw StateError('未配置数据库，无法浏览市集文章');
+    }
+    final conn = await NeonEndpoint.parse(url).open();
+    try {
+      final cityFilter = city?.trim() ?? '';
+      final ownerFilter = ownerId?.trim() ?? '';
+      final rows = await conn.query(
+        '''
+        SELECT
+          n.id,
+          n.title,
+          n.body,
+          n.format,
+          n.city,
+          n.listed_at,
+          n.owner_id,
+          COALESCE(s.view_count, 0)
+        FROM notes n
+        LEFT JOIN note_stats s ON s.note_id = n.id
+        WHERE n.deleted_at IS NULL
+          AND n.kind = 'article'
+          AND n.listing_status = 'listed'
+          AND (@city = '' OR n.city = @city OR n.city = '')
+          AND (@owner = '' OR n.owner_id::text = @owner)
+        ORDER BY n.listed_at DESC NULLS LAST, n.updated_at DESC
+        LIMIT 200
+        ''',
+        substitutionValues: {
+          'city': cityFilter,
+          'owner': ownerFilter,
+        },
+      );
+      return rows.map(_articleFromRow).toList();
+    } finally {
+      await conn.close();
+    }
+  }
+
+  MarketplaceArticle _articleFromRow(dynamic row) {
+    DateTime? listedAt;
+    final raw = row[5];
+    if (raw is DateTime) {
+      listedAt = raw.toUtc();
+    } else if (raw != null) {
+      listedAt = DateTime.tryParse('$raw');
+    }
+    final vc = row[7];
+    return MarketplaceArticle(
+      noteUuid: '${row[0]}',
+      title: '${row[1] ?? ''}',
+      body: '${row[2] ?? ''}',
+      format: '${row[3] ?? 'plain'}',
+      city: '${row[4] ?? ''}',
+      listedAt: listedAt,
+      ownerId: '${row[6] ?? ''}',
+      viewCount: vc is int ? vc : int.tryParse('$vc') ?? 0,
+    );
+  }
+
+  /// 非作者访问：累计文章浏览次数。
+  Future<void> incrementArticleView({
+    required String noteUuid,
+    String? viewerId,
+  }) async {
+    final id = noteUuid.trim();
+    if (id.isEmpty) return;
+    await _settings.load();
+    final url = _settings.databaseUrl.trim();
+    if (url.isEmpty) return;
+    final conn = await NeonEndpoint.parse(url).open();
+    try {
+      final viewer = viewerId?.trim() ?? '';
+      await conn.execute(
+        '''
+        INSERT INTO note_stats (note_id, view_count)
+        SELECT n.id, 1
+        FROM notes n
+        WHERE n.id = @id::uuid
+          AND n.deleted_at IS NULL
+          AND n.kind = 'article'
+          AND (@viewer = '' OR n.owner_id::text IS DISTINCT FROM @viewer)
+        ON CONFLICT (note_id) DO UPDATE
+        SET view_count = note_stats.view_count + 1
+        WHERE EXISTS (
+          SELECT 1 FROM notes n2
+          WHERE n2.id = note_stats.note_id
+            AND (@viewer = '' OR n2.owner_id::text IS DISTINCT FROM @viewer)
+        )
+        ''',
+        substitutionValues: {'id': id, 'viewer': viewer},
+      );
+    } catch (_) {
+      // 远端未建 note_stats 时不挡阅读
+    } finally {
+      await conn.close();
+    }
+  }
+
+  /// 某作者的上架房源（陋室）。
+  Future<List<MarketplaceListing>> fetchListedRoomsByOwner(String ownerId) async {
+    final oid = ownerId.trim();
+    if (oid.isEmpty) return const [];
+    await _settings.load();
+    final url = _settings.databaseUrl.trim();
+    if (url.isEmpty) return const [];
+    final conn = await NeonEndpoint.parse(url).open();
+    try {
+      final rows = await conn.query(
+        '''
+        SELECT
+          r.id AS room_id,
+          p.id AS property_id,
+          p.name AS property_name,
+          p.city AS city,
+          p.address AS address,
+          r.label AS room_label,
+          r.video_url AS video_url,
+          r.video_poster_url AS video_poster_url,
+          r.listed_at AS listed_at
+        FROM rooms r
+        JOIN properties p ON p.id = r.property_id
+        WHERE r.deleted_at IS NULL
+          AND p.deleted_at IS NULL
+          AND r.listing_status = 'listed'
+          AND r.owner_id::text = @owner
+        ORDER BY r.listed_at DESC NULLS LAST, r.updated_at DESC
+        LIMIT 200
+        ''',
+        substitutionValues: {'owner': oid},
       );
       return rows.map((row) {
         DateTime? listedAt;

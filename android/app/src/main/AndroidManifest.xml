@@ -34,7 +34,7 @@
         </intent>
     </queries>
     <application
-        android:label="缘初"
+        android:label="醍醐"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true"

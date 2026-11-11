@@ -2,11 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../domain/models.dart';
+import '../domain/note_recur.dart';
 import '../reminders/reminder_service.dart';
 import '../state/app_store.dart';
 import 'format.dart';
-import 'home_page.dart';
-import 'reminder_settings_page.dart';
+import 'note_editor_page.dart';
 
 class CalendarPage extends StatefulWidget {
   const CalendarPage({super.key});
@@ -16,8 +16,17 @@ class CalendarPage extends StatefulWidget {
 }
 
 class _CalendarPageState extends State<CalendarPage> {
+  static const _hourStart = 6;
+  static const _hourEnd = 23;
+
   late DateTime _month;
   late DateTime _selected;
+  /// month | three
+  String _mode = 'month';
+  late final PageController _monthPage;
+  late final PageController _threePage;
+  static const _monthBase = 120;
+  static const _threeBase = 400;
 
   @override
   void initState() {
@@ -25,95 +34,271 @@ class _CalendarPageState extends State<CalendarPage> {
     final today = dateOnly(DateTime.now());
     _month = DateTime(today.year, today.month);
     _selected = today;
+    _monthPage = PageController(initialPage: _monthBase);
+    _threePage = PageController(initialPage: _threeBase);
   }
 
-  Map<DateTime, List<DueItem>> _byDay(List<DueItem> pending) {
-    final map = <DateTime, List<DueItem>>{};
-    for (final item in pending) {
-      final key = dateOnly(item.period.dueDate);
-      map.putIfAbsent(key, () => []).add(item);
-    }
-    return map;
+  @override
+  void dispose() {
+    _monthPage.dispose();
+    _threePage.dispose();
+    super.dispose();
+  }
+
+  DateTime _monthAt(int page) {
+    final today = dateOnly(DateTime.now());
+    final base = DateTime(today.year, today.month);
+    return DateTime(base.year, base.month + (page - _monthBase));
+  }
+
+  DateTime _threeAnchorAt(int page) {
+    final today = dateOnly(DateTime.now());
+    // 每页以中间日为锚；页 0 对应今天为中间日
+    return today.add(Duration(days: (page - _threeBase) * 3));
+  }
+
+  List<DateTime> _threeDays(DateTime mid) => [
+        mid.subtract(const Duration(days: 1)),
+        mid,
+        mid.add(const Duration(days: 1)),
+      ];
+
+  Map<DateTime, List<({Note note, DateTime at})>> _notesWindow(
+    List<Note> notes, {
+    required DateTime from,
+    required DateTime to,
+  }) {
+    return notesGroupedByDay(notes, from: from, to: to);
+  }
+
+  Future<void> _openNewSchedule(DateTime at, {String kind = kNoteKindSchedule}) {
+    return Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NoteEditorPage(
+          initialKind: kind,
+          initialScheduleAt: at,
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
     final reminders = ReminderService.instance;
-    final byDay = _byDay(store.pending);
-    final selectedItems = byDay[_selected] ?? const <DueItem>[];
     final today = dateOnly(DateTime.now());
+    final monthFrom = DateTime(_month.year, _month.month, 1);
+    final monthTo = DateTime(_month.year, _month.month + 1, 0, 23, 59, 59);
+    final threeMid = _selected;
+    final threeDays = _threeDays(threeMid);
+    final threeFrom = DateTime(
+      threeDays.first.year,
+      threeDays.first.month,
+      threeDays.first.day,
+    );
+    final threeTo = DateTime(
+      threeDays.last.year,
+      threeDays.last.month,
+      threeDays.last.day,
+      23,
+      59,
+      59,
+    );
+    final notesByDay = _notesWindow(
+      store.notes,
+      from: _mode == 'month'
+          ? monthFrom.subtract(const Duration(days: 7))
+          : threeFrom,
+      to: _mode == 'month' ? monthTo.add(const Duration(days: 7)) : threeTo,
+    );
+    final selectedNotes = notesByDay[_selected] ?? const [];
+    final noteAlarms =
+        reminders.scheduled.where((a) => a.id >= 800000).toList();
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
       children: [
-        Row(
-          children: [
-            IconButton(
-              onPressed: () => setState(() {
-                _month = DateTime(_month.year, _month.month - 1);
-              }),
-              icon: const Icon(Icons.chevron_left),
-            ),
-            Expanded(
-              child: Text(
-                '${_month.year}年${_month.month}月',
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-            ),
-            IconButton(
-              onPressed: () => setState(() {
-                _month = DateTime(_month.year, _month.month + 1);
-              }),
-              icon: const Icon(Icons.chevron_right),
-            ),
-            IconButton(
-              tooltip: '闹钟设置',
-              onPressed: () async {
-                await Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => const ReminderSettingsPage(),
-                  ),
-                );
-                if (mounted) await store.reload();
-              },
-              icon: const Icon(Icons.alarm),
-            ),
-          ],
+        Text(
+          _mode == 'month'
+              ? '${_month.year}年${_month.month}月'
+              : '${ymd(threeDays.first)} – ${ymd(threeDays.last)}',
+          style: Theme.of(context).textTheme.titleLarge,
         ),
         const SizedBox(height: 4),
+        SegmentedButton<String>(
+          segments: const [
+            ButtonSegment(value: 'month', label: Text('月历')),
+            ButtonSegment(value: 'three', label: Text('三日')),
+          ],
+          selected: {_mode},
+          onSelectionChanged: (s) {
+            final next = s.first;
+            setState(() => _mode = next);
+            if (next == 'three') {
+              final today = dateOnly(DateTime.now());
+              final delta = dateOnly(_selected).difference(today).inDays;
+              final page = _threeBase + (delta / 3).round();
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (_threePage.hasClients) {
+                  _threePage.jumpToPage(page);
+                }
+              });
+            } else {
+              final today = dateOnly(DateTime.now());
+              final base = DateTime(today.year, today.month);
+              final page = _monthBase +
+                  (_month.year - base.year) * 12 +
+                  (_month.month - base.month);
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (_monthPage.hasClients) {
+                  _monthPage.jumpToPage(page);
+                }
+              });
+            }
+          },
+        ),
+        const SizedBox(height: 8),
         Text(
-          '点日期看当天应收。提醒只在本 App 内管理，不同步系统日历。',
+          _mode == 'month'
+              ? '左右滑换月；点日期看当天备忘日程。'
+              : '左右滑换三日；点空白时段新建日程，长按建备忘。',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 12),
-        _MonthGrid(
-          month: _month,
-          selected: _selected,
-          today: today,
-          byDay: byDay,
-          onSelect: (d) => setState(() => _selected = d),
-        ),
+        if (_mode == 'month')
+          SizedBox(
+            height: 320,
+            child: PageView.builder(
+              controller: _monthPage,
+              onPageChanged: (page) {
+                final m = _monthAt(page);
+                setState(() {
+                  _month = m;
+                  if (_selected.month != m.month || _selected.year != m.year) {
+                    final day = _selected.day.clamp(
+                      1,
+                      DateTime(m.year, m.month + 1, 0).day,
+                    );
+                    _selected = DateTime(m.year, m.month, day);
+                  }
+                });
+              },
+              itemBuilder: (context, page) {
+                final m = _monthAt(page);
+                final from = DateTime(m.year, m.month, 1)
+                    .subtract(const Duration(days: 7));
+                final to = DateTime(m.year, m.month + 1, 0, 23, 59, 59)
+                    .add(const Duration(days: 7));
+                final pageNotes = _notesWindow(
+                  store.notes,
+                  from: from,
+                  to: to,
+                );
+                return _MonthGrid(
+                  month: m,
+                  selected: _selected,
+                  today: today,
+                  notesByDay: pageNotes,
+                  onSelect: (d) => setState(() {
+                    _selected = d;
+                    _month = DateTime(d.year, d.month);
+                  }),
+                );
+              },
+            ),
+          )
+        else
+          SizedBox(
+            height: 420,
+            child: PageView.builder(
+              controller: _threePage,
+              onPageChanged: (page) {
+                final mid = _threeAnchorAt(page);
+                setState(() => _selected = mid);
+              },
+              itemBuilder: (context, page) {
+                final mid = _threeAnchorAt(page);
+                final days = _threeDays(mid);
+                final from = DateTime(
+                  days.first.year,
+                  days.first.month,
+                  days.first.day,
+                );
+                final to = DateTime(
+                  days.last.year,
+                  days.last.month,
+                  days.last.day,
+                  23,
+                  59,
+                  59,
+                );
+                final pageNotes = _notesWindow(
+                  store.notes,
+                  from: from,
+                  to: to,
+                );
+                return _ThreeDayView(
+                  days: days,
+                  selected: _selected,
+                  today: today,
+                  hourStart: _hourStart,
+                  hourEnd: _hourEnd,
+                  notesByDay: pageNotes,
+                  onSelectDay: (d) => setState(() => _selected = d),
+                  onTapSlot: (at) => _openNewSchedule(at),
+                  onLongPressSlot: (at) =>
+                      _openNewSchedule(at, kind: kNoteKindMemo),
+                  onTapNote: (n) {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => NoteEditorPage(noteId: n.id),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
         const SizedBox(height: 16),
         Text(
-          '${md(_selected)} 的应收',
+          '${md(_selected)} 的备忘 / 日程',
           style: Theme.of(context).textTheme.titleMedium,
         ),
         const SizedBox(height: 8),
-        if (selectedItems.isEmpty)
+        if (selectedNotes.isEmpty)
           Text(
-            _selected.isBefore(today)
-                ? '这一天没有未收账期（或已记收款）。'
-                : '这一天暂时没有应收。',
+            '这一天没有备忘或日程。',
             style: Theme.of(context).textTheme.bodySmall,
           )
         else
-          ...selectedItems.map((e) => DueTile(item: e)),
+          ...selectedNotes.map(
+            (e) => ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(
+                e.note.kind == kNoteKindSchedule
+                    ? Icons.event_outlined
+                    : Icons.notifications_none,
+              ),
+              title: Text(e.note.displayTitle),
+              subtitle: Text(
+                '${e.note.kindLabel} · '
+                '${e.at.hour.toString().padLeft(2, '0')}:'
+                '${e.at.minute.toString().padLeft(2, '0')}'
+                '${isRecurringFreq(e.note.recurFreq) ? ' · 重复' : ''}',
+              ),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => NoteEditorPage(noteId: e.note.id),
+                  ),
+                );
+              },
+            ),
+          ),
         const SizedBox(height: 20),
         Row(
           children: [
-            Text('已排闹钟', style: Theme.of(context).textTheme.titleMedium),
+            Text('已排日程提醒', style: Theme.of(context).textTheme.titleMedium),
             const Spacer(),
             if (!reminders.exactAlarmAllowed)
               TextButton(
@@ -122,22 +307,14 @@ class _CalendarPageState extends State<CalendarPage> {
               ),
           ],
         ),
-        const SizedBox(height: 4),
-        Text(
-          reminders.settings.enabled
-              ? '每天 ${reminders.settings.hour.toString().padLeft(2, '0')}:00 · '
-                  '提前 ${reminders.settings.advanceDays} 天 + 当天 + 逾期续催'
-              : '闹钟已关闭（可在右上角闹钟图标里打开）',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
         const SizedBox(height: 8),
-        if (reminders.scheduled.isEmpty)
+        if (noteAlarms.isEmpty)
           Text(
-            '暂无未来闹钟。登记租约并保持闹钟开启后会自动排。',
+            '暂无未来日程提醒。在备忘里设好时间后会自动排。',
             style: Theme.of(context).textTheme.bodySmall,
           )
         else
-          ...reminders.scheduled.take(12).map((a) {
+          ...noteAlarms.take(12).map((a) {
             return ListTile(
               contentPadding: EdgeInsets.zero,
               dense: true,
@@ -145,7 +322,8 @@ class _CalendarPageState extends State<CalendarPage> {
               title: Text(a.title),
               subtitle: Text(
                 '${ymd(a.when)} ${a.when.hour.toString().padLeft(2, '0')}:'
-                '${a.when.minute.toString().padLeft(2, '0')} · ${a.roomLabel}',
+                '${a.when.minute.toString().padLeft(2, '0')}'
+                '${a.roomLabel.isEmpty ? '' : ' · ${a.roomLabel}'}',
               ),
             );
           }),
@@ -159,8 +337,8 @@ class _CalendarPageState extends State<CalendarPage> {
       builder: (ctx) => AlertDialog(
         title: const Text('打开精确闹钟'),
         content: const Text(
-          '小米/Android 12+ 可能禁止精确闹钟，导致收租提醒延迟。\n'
-          '请到系统设置 → 应用 → 缘初 → 闹钟与提醒（或「使用精确闹钟」）允许。',
+          '小米/Android 12+ 可能禁止精确闹钟，导致日程提醒延迟。\n'
+          '请到系统设置 → 应用 → 醍醐 → 闹钟与提醒（或「使用精确闹钟」）允许。',
         ),
         actions: [
           TextButton(
@@ -178,32 +356,32 @@ class _MonthGrid extends StatelessWidget {
     required this.month,
     required this.selected,
     required this.today,
-    required this.byDay,
+    required this.notesByDay,
     required this.onSelect,
   });
 
   final DateTime month;
   final DateTime selected;
   final DateTime today;
-  final Map<DateTime, List<DueItem>> byDay;
+  final Map<DateTime, List<({Note note, DateTime at})>> notesByDay;
   final ValueChanged<DateTime> onSelect;
 
   @override
   Widget build(BuildContext context) {
     final first = DateTime(month.year, month.month, 1);
-    // Monday-based week: DateTime.weekday Mon=1 ... Sun=7
     final lead = first.weekday - 1;
     final daysInMonth = DateTime(month.year, month.month + 1, 0).day;
     final cells = lead + daysInMonth;
     final rows = ((cells + 6) ~/ 7);
 
-    final scheme = Theme.of(context).colorScheme;
     const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
 
     return Container(
-      decoration: BoxDecoration(
-        border: Border.all(color: scheme.outlineVariant),
-        borderRadius: BorderRadius.circular(12),
+      decoration: const BoxDecoration(
+        border: Border(
+          top: BorderSide(color: Color(0xFFE5E5E5)),
+          bottom: BorderSide(color: Color(0xFFE5E5E5)),
+        ),
       ),
       padding: const EdgeInsets.fromLTRB(8, 10, 8, 8),
       child: Column(
@@ -232,28 +410,23 @@ class _MonthGrid extends StatelessWidget {
                   return const Expanded(child: SizedBox(height: 44));
                 }
                 final date = DateTime(month.year, month.month, dayNum);
-                final items = byDay[date] ?? const <DueItem>[];
+                final dayNotes = notesByDay[date] ?? const [];
                 final isSelected = date == selected;
                 final isToday = date == today;
-                final hasDue = items.isNotEmpty;
-                final isOverdue = hasDue && date.isBefore(today);
+                final hasNote = dayNotes.isNotEmpty;
 
                 return Expanded(
                   child: InkWell(
-                    borderRadius: BorderRadius.circular(8),
                     onTap: () => onSelect(date),
                     child: Container(
                       height: 48,
                       margin: const EdgeInsets.all(2),
                       decoration: BoxDecoration(
                         color: isSelected
-                            ? scheme.primaryContainer
-                            : (isToday
-                                ? scheme.surfaceVariant.withOpacity(0.6)
-                                : null),
-                        borderRadius: BorderRadius.circular(8),
+                            ? const Color(0xFFEEEEEE)
+                            : (isToday ? const Color(0xFFF5F5F5) : null),
                         border: isToday && !isSelected
-                            ? Border.all(color: scheme.primary)
+                            ? Border.all(color: const Color(0xFF111111))
                             : null,
                       ),
                       child: Column(
@@ -262,31 +435,22 @@ class _MonthGrid extends StatelessWidget {
                           Text(
                             '$dayNum',
                             style: TextStyle(
-                              fontWeight:
-                                  isToday ? FontWeight.w700 : FontWeight.w500,
-                              color: isOverdue ? Colors.red.shade700 : null,
+                              fontWeight: isToday || isSelected
+                                  ? FontWeight.w700
+                                  : FontWeight.w500,
                             ),
                           ),
                           const SizedBox(height: 2),
                           SizedBox(
                             height: 6,
-                            child: hasDue
-                                ? Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: List.generate(
-                                      items.length > 3 ? 3 : items.length,
-                                      (_) => Container(
-                                        width: 5,
-                                        height: 5,
-                                        margin: const EdgeInsets.symmetric(
-                                          horizontal: 1,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          color: isOverdue
-                                              ? Colors.red.shade700
-                                              : scheme.primary,
-                                        ),
+                            child: hasNote
+                                ? Center(
+                                    child: Container(
+                                      width: 5,
+                                      height: 5,
+                                      decoration: const BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        color: Color(0xFF888888),
                                       ),
                                     ),
                                   )
@@ -301,6 +465,212 @@ class _MonthGrid extends StatelessWidget {
             ),
         ],
       ),
+    );
+  }
+}
+
+class _ThreeDayView extends StatelessWidget {
+  const _ThreeDayView({
+    required this.days,
+    required this.selected,
+    required this.today,
+    required this.hourStart,
+    required this.hourEnd,
+    required this.notesByDay,
+    required this.onSelectDay,
+    required this.onTapSlot,
+    required this.onLongPressSlot,
+    required this.onTapNote,
+  });
+
+  final List<DateTime> days;
+  final DateTime selected;
+  final DateTime today;
+  final int hourStart;
+  final int hourEnd;
+  final Map<DateTime, List<({Note note, DateTime at})>> notesByDay;
+  final ValueChanged<DateTime> onSelectDay;
+  final ValueChanged<DateTime> onTapSlot;
+  final ValueChanged<DateTime> onLongPressSlot;
+  final ValueChanged<Note> onTapNote;
+
+  static const _rowH = 48.0;
+
+  @override
+  Widget build(BuildContext context) {
+    final hours = hourEnd - hourStart + 1;
+    return Container(
+      decoration: const BoxDecoration(
+        border: Border(
+          top: BorderSide(color: Color(0xFFE5E5E5)),
+          bottom: BorderSide(color: Color(0xFFE5E5E5)),
+        ),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              const SizedBox(width: 40),
+              for (final d in days)
+                Expanded(
+                  child: InkWell(
+                    onTap: () => onSelectDay(d),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      color: dateOnly(d) == dateOnly(selected)
+                          ? const Color(0xFFEEEEEE)
+                          : null,
+                      child: Column(
+                        children: [
+                          Text(
+                            const ['一', '二', '三', '四', '五', '六', '日']
+                                [d.weekday - 1],
+                            style: Theme.of(context).textTheme.labelSmall,
+                          ),
+                          Text(
+                            '${d.day}',
+                            style: TextStyle(
+                              fontWeight: dateOnly(d) == today
+                                  ? FontWeight.w700
+                                  : FontWeight.w500,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: SingleChildScrollView(
+              child: SizedBox(
+                height: hours * _rowH,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    SizedBox(
+                      width: 40,
+                      child: Column(
+                        children: [
+                          for (var h = hourStart; h <= hourEnd; h++)
+                            SizedBox(
+                              height: _rowH,
+                              child: Align(
+                                alignment: Alignment.topCenter,
+                                child: Text(
+                                  h.toString().padLeft(2, '0'),
+                                  style: Theme.of(context).textTheme.labelSmall,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    for (final d in days)
+                      Expanded(
+                        child: _DayColumn(
+                          day: d,
+                          hourStart: hourStart,
+                          hourEnd: hourEnd,
+                          rowH: _rowH,
+                          events: notesByDay[dateOnly(d)] ?? const [],
+                          onTapSlot: onTapSlot,
+                          onLongPressSlot: onLongPressSlot,
+                          onTapNote: onTapNote,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DayColumn extends StatelessWidget {
+  const _DayColumn({
+    required this.day,
+    required this.hourStart,
+    required this.hourEnd,
+    required this.rowH,
+    required this.events,
+    required this.onTapSlot,
+    required this.onLongPressSlot,
+    required this.onTapNote,
+  });
+
+  final DateTime day;
+  final int hourStart;
+  final int hourEnd;
+  final double rowH;
+  final List<({Note note, DateTime at})> events;
+  final ValueChanged<DateTime> onTapSlot;
+  final ValueChanged<DateTime> onLongPressSlot;
+  final ValueChanged<Note> onTapNote;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        Column(
+          children: [
+            for (var h = hourStart; h <= hourEnd; h++)
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => onTapSlot(
+                  DateTime(day.year, day.month, day.day, h),
+                ),
+                onLongPress: () => onLongPressSlot(
+                  DateTime(day.year, day.month, day.day, h),
+                ),
+                child: Container(
+                  height: rowH,
+                  decoration: const BoxDecoration(
+                    border: Border(
+                      top: BorderSide(color: Color(0xFFEEEEEE)),
+                      left: BorderSide(color: Color(0xFFEEEEEE)),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+        for (final e in events)
+          if (e.at.hour >= hourStart && e.at.hour <= hourEnd)
+            Positioned(
+              top: (e.at.hour - hourStart) * rowH +
+                  (e.at.minute / 60.0) * rowH,
+              left: 2,
+              right: 2,
+              height: rowH - 4,
+              child: Material(
+                color: const Color(0xFF111111),
+                child: InkWell(
+                  onTap: () => onTapNote(e.note),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 4,
+                      vertical: 2,
+                    ),
+                    child: Text(
+                      e.note.displayTitle,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+      ],
     );
   }
 }

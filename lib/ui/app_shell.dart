@@ -2,14 +2,15 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../agent/agent_settings.dart';
+import '../auth/auth_gate.dart';
 import '../state/app_store.dart';
-import '../sync/sync_service.dart';
 import '../update/app_update_banner.dart';
 import 'auth_page.dart';
-import 'busy.dart';
 import 'calendar_page.dart';
 import 'chat_page.dart';
-import 'home_page.dart';
+import 'mine_settings_page.dart';
+import 'note_editor_page.dart';
+import 'reminder_inbox_page.dart';
 import 'rooms_page.dart';
 
 class AppShell extends StatefulWidget {
@@ -19,13 +20,121 @@ class AppShell extends StatefulWidget {
   State<AppShell> createState() => _AppShellState();
 }
 
-class _AppShellState extends State<AppShell> {
+class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
   int _index = 0;
+  DateTime? _lastResumePull;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     AgentSettings.instance.load();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    if (!mounted) return;
+    final store = context.read<AppStore>();
+    if (!store.isLandlord) return;
+    final now = DateTime.now();
+    if (_lastResumePull != null &&
+        now.difference(_lastResumePull!) < const Duration(seconds: 8)) {
+      return;
+    }
+    _lastResumePull = now;
+    // ignore: unawaited_futures
+    store.refreshMyCache();
+  }
+
+  Future<void> _onAsAction() async {
+    final store = context.read<AppStore>();
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 8),
+              Text('作为', style: Theme.of(ctx).textTheme.titleMedium),
+              const Divider(height: 16),
+              ListTile(
+                leading: const Icon(Icons.edit_note),
+                title: const Text('新笔记'),
+                onTap: () => Navigator.pop(ctx, 'note'),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.auto_awesome),
+                title: const Text('找 AI'),
+                onTap: () => Navigator.pop(ctx, 'ai'),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+    if (!mounted || choice == null) return;
+
+    if (choice == 'note') {
+      final ok = store.isLandlord || await requireLandlord(context);
+      if (!ok || !mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const NoteEditorPage()),
+      );
+    } else if (choice == 'ai') {
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const ChatPage()),
+      );
+    }
+  }
+
+  Future<void> _onOtherAction() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 8),
+              Text('其他', style: Theme.of(ctx).textTheme.titleMedium),
+              const Divider(height: 16),
+              ListTile(
+                leading: const Icon(Icons.settings_outlined),
+                title: const Text('设置'),
+                onTap: () => Navigator.pop(ctx, 'settings'),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.support_agent_outlined),
+                title: const Text('客服与联系'),
+                onTap: () => Navigator.pop(ctx, 'support'),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+    if (!mounted || choice == null) return;
+    if (choice == 'settings') {
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const MineSettingsPage()),
+      );
+    } else if (choice == 'support') {
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const _SupportPlaceholderPage()),
+      );
+    }
   }
 
   @override
@@ -33,54 +142,65 @@ class _AppShellState extends State<AppShell> {
     final store = context.watch<AppStore>();
     final landlord = store.isLandlord;
 
-    // 游客：房源 / 对话；房东：应收 / 日历 / 房源 / 对话
+    // 游客：求索；房东：醍醐 / 光阴 / 求索
+    // 「作为」「其他」不占 IndexedStack，点开弹窗
     final titles = landlord
-        ? const ['缘初', '日历', '房源', '对话']
-        : const ['房源', '对话'];
+        ? const ['醍醐', '光阴', '求索']
+        : const ['求索'];
     final pages = landlord
         ? const <Widget>[
-            HomePage(),
+            ReminderInboxPage(),
             CalendarPage(),
             RoomsPage(),
-            ChatPage(),
           ]
         : const <Widget>[
             RoomsPage(),
-            ChatPage(),
           ];
+    final asIndex = pages.length;
+    final otherIndex = pages.length + 1;
     final destinations = landlord
         ? const [
             NavigationDestination(
-              icon: Icon(Icons.event_note_outlined),
-              selectedIcon: Icon(Icons.event_note),
-              label: '应收',
+              icon: Icon(Icons.notifications_none),
+              selectedIcon: Icon(Icons.notifications),
+              label: '醍醐',
             ),
             NavigationDestination(
               icon: Icon(Icons.calendar_month_outlined),
               selectedIcon: Icon(Icons.calendar_month),
-              label: '日历',
+              label: '光阴',
             ),
             NavigationDestination(
-              icon: Icon(Icons.apartment_outlined),
-              selectedIcon: Icon(Icons.apartment),
-              label: '房源',
+              icon: Icon(Icons.explore_outlined),
+              selectedIcon: Icon(Icons.explore),
+              label: '求索',
             ),
             NavigationDestination(
-              icon: Icon(Icons.chat_bubble_outline),
-              selectedIcon: Icon(Icons.chat_bubble),
-              label: '对话',
+              icon: Icon(Icons.edit_outlined),
+              selectedIcon: Icon(Icons.edit),
+              label: '作为',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.more_horiz),
+              selectedIcon: Icon(Icons.more_horiz),
+              label: '其他',
             ),
           ]
         : const [
             NavigationDestination(
-              icon: Icon(Icons.apartment_outlined),
-              selectedIcon: Icon(Icons.apartment),
-              label: '房源',
+              icon: Icon(Icons.explore_outlined),
+              selectedIcon: Icon(Icons.explore),
+              label: '求索',
             ),
             NavigationDestination(
-              icon: Icon(Icons.chat_bubble_outline),
-              selectedIcon: Icon(Icons.chat_bubble),
-              label: '对话',
+              icon: Icon(Icons.edit_outlined),
+              selectedIcon: Icon(Icons.edit),
+              label: '作为',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.more_horiz),
+              selectedIcon: Icon(Icons.more_horiz),
+              label: '其他',
             ),
           ];
 
@@ -88,120 +208,32 @@ class _AppShellState extends State<AppShell> {
       _index = 0;
     }
 
+    final seekIndex = landlord ? 2 : 0;
+    final onSeek = _index == seekIndex;
+
     return Scaffold(
-      appBar: AppBar(
-        title: Text(titles[_index]),
-        actions: [
-          if (landlord)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Center(
-                child: Text(
-                  store.user?.phoneMasked ?? '',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ),
-            )
-          else
-            TextButton(
-              onPressed: () async {
-                await Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const AuthPage()),
-                );
-              },
-              child: const Text('登录/注册'),
-            ),
-          PopupMenuButton<String>(
-            onSelected: (value) async {
-              if (value == 'auth') {
-                await Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const AuthPage()),
-                );
-              } else if (value == 'logout') {
-                final ok = await showDialog<bool>(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    title: const Text('退出登录？'),
-                    content: const Text('将清空本机业务缓存并回到游客模式。'),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(ctx, false),
-                        child: const Text('取消'),
-                      ),
-                      FilledButton(
-                        onPressed: () => Navigator.pop(ctx, true),
-                        child: const Text('退出'),
-                      ),
-                    ],
+      appBar: onSeek
+          ? null
+          : AppBar(
+              title: Text(titles[_index]),
+              actions: [
+                if (!landlord)
+                  TextButton(
+                    onPressed: () async {
+                      await Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const AuthPage()),
+                      );
+                    },
+                    child: const Text('登录/注册'),
+                  )
+                else
+                  IconButton(
+                    tooltip: '检查更新',
+                    onPressed: () => runManualUpdateCheck(context),
+                    icon: const Icon(Icons.system_update_alt, size: 20),
                   ),
-                );
-                if (ok == true && mounted) {
-                  await runBusy(
-                    context,
-                    message: '正在退出…',
-                    task: () => store.logout(),
-                  );
-                  setState(() => _index = 0);
-                }
-              } else if (value == 'seed') {
-                await runBusy(
-                  context,
-                  message: '正在写入演示数据…',
-                  task: () => store.seedDemo(),
-                );
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('已写入演示：302 / 张三 / 本月今天到期')),
-                  );
-                }
-              } else if (value == 'ping') {
-                try {
-                  await store.testNotification();
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          '已预约约 8 秒后提醒。请保持屏幕亮着、不要杀后台；'
-                          '若仍无声，到系统设置打开本 App 的通知与「闹钟和提醒」权限，并关掉省电限制。',
-                        ),
-                        duration: Duration(seconds: 6),
-                      ),
-                    );
-                  }
-                } catch (e) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('$e')),
-                    );
-                  }
-                }
-              } else if (value == 'update') {
-                await runManualUpdateCheck(context);
-              } else if (value == 'sync') {
-                await _runSync(context, store);
-              }
-            },
-            itemBuilder: (context) {
-              final items = <PopupMenuEntry<String>>[
-                const PopupMenuItem(value: 'update', child: Text('检查更新')),
-              ];
-              if (landlord) {
-                items.addAll(const [
-                  PopupMenuItem(value: 'sync', child: Text('立即同步')),
-                  PopupMenuItem(value: 'ping', child: Text('8 秒后测试闹钟')),
-                  PopupMenuItem(value: 'seed', child: Text('填入演示数据')),
-                  PopupMenuItem(value: 'logout', child: Text('退出登录')),
-                ]);
-              } else {
-                items.add(
-                  const PopupMenuItem(value: 'auth', child: Text('登录/注册')),
-                );
-              }
-              return items;
-            },
-          ),
-        ],
-      ),
+              ],
+            ),
       body: AppUpdateHost(
         child: IndexedStack(
           index: _index,
@@ -210,82 +242,38 @@ class _AppShellState extends State<AppShell> {
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
+        onDestinationSelected: (i) {
+          if (i == asIndex) {
+            _onAsAction();
+            return;
+          }
+          if (i == otherIndex) {
+            _onOtherAction();
+            return;
+          }
+          setState(() => _index = i);
+        },
         destinations: destinations,
       ),
     );
   }
+}
 
-  Future<void> _runSync(BuildContext context, AppStore store) async {
-    final progress = ValueNotifier<String>('准备同步…');
-    final log = <String>['准备同步…'];
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => AlertDialog(
-        title: const Text('正在同步'),
-        content: SizedBox(
-          width: 320,
-          child: ValueListenableBuilder<String>(
-            valueListenable: progress,
-            builder: (_, msg, __) {
-              return Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const LinearProgressIndicator(),
-                  const SizedBox(height: 16),
-                  Text(msg, style: const TextStyle(fontSize: 15)),
-                  const SizedBox(height: 12),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 160),
-                    child: SingleChildScrollView(
-                      reverse: true,
-                      child: Text(
-                        log.join('\n'),
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade700,
-                          height: 1.35,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              );
-            },
+class _SupportPlaceholderPage extends StatelessWidget {
+  const _SupportPlaceholderPage();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('客服与联系')),
+      body: const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            '联系方式即将上线，敬请期待。',
+            textAlign: TextAlign.center,
           ),
         ),
-      ),
-    );
-    SyncReport? r;
-    Object? err;
-    try {
-      r = await store.silentSync(
-        fullPull: true,
-        onProgress: (m) {
-          log.add(m);
-          if (log.length > 40) log.removeAt(0);
-          progress.value = m;
-        },
-      );
-    } catch (e) {
-      err = e;
-    }
-    if (!mounted) return;
-    Navigator.of(context, rootNavigator: true).pop();
-    progress.dispose();
-    final msg = err != null
-        ? '同步失败：$err'
-        : r!.error == 'sync_disabled'
-            ? '未开启同步：请先登录，并确认已配置 Neon'
-            : r.ok
-                ? '同步完成：上传 ${r.pushed} 条 · 下载 ${r.pulled} 条'
-                : '同步失败：${r.error}';
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        duration: const Duration(seconds: 5),
       ),
     );
   }

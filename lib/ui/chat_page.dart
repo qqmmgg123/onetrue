@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -25,13 +25,13 @@ import '../state/app_store.dart';
 import 'agent_settings_page.dart';
 import 'busy.dart';
 
-const _welcomeText = '可以像微信一样随便聊，慢慢把事说清楚就行。\n'
+const _welcomeText = '可以像微信一样随便聊；闲聊问答都行，也能帮你记笔记。\n'
     '例如：\n'
-    '· 有个 302 要租给王芳\n'
-    '· 房租两千八，每月 10 号收\n'
-    '· 302 电表 1180 到 1234\n'
-    '· 这个月心情好，302 少收 200\n'
-    '· 也可点图片：附上电表照片，再说「帮我读出来录入 201」\n'
+    '· 记一下：周五下午见客户\n'
+    '· 备忘：明天带护照\n'
+    '· 下周一 10 点开会，每周重复\n'
+    '· 列出我的笔记\n'
+    '· 把这几条整理成一篇文章并上架\n'
     '写操作会先让你确认。点右上角「新对话」可开干净会话。';
 
 class ChatPage extends StatefulWidget {
@@ -54,6 +54,7 @@ class _ChatPageState extends State<ChatPage> {
 
   String? _sessionId;
   SessionSticky _sticky = SessionSticky();
+  // ignore: unused_field - 会话记忆用量，后续可在 AppBar 展示
   ContextUsage? _usage;
   bool _busy = false;
   bool _loading = true;
@@ -105,7 +106,7 @@ class _ChatPageState extends State<ChatPage> {
       if (showError && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('请允许麦克风权限（设置 → 应用 → 缘初 → 权限）'),
+            content: Text('请允许麦克风权限（设置 → 应用 → 醍醐 → 权限）'),
           ),
         );
       }
@@ -145,13 +146,16 @@ class _ChatPageState extends State<ChatPage> {
     await AgentSettings.instance.load();
     final prefs = await SharedPreferences.getInstance();
     var id = prefs.getString(_kActiveSession);
-    final sessions = await _db.listChatSessions();
+    final sessions = await _db.listChatSessions(kind: kChatKindAgent);
     if (id == null || sessions.every((s) => s.id != id)) {
       id = await _createSession(title: '新对话', activate: false);
     }
     await prefs.setString(_kActiveSession, id);
-    // 滚动清理：最多保留约 40 个会话、每会话约 250 条；账本数据不动
-    await _db.pruneChatStorage(preserveSessionId: id);
+    // 滚动清理：最多保留约 40 个会话、每会话约 250 条；笔记数据不动
+    await _db.pruneChatStorage(
+      preserveSessionId: id,
+      kind: kChatKindAgent,
+    );
     await _loadSession(id);
     if (!mounted) return;
     setState(() => _loading = false);
@@ -170,6 +174,7 @@ class _ChatPageState extends State<ChatPage> {
         sticky: SessionSticky(),
         createdAt: now,
         updatedAt: now,
+        kind: kChatKindAgent,
       ),
     );
     await _db.insertChatMessage(
@@ -217,68 +222,123 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _pickSession() async {
-    final sessions = await _db.listChatSessions();
+    var sessions = await _db.listChatSessions(kind: kChatKindAgent);
     if (!mounted) return;
     await showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
       builder: (ctx) {
         return SafeArea(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                child: Text('历史对话', style: Theme.of(ctx).textTheme.titleMedium),
-              ),
-              Expanded(
-                child: ListView.builder(
-                  itemCount: sessions.length,
-                  itemBuilder: (_, i) {
-                    final s = sessions[i];
-                    final active = s.id == _sessionId;
-                    return ListTile(
-                      selected: active,
-                      title: Text(s.title),
-                      subtitle: Text(
-                        _formatTime(s.updatedAt),
-                        style: Theme.of(ctx).textTheme.bodySmall,
-                      ),
-                      trailing: active
-                          ? const Icon(Icons.check)
-                          : IconButton(
-                              icon: const Icon(Icons.delete_outline),
-                              onPressed: () async {
-                                if (sessions.length <= 1) return;
-                                await _db.deleteChatSession(s.id);
-                                if (s.id == _sessionId) {
-                                  final rest = await _db.listChatSessions();
-                                  if (rest.isEmpty) {
-                                    await _createSession(title: '新对话');
-                                  } else {
-                                    final prefs =
-                                        await SharedPreferences.getInstance();
-                                    await prefs.setString(
-                                      _kActiveSession,
-                                      rest.first.id,
+          child: StatefulBuilder(
+            builder: (ctx, setSheet) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 8, 8),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            '历史对话',
+                            style: Theme.of(ctx).textTheme.titleMedium,
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: sessions.isEmpty
+                              ? null
+                              : () async {
+                                  final ok = await showDialog<bool>(
+                                    context: ctx,
+                                    builder: (d) => AlertDialog(
+                                      title: const Text('清除全部对话？'),
+                                      content: const Text(
+                                        '只清本地找 AI 聊天记录，不影响笔记数据。',
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(d, false),
+                                          child: const Text('取消'),
+                                        ),
+                                        FilledButton(
+                                          onPressed: () =>
+                                              Navigator.pop(d, true),
+                                          child: const Text('清除'),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                  if (ok != true) return;
+                                  await _db.deleteAllChatSessions(
+                                    kind: kChatKindAgent,
+                                  );
+                                  await _createSession(title: '新对话');
+                                  sessions = await _db
+                                      .listChatSessions(kind: kChatKindAgent);
+                                  if (ctx.mounted) setSheet(() {});
+                                },
+                          child: const Text('清除全部'),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: sessions.length,
+                      itemBuilder: (_, i) {
+                        final s = sessions[i];
+                        final active = s.id == _sessionId;
+                        return ListTile(
+                          selected: active,
+                          title: Text(s.title),
+                          subtitle: Text(
+                            _formatTime(s.updatedAt),
+                            style: Theme.of(ctx).textTheme.bodySmall,
+                          ),
+                          trailing: active
+                              ? const Icon(Icons.check)
+                              : IconButton(
+                                  icon: const Icon(Icons.delete_outline),
+                                  onPressed: () async {
+                                    if (sessions.length <= 1) return;
+                                    await _db.deleteChatSession(s.id);
+                                    if (s.id == _sessionId) {
+                                      final rest = await _db.listChatSessions(
+                                        kind: kChatKindAgent,
+                                      );
+                                      if (rest.isEmpty) {
+                                        await _createSession(title: '新对话');
+                                      } else {
+                                        final prefs = await SharedPreferences
+                                            .getInstance();
+                                        await prefs.setString(
+                                          _kActiveSession,
+                                          rest.first.id,
+                                        );
+                                        await _loadSession(rest.first.id);
+                                      }
+                                    }
+                                    sessions = await _db.listChatSessions(
+                                      kind: kChatKindAgent,
                                     );
-                                    await _loadSession(rest.first.id);
-                                  }
-                                }
-                                if (ctx.mounted) Navigator.pop(ctx);
-                              },
-                            ),
-                      onTap: () async {
-                        final prefs = await SharedPreferences.getInstance();
-                        await prefs.setString(_kActiveSession, s.id);
-                        await _loadSession(s.id);
-                        if (ctx.mounted) Navigator.pop(ctx);
+                                    if (ctx.mounted) setSheet(() {});
+                                  },
+                                ),
+                          onTap: () async {
+                            final prefs =
+                                await SharedPreferences.getInstance();
+                            await prefs.setString(_kActiveSession, s.id);
+                            await _loadSession(s.id);
+                            if (ctx.mounted) Navigator.pop(ctx);
+                          },
+                        );
                       },
-                    );
-                  },
-                ),
-              ),
-            ],
+                    ),
+                  ),
+                ],
+              );
+            },
           ),
         );
       },
@@ -981,13 +1041,8 @@ class _ChatPageState extends State<ChatPage> {
               confirmed: true,
             );
           }
-          // 任意写操作确认后清掉意图/租约草稿槽，只保留房号与摘要，避免后续话被「登记租约」劫持
           if (writeTools.contains(action.tool)) {
-            _sticky = SessionSticky(
-              propertyName: _sticky.propertyName,
-              roomLabel: _sticky.roomLabel,
-              summary: _sticky.summary,
-            );
+            _sticky = SessionSticky(summary: _sticky.summary);
             await _db.updateChatSessionSticky(_sessionId!, _sticky);
           }
           final follow = ChatMessage(role: ChatRole.assistant, text: result);
@@ -1072,330 +1127,305 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
-  Widget _usageBar(BuildContext context) {
-    final u = _usage;
-    final pct = u?.percent ?? 0;
-    final color = pct >= 85
-        ? Theme.of(context).colorScheme.error
-        : pct >= 60
-            ? Colors.orange.shade800
-            : Theme.of(context).colorScheme.onSurfaceVariant;
-    final stickyHint = _sticky.isEmpty
-        ? ''
-        : ' · 已记${[
-            if (_sticky.roomLabel != null) _sticky.roomLabel!,
-            if (_sticky.tenantName != null) _sticky.tenantName!,
-          ].join('/')}';
-    return Material(
-      color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.65),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
-        child: Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    u == null
-                        ? '闲聊记账 · 可开新对话清上下文'
-                        : '记忆约 $pct%（${u.usedTokens}/${u.windowTokens}）'
-                            '${u.droppedMessages > 0 ? ' · 早先已摘要' : ''}'
-                            '$stickyHint',
-                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                          color: color,
-                        ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  if (u != null) ...[
-                    const SizedBox(height: 4),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(99),
-                      child: LinearProgressIndicator(
-                        value: (u.ratio).clamp(0.0, 1.0),
-                        minHeight: 3,
-                        color: color,
-                        backgroundColor:
-                            Theme.of(context).colorScheme.surfaceVariant,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            IconButton(
-              tooltip: '历史对话',
-              onPressed: _busy ? null : _pickSession,
-              icon: const Icon(Icons.history),
-            ),
-            IconButton(
-              tooltip: '新对话',
-              onPressed: _busy ? null : _newChat,
-              icon: const Icon(Icons.add_comment_outlined),
-            ),
-            IconButton(
-              tooltip: 'Agent 设置',
-              onPressed: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => const AgentSettingsPage(),
-                  ),
-                );
-              },
-              icon: const Icon(Icons.settings_outlined),
-            ),
-          ],
-        ),
+  List<Widget> _appBarActions() {
+    return [
+      IconButton(
+        tooltip: '使用说明',
+        onPressed: _showAgentHelp,
+        icon: const Icon(Icons.help_outline, size: 22),
       ),
+      IconButton(
+        tooltip: '历史对话',
+        onPressed: _busy ? null : _pickSession,
+        icon: const Icon(Icons.history, size: 22),
+      ),
+      IconButton(
+        tooltip: '新对话',
+        onPressed: _busy ? null : _newChat,
+        icon: const Icon(Icons.add_comment_outlined, size: 22),
+      ),
+      IconButton(
+        tooltip: 'Agent 设置',
+        onPressed: () {
+          Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => const AgentSettingsPage(),
+            ),
+          );
+        },
+        icon: const Icon(Icons.settings_outlined, size: 22),
+      ),
+    ];
+  }
+
+  void _showAgentHelp() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('对话能帮你做什么', style: Theme.of(ctx).textTheme.titleMedium),
+                const SizedBox(height: 12),
+                Text(
+                  '全能对话：闲聊、问答、构思写作都可以。\n\n'
+                  '笔记本（可直接说）\n'
+                  '· 「记一下：下周开会」→ 随笔/备忘\n'
+                  '· 「明天下午三点开会」→ 日程\n'
+                  '· 「列出我的笔记」\n'
+                  '· 「把这几条整理成一篇文章」\n'
+                  '· 「把这条改成文章并上架」\n\n'
+                  '写操作会先让你确认再执行。',
+                  style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(height: 1.45),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
+
 
   @override
   Widget build(BuildContext context) {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator());
+      return Scaffold(
+        appBar: AppBar(title: const Text('找 AI'), actions: _appBarActions()),
+        body: const Center(child: CircularProgressIndicator()),
+      );
     }
-    return Column(
-      children: [
-        _usageBar(context),
-        const Divider(height: 1),
-        Expanded(
-          child: ListView.builder(
-            controller: _scroll,
-            // 从下往上堆：打开即见最新，避免首屏空白要往下拉
-            reverse: true,
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-            itemCount: _messages.length + (_busy ? 1 : 0),
-            itemBuilder: (context, i) {
-              if (_busy && i == 0) {
-                return const Padding(
-                  padding: EdgeInsets.all(12),
-                  child: Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text('思考中…'),
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(title: const Text('找 AI'), actions: _appBarActions()),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              controller: _scroll,
+              reverse: true,
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              itemCount: _messages.length + (_busy ? 1 : 0),
+              itemBuilder: (context, i) {
+                if (_busy && i == 0) {
+                  return const Padding(
+                    padding: EdgeInsets.all(12),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        '思考中…',
+                        style: TextStyle(fontSize: 15, color: Color(0xFF888888)),
+                      ),
+                    ),
+                  );
+                }
+                final msgIndex = _messages.length - 1 - (i - (_busy ? 1 : 0));
+                final m = _messages[msgIndex];
+                final isUser = m.role == ChatRole.user;
+                return Align(
+                  alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+                  child: Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    constraints: BoxConstraints(
+                      maxWidth: MediaQuery.of(context).size.width * 0.86,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isUser ? const Color(0xFF111111) : const Color(0xFFF0F0F0),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          m.text,
+                          style: TextStyle(
+                            fontSize: 15,
+                            height: 1.45,
+                            decoration: TextDecoration.none,
+                            color: isUser ? Colors.white : const Color(0xFF111111),
+                          ),
+                        ),
+                        if (m.pending != null && m.confirmed == null) ...[
+                          const SizedBox(height: 10),
+                          Text(
+                            m.pending!.summary,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: isUser ? Colors.white70 : const Color(0xFF666666),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              FilledButton(
+                                onPressed: _busy ? null : () => _confirm(msgIndex, m.pending!),
+                                child: const Text('确认执行'),
+                              ),
+                              const SizedBox(width: 8),
+                              TextButton(
+                                onPressed: _busy ? null : () => _cancel(msgIndex, m.pending!),
+                                child: const Text('取消'),
+                              ),
+                            ],
+                          ),
+                        ],
+                        if (m.confirmed == true)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 6),
+                            child: Text('已确认', style: TextStyle(fontSize: 12, color: Color(0xFF888888))),
+                          ),
+                        if (m.confirmed == false)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 6),
+                            child: Text('已取消', style: TextStyle(fontSize: 12, color: Color(0xFF888888))),
+                          ),
+                      ],
+                    ),
                   ),
                 );
-              }
-              final msgIndex =
-                  _messages.length - 1 - (i - (_busy ? 1 : 0));
-              final m = _messages[msgIndex];
-              final isUser = m.role == ChatRole.user;
-              return Align(
-                alignment:
-                    isUser ? Alignment.centerRight : Alignment.centerLeft,
-                child: Container(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                  constraints: BoxConstraints(
-                    maxWidth: MediaQuery.of(context).size.width * 0.86,
-                  ),
-                  decoration: BoxDecoration(
-                    color: isUser
-                        ? Theme.of(context).colorScheme.primaryContainer
-                        : Theme.of(context).colorScheme.surfaceVariant,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(m.text),
-                      if (m.pending != null && m.confirmed == null) ...[
-                        const SizedBox(height: 10),
-                        Text(
-                          m.pending!.summary,
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                        const SizedBox(height: 8),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            FilledButton(
-                              onPressed: _busy
-                                  ? null
-                                  : () => _confirm(msgIndex, m.pending!),
-                              child: const Text('确认执行'),
-                            ),
-                            const SizedBox(width: 8),
-                            TextButton(
-                              onPressed: _busy
-                                  ? null
-                                  : () => _cancel(msgIndex, m.pending!),
-                              child: const Text('取消'),
-                            ),
-                          ],
-                        ),
-                      ],
-                      if (m.confirmed == true)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 6),
-                          child: Text(
-                            '已确认',
-                            style: Theme.of(context).textTheme.labelSmall,
-                          ),
-                        ),
-                      if (m.confirmed == false)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 6),
-                          child: Text(
-                            '已取消',
-                            style: Theme.of(context).textTheme.labelSmall,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              );
-            },
-          ),
-        ),
-        const Divider(height: 1),
-        if (_listening || _transcribing) _voicePulse(context),
-        if (_pendingImage != null)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: Row(
-              children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.file(
-                    _pendingImage!,
-                    width: 56,
-                    height: 56,
-                    fit: BoxFit.cover,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    _voiceMode
-                        ? '已附图 · 按住说话说明要求后松开'
-                        : '已附图 · 写上要求后点发送',
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-                IconButton(
-                  tooltip: '去掉图片',
-                  onPressed: _busy
-                      ? null
-                      : () => setState(() => _pendingImage = null),
-                  icon: const Icon(Icons.close),
-                ),
-              ],
+              },
             ),
           ),
-        SafeArea(
-          top: false,
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: _voiceMode
-                      ? GestureDetector(
-                          // 长按手势：按下约 0.3s 起效，反馈稳定（小米上比 Listener 可靠）
-                          onLongPressStart: (_) => _onHoldStart(),
-                          onLongPressEnd: (_) => _onHoldEnd(send: true),
-                          onLongPressCancel: () => _onHoldEnd(send: false),
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 120),
-                            height: 48,
-                            alignment: Alignment.center,
-                            decoration: BoxDecoration(
-                              color: _listening
-                                  ? Theme.of(context).colorScheme.primary
-                                  : Theme.of(context)
-                                      .colorScheme
-                                      .surfaceVariant,
-                              borderRadius: BorderRadius.circular(24),
-                              border: Border.all(
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .outlineVariant,
+          if (_listening || _transcribing) _voicePulse(context),
+          if (_pendingImage != null)
+            Material(
+              color: const Color(0xFF111111),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Row(
+                  children: [
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.file(_pendingImage!, width: 56, height: 56, fit: BoxFit.cover),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        _voiceMode ? '已附图 · 按住说话说明要求后松开' : '已附图 · 写上要求后点发送',
+                        style: const TextStyle(fontSize: 13, color: Colors.white70),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: _busy ? null : () => setState(() => _pendingImage = null),
+                      icon: const Icon(Icons.close, color: Colors.white70),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          Material(
+            color: const Color(0xFF111111),
+            child: SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 6, 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _voiceMode
+                          ? Listener(
+                              behavior: HitTestBehavior.opaque,
+                              onPointerDown: (_) => _onHoldStart(),
+                              onPointerUp: (_) => _onHoldEnd(send: true),
+                              onPointerCancel: (_) => _onHoldEnd(send: false),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 120),
+                                height: 48,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  color: _listening ? const Color(0xFF333333) : Colors.white,
+                                  borderRadius: BorderRadius.circular(24),
+                                ),
+                                child: Text(
+                                  _listening ? '松开发送…' : '按住说话',
+                                  style: TextStyle(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w600,
+                                    color: _listening ? Colors.white : const Color(0xFF111111),
+                                  ),
+                                ),
+                              ),
+                            )
+                          : TextField(
+                              controller: _input,
+                              minLines: 1,
+                              maxLines: 4,
+                              style: const TextStyle(color: Colors.white, fontSize: 15),
+                              cursorColor: Colors.white,
+                              textInputAction: TextInputAction.send,
+                              onSubmitted: (_) => _send(),
+                              decoration: InputDecoration(
+                                hintText: '随便聊，或说记一下…',
+                                hintStyle: const TextStyle(color: Colors.white54),
+                                filled: true,
+                                fillColor: const Color(0xFF2A2A2A),
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(8),
+                                  borderSide: BorderSide.none,
+                                ),
+                                isDense: true,
+                                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
                               ),
                             ),
-                            child: Text(
-                              _listening ? '松开发送…' : '按住说话',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .titleSmall
-                                  ?.copyWith(
-                                    color: _listening
-                                        ? Theme.of(context)
-                                            .colorScheme
-                                            .onPrimary
-                                        : null,
-                                  ),
-                            ),
-                          ),
-                        )
-                      : TextField(
-                          controller: _input,
-                          minLines: 1,
-                          maxLines: 4,
-                          textInputAction: TextInputAction.send,
-                          onSubmitted: (_) => _send(),
-                          decoration: const InputDecoration(
-                            hintText: '随便说，比如：302 要租给王芳…',
-                            border: OutlineInputBorder(),
-                            isDense: true,
-                          ),
-                        ),
+                    ),
+                    IconButton(
+                      tooltip: '附图（看图做事）',
+                      onPressed: _busy || _transcribing ? null : _attachImage,
+                      icon: Icon(
+                        _pendingImage == null ? Icons.image_outlined : Icons.image,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: _voiceMode ? '切换键盘' : '切换语音',
+                      onPressed: _busy || _transcribing
+                          ? null
+                          : () async {
+                              final toVoice = !_voiceMode;
+                              setState(() {
+                                _voiceMode = toVoice;
+                                if (_listening) {
+                                  _speech.stop();
+                                  _listening = false;
+                                  _partialVoice = '';
+                                }
+                              });
+                              if (toVoice) {
+                                await AgentSettings.instance.load();
+                                await _ensureMic(showError: true);
+                                if (!AgentSettings.instance.hasCloudAsr && !_systemAsrOk && mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(_voiceUnavailableTip()),
+                                      duration: const Duration(seconds: 5),
+                                    ),
+                                  );
+                                }
+                              }
+                            },
+                      icon: Icon(
+                        _voiceMode ? Icons.keyboard_alt_outlined : Icons.mic_none,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    if (!_voiceMode)
+                      TextButton(
+                        onPressed: _busy ? null : _send,
+                        child: const Text('发送', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                      ),
+                  ],
                 ),
-                const SizedBox(width: 2),
-                IconButton(
-                  tooltip: '附图（看图做事）',
-                  onPressed: _busy || _transcribing ? null : _attachImage,
-                  icon: Icon(
-                    _pendingImage == null
-                        ? Icons.image_outlined
-                        : Icons.image,
-                  ),
-                ),
-                IconButton(
-                  tooltip: _voiceMode ? '切换键盘' : '切换语音',
-                  onPressed: _busy || _transcribing
-                      ? null
-                      : () async {
-                          final toVoice = !_voiceMode;
-                          setState(() {
-                            _voiceMode = toVoice;
-                            if (_listening) {
-                              _speech.stop();
-                              _listening = false;
-                              _partialVoice = '';
-                            }
-                          });
-                          if (toVoice) {
-                            await AgentSettings.instance.load();
-                            await _ensureMic(showError: true);
-                            if (!AgentSettings.instance.hasCloudAsr &&
-                                !_systemAsrOk &&
-                                mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(_voiceUnavailableTip()),
-                                  duration: const Duration(seconds: 5),
-                                ),
-                              );
-                            }
-                          }
-                        },
-                  icon: Icon(
-                    _voiceMode ? Icons.keyboard_alt_outlined : Icons.mic_none,
-                  ),
-                ),
-                if (!_voiceMode)
-                  FilledButton(
-                    onPressed: _busy ? null : _send,
-                    child: const Text('发送'),
-                  ),
-              ],
+              ),
             ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }

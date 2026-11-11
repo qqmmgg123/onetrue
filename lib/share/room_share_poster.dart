@@ -24,7 +24,7 @@ class RoomSharePoster {
     required String title,
     required String description,
     String? posterUrl,
-    String brand = '缘初 · 房间实拍',
+    String brand = '醍醐 · 房间实拍',
   }) async {
     final coverBytes = await _downloadPosterBytes(posterUrl);
     final cover = coverBytes == null

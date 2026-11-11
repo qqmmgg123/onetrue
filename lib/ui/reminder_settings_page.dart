@@ -30,7 +30,7 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('收租闹钟')),
+      appBar: AppBar(title: const Text('提醒设置')),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
@@ -83,19 +83,17 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
                       setState(() => _settings.advanceDays = v.round()),
                 ),
                 if (!ReminderService.instance.exactAlarmAllowed)
-                  Card(
-                    color: Theme.of(context).colorScheme.errorContainer,
-                    child: const Padding(
-                      padding: EdgeInsets.all(12),
-                      child: Text(
-                        '系统未允许精确闹钟，提醒可能被推迟。'
-                        '请到系统设置里给「缘初」打开精确闹钟权限。',
-                      ),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                      '系统未允许精确闹钟，提醒可能被推迟。'
+                      '请到系统设置里给「醍醐」打开精确闹钟权限。',
+                      style: TextStyle(color: Color(0xFF111111)),
                     ),
                   ),
                 const SizedBox(height: 8),
                 Text(
-                  '记已收或改租约后，闹钟会按账本自动重排；已收款的账期不再响铃。',
+                  '改备忘/日程提醒后，闹钟会按笔记自动重排。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
                 const SizedBox(height: 24),

@@ -8,6 +8,7 @@ import 'platform_init.dart';
 import 'share/wechat_share.dart';
 import 'state/app_store.dart';
 import 'ui/app_shell.dart';
+import 'ui/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -47,7 +48,7 @@ class RentAgentApp extends StatelessWidget {
     return ChangeNotifierProvider.value(
       value: store,
       child: MaterialApp(
-        title: '缘初',
+        title: '醍醐',
         debugShowCheckedModeBanner: false,
         locale: const Locale('zh', 'CN'),
         supportedLocales: const [
@@ -59,10 +60,7 @@ class RentAgentApp extends StatelessWidget {
           GlobalWidgetsLocalizations.delegate,
           GlobalCupertinoLocalizations.delegate,
         ],
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1F4B99)),
-          useMaterial3: true,
-        ),
+        theme: buildAppTheme(),
         home: const AppShell(),
       ),
     );

@@ -68,9 +68,9 @@ class _AuthPageState extends State<AuthPage> {
         claim = await showDialog<bool>(
               context: context,
               builder: (ctx) => AlertDialog(
-                title: const Text('本机已有房源数据'),
+                title: const Text('本机已有本地数据'),
                 content: const Text(
-                  '是否将本机现有物业/租约归属到当前账号并上传？\n'
+                  '是否将本机现有数据归属到当前账号并上传？\n'
                   '选「清空」则丢弃本机旧数据，从云端拉取该账号数据。',
                 ),
                 actions: [
@@ -106,13 +106,13 @@ class _AuthPageState extends State<AuthPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_register ? '注册房东' : '登录'),
+        title: Text(_register ? '注册' : '登录'),
       ),
       body: ListView(
         padding: const EdgeInsets.all(24),
         children: [
           Text(
-            _register ? '手机号注册后即可管理自己的房源与账单' : '使用注册时的手机号与密码登录',
+            _register ? '手机号注册后即可写笔记、上架文章并同步' : '使用注册时的手机号与密码登录',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                   color: Colors.grey.shade700,
                 ),

@@ -166,6 +166,53 @@ create index if not exists idx_adjustments_updated on public.period_adjustments(
 create index if not exists idx_invoices_updated on public.invoices(owner_id, updated_at);
 create index if not exists idx_payments_updated on public.payments(owner_id, updated_at);
 
+-- 笔记本（随笔/备忘/日程/文章）；reminder_inbox 仅本地，不同步
+create table if not exists public.notes (
+  id uuid primary key,
+  kind text not null default 'note',
+  title text not null default '',
+  body text not null default '',
+  format text not null default 'plain',
+  schedule_at timestamptz,
+  remind_at timestamptz,
+  recur_freq text not null default '',
+  recur_interval int not null default 1,
+  recur_byday text,
+  recur_until timestamptz,
+  recur_count int,
+  remind_offset_min int not null default 0,
+  listing_status text not null default 'draft',
+  listed_at timestamptz,
+  city text not null default '',
+  parent_uuid uuid,
+  sort_order int not null default 0,
+  source_note_uuids jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now(),
+  deleted_at timestamptz,
+  owner_id uuid not null
+);
+
+-- 已有库升级（可重复执行）
+alter table public.notes add column if not exists recur_freq text not null default '';
+alter table public.notes add column if not exists recur_interval int not null default 1;
+alter table public.notes add column if not exists recur_byday text;
+alter table public.notes add column if not exists recur_until timestamptz;
+alter table public.notes add column if not exists recur_count int;
+alter table public.notes add column if not exists remind_offset_min int not null default 0;
+
+-- 文章访问次数（与 notes 分离，避免浏览刷新 notes.updated_at）
+create table if not exists public.note_stats (
+  note_id uuid primary key,
+  view_count bigint not null default 0
+);
+
+create index if not exists idx_notes_owner on public.notes(owner_id);
+create index if not exists idx_notes_updated on public.notes(owner_id, updated_at);
+create index if not exists idx_notes_listed on public.notes(listing_status, listed_at desc)
+  where listing_status = 'listed' and deleted_at is null and kind = 'article';
+create index if not exists idx_notes_city on public.notes(city)
+  where deleted_at is null and listing_status = 'listed';
+
 -- 在 Neon 控制台改数据时自动刷新 updated_at，否则 App 增量同步拉不到
 create or replace function public.touch_updated_at()
 returns trigger
@@ -183,7 +230,8 @@ declare
 begin
   foreach t in array array[
     'properties','rooms','tenants','leases','lease_extras',
-    'rent_periods','meter_readings','period_adjustments','invoices','payments'
+    'rent_periods','meter_readings','period_adjustments','invoices','payments',
+    'notes'
   ]
   loop
     execute format(
