@@ -129,20 +129,12 @@ class AppStore extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    // 房产/账期数据仍保留在本地库（兼容旧版同步），UI 不再展示；提醒只排笔记。
     properties = await _db.listProperties();
-    final db = await _db.database;
-    final leaseRows = await db.query(
-      'leases',
-      columns: ['id'],
-      where: "status = 'active' AND deleted_at IS NULL",
-    );
-    for (final row in leaseRows) {
-      await _billing.syncOpenPeriodAmounts(row['id'] as int);
-    }
-    pending = await _db.pendingDues();
+    pending = const [];
     notes = await _db.listNotes();
     articleReads = await _db.listArticleReads();
-    await _reminders.reschedule(pending, notes: notes);
+    await _reminders.reschedule(const [], notes: notes);
     loading = false;
     error = null;
     notifyListeners();
@@ -158,27 +150,14 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
     try {
       final sync = SyncService(db: _db);
-      List<MarketplaceListing> rooms = [];
       List<MarketplaceArticle> articles = [];
-      Object? roomErr;
-      Object? articleErr;
       try {
-        rooms = await sync.fetchListedRooms(city: marketplaceCity);
-      } catch (e) {
-        roomErr = e;
-        rooms = [];
-      }
-      try {
-        articles = await sync.fetchListedArticles(city: marketplaceCity);
-      } catch (e) {
-        articleErr = e;
+        articles = await sync.fetchListedArticles();
+      } catch (_) {
         articles = [];
       }
-      marketplace = rooms;
+      marketplace = [];
       marketplaceArticles = articles;
-      if (rooms.isEmpty && articles.isEmpty && (roomErr != null || articleErr != null)) {
-        marketplaceError = '${roomErr ?? articleErr}';
-      }
     } catch (e) {
       marketplaceError = e.toString();
       marketplace = [];

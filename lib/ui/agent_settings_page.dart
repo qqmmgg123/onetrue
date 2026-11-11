@@ -31,7 +31,6 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
   final _asrBaseUrl = TextEditingController();
   final _asrApiKey = TextEditingController();
   final _asrModel = TextEditingController();
-  final _databaseUrl = TextEditingController();
   final _ownerId = TextEditingController();
   String _llmProvider = LlmProviderId.auto;
   bool _useLlm = false;
@@ -76,7 +75,6 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
       _useLlm = s.useLlm;
       _useCloudAsr = s.useCloudAsr;
       _syncEnabled = sync.enabled;
-      _databaseUrl.text = sync.databaseUrl;
       _ownerId.text = sync.ownerId;
       _showDeepseek = s.llmProvider == LlmProviderId.deepseek;
       _loading = false;
@@ -102,7 +100,6 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
     _asrBaseUrl.dispose();
     _asrApiKey.dispose();
     _asrModel.dispose();
-    _databaseUrl.dispose();
     _ownerId.dispose();
     super.dispose();
   }
@@ -364,30 +361,27 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                   ),
                 ],
                 const SizedBox(height: 16),
-                Text('Neon 同步', style: Theme.of(context).textTheme.titleSmall),
+                Text('Supabase 同步',
+                    style: Theme.of(context).textTheme.titleSmall),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('启用云端同步'),
-                  value: _syncEnabled,
-                  onChanged: (v) => setState(() => _syncEnabled = v),
-                ),
-                if (!BakedEnv.hasSyncDb)
-                  TextField(
-                    controller: _databaseUrl,
-                    decoration: const InputDecoration(
-                      labelText: 'Neon DATABASE_URL',
-                      hintText:
-                          'postgresql://user:pass@ep-xxx.region.aws.neon.tech/neondb?sslmode=require',
-                    ),
-                    obscureText: true,
-                    maxLines: 2,
+                  subtitle: Text(
+                    BakedEnv.hasSupabase
+                        ? '已配置 SUPABASE_URL / ANON_KEY'
+                        : '未 bake Supabase，请写 env.local 后重新打包',
                   ),
+                  value: _syncEnabled && BakedEnv.hasSupabase,
+                  onChanged: BakedEnv.hasSupabase
+                      ? (v) => setState(() => _syncEnabled = v)
+                      : null,
+                ),
                 TextField(
                   controller: _ownerId,
                   readOnly: true,
                   decoration: const InputDecoration(
                     labelText: 'owner_id（登录账号自动绑定）',
-                    helperText: '多端用同一手机号登录即可同步；游客无 owner',
+                    helperText: '多端用同一邮箱登录即可同步；游客无 owner',
                   ),
                 ),
                 Align(
@@ -407,11 +401,10 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                     label: const Text('复制 owner_id'),
                   ),
                 ),
-                if (!_bundled)
-                  Text(
-                    '开发调试可在此填写 DATABASE_URL；正式打包请写 supabase/env.local 后用 build_apk.ps1。',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
+                Text(
+                  '正式版只 bake Supabase URL/anon；LLM/ASR Key 放 Edge secrets，勿打进 APK。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
                 const SizedBox(height: 24),
                 FilledButton(
                   onPressed: () async {
@@ -440,7 +433,6 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                     await SyncSettings.instance.save(
                       enabled: _syncEnabled &&
                           SyncSettings.instance.ownerId.trim().isNotEmpty,
-                      databaseUrl: _databaseUrl.text,
                     );
                     if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(

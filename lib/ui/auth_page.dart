@@ -9,6 +9,7 @@ import 'busy.dart';
 class AuthPage extends StatefulWidget {
   const AuthPage({super.key, this.initialRegister = false});
 
+  /// 保留参数以兼容旧入口；Email OTP 无注册/登录分栏。
   final bool initialRegister;
 
   @override
@@ -16,34 +17,43 @@ class AuthPage extends StatefulWidget {
 }
 
 class _AuthPageState extends State<AuthPage> {
-  late bool _register;
-  final _phone = TextEditingController();
-  final _password = TextEditingController();
-  final _confirm = TextEditingController();
+  final _email = TextEditingController();
+  final _otp = TextEditingController();
+  bool _codeSent = false;
   String? _error;
 
   @override
-  void initState() {
-    super.initState();
-    _register = widget.initialRegister;
-  }
-
-  @override
   void dispose() {
-    _phone.dispose();
-    _password.dispose();
-    _confirm.dispose();
+    _email.dispose();
+    _otp.dispose();
     super.dispose();
   }
 
-  Future<void> _submit() async {
+  Future<void> _sendCode() async {
     setState(() => _error = null);
-    final phone = _phone.text.trim();
-    final password = _password.text;
-    if (_register && password != _confirm.text) {
-      setState(() => _error = '两次密码不一致');
-      return;
+    final email = _email.text.trim();
+    try {
+      await runBusy(
+        context,
+        message: '正在发送验证码…',
+        task: () => AuthService.instance.sendEmailOtp(email),
+      );
+      if (!mounted) return;
+      setState(() => _codeSent = true);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('验证码已发送，请查收邮箱')),
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = e.toString().replaceFirst('Bad state: ', ''));
+      }
     }
+  }
+
+  Future<void> _verify() async {
+    setState(() => _error = null);
+    final email = _email.text.trim();
+    final token = _otp.text.trim();
     final store = context.read<AppStore>();
     final auth = AuthService.instance;
     try {
@@ -52,14 +62,8 @@ class _AuthPageState extends State<AuthPage> {
 
       await runBusy(
         context,
-        message: _register ? '正在注册…' : '正在登录…',
-        task: () async {
-          if (_register) {
-            await auth.register(phone: phone, password: password);
-          } else {
-            await auth.login(phone: phone, password: password);
-          }
-        },
+        message: '正在验证…',
+        task: () => auth.verifyEmailOtp(email: email, token: token),
       );
       if (!mounted) return;
 
@@ -106,46 +110,40 @@ class _AuthPageState extends State<AuthPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_register ? '注册' : '登录'),
+        title: const Text('登录'),
       ),
       body: ListView(
         padding: const EdgeInsets.all(24),
         children: [
           Text(
-            _register
-                ? '手机号注册后即可管理房源与笔记、上架并同步'
-                : '使用注册时的手机号与密码登录',
+            _codeSent
+                ? '输入邮箱收到的验证码完成登录'
+                : '使用邮箱验证码登录后即可写笔记、上架文章并同步',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                   color: Colors.grey.shade700,
                 ),
           ),
           const SizedBox(height: 24),
           TextField(
-            controller: _phone,
-            keyboardType: TextInputType.phone,
+            controller: _email,
+            enabled: !_codeSent,
+            keyboardType: TextInputType.emailAddress,
+            autofillHints: const [AutofillHints.email],
             decoration: const InputDecoration(
-              labelText: '手机号',
-              hintText: '11 位手机号',
+              labelText: '邮箱',
+              hintText: 'you@example.com',
               border: OutlineInputBorder(),
             ),
           ),
-          const SizedBox(height: 16),
-          TextField(
-            controller: _password,
-            obscureText: true,
-            decoration: const InputDecoration(
-              labelText: '密码',
-              hintText: '至少 6 位',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          if (_register) ...[
+          if (_codeSent) ...[
             const SizedBox(height: 16),
             TextField(
-              controller: _confirm,
-              obscureText: true,
+              controller: _otp,
+              keyboardType: TextInputType.number,
+              autofillHints: const [AutofillHints.oneTimeCode],
               decoration: const InputDecoration(
-                labelText: '确认密码',
+                labelText: '验证码',
+                hintText: '邮件中的 6–8 位码',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -155,24 +153,36 @@ class _AuthPageState extends State<AuthPage> {
             Text(_error!, style: TextStyle(color: Colors.red.shade700)),
           ],
           const SizedBox(height: 24),
-          FilledButton(
-            onPressed: _submit,
-            child: Text(_register ? '注册' : '登录'),
-          ),
-          TextButton(
-            onPressed: () => setState(() {
-              _register = !_register;
-              _error = null;
-            }),
-            child: Text(_register ? '已有账号？去登录' : '没有账号？去注册'),
-          ),
+          if (!_codeSent)
+            FilledButton(
+              onPressed: _sendCode,
+              child: const Text('发送验证码'),
+            )
+          else ...[
+            FilledButton(
+              onPressed: _verify,
+              child: const Text('验证并登录'),
+            ),
+            TextButton(
+              onPressed: () => setState(() {
+                _codeSent = false;
+                _otp.clear();
+                _error = null;
+              }),
+              child: const Text('更换邮箱'),
+            ),
+            TextButton(
+              onPressed: _sendCode,
+              child: const Text('重新发送验证码'),
+            ),
+          ],
           TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('以后再说，先逛逛'),
           ),
           const SizedBox(height: 12),
           Text(
-            '后续将支持短信验证码 / 微信登录。当前为测试版：密码直连云端校验。',
+            '验证码由 Supabase Auth 发送。请在控制台开启 Email OTP。',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
                   color: Colors.grey,
                 ),

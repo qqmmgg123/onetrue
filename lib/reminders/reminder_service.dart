@@ -9,7 +9,6 @@ import 'package:timezone/timezone.dart' as tz;
 import '../domain/models.dart';
 import '../domain/note_recur.dart';
 import '../platform_init.dart';
-import '../ui/format.dart';
 import 'reminder_settings.dart';
 
 class ScheduledAlarm {
@@ -26,9 +25,9 @@ class ScheduledAlarm {
   final DateTime when;
   final String title;
   final String body;
-  /// 房源标签，或笔记类型等展示标签。
+  /// 兼容旧字段名：现为笔记类型等展示标签。
   final String roomLabel;
-  /// 账期 id，或 note.id。
+  /// 兼容旧字段名：现为 note.id。
   final int periodId;
 }
 
@@ -36,9 +35,7 @@ class ReminderService {
   ReminderService._();
   static final ReminderService instance = ReminderService._();
 
-  /// 改 channel id 才能让系统重建通道（旧通道关掉声音后改代码无效）。
-  static const _rentChannelId = 'rent_alarm_v3';
-  static const _noteChannelId = 'note_alarm_v1';
+  static const _channelId = 'note_alarm_v1';
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -83,18 +80,7 @@ class ReminderService {
       try {
         await _android?.createNotificationChannel(
           const AndroidNotificationChannel(
-            _rentChannelId,
-            '收租闹钟',
-            description: '到期前、当天与逾期的本地闹钟提醒',
-            importance: Importance.max,
-            playSound: true,
-            enableVibration: true,
-            showBadge: true,
-          ),
-        );
-        await _android?.createNotificationChannel(
-          const AndroidNotificationChannel(
-            _noteChannelId,
+            _channelId,
             '笔记提醒',
             description: '备忘与日程的本地提醒',
             importance: Importance.max,
@@ -122,7 +108,7 @@ class ReminderService {
     }
   }
 
-  /// 请求通知 + 精确闹钟权限（小米上常需用户去系统页打开）。
+  /// 请求通知 + 精确闹钟权限。
   Future<String?> ensureAlarmPermissions() async {
     await init();
     if (!notificationsSupported) {
@@ -170,10 +156,10 @@ class ReminderService {
     try {
       await _plugin.zonedSchedule(
         999001,
-        '收租闹钟测试',
-        '若听到/看到这条，说明本机闹钟通道可用',
+        '提醒测试',
+        '若听到/看到这条，说明本机提醒通道可用',
         when,
-        _rentAlarmDetails(fullscreen: true),
+        _alarmDetails(),
         androidScheduleMode: AndroidScheduleMode.alarmClock,
         uiLocalNotificationDateInterpretation:
             UILocalNotificationDateInterpretation.absoluteTime,
@@ -182,10 +168,10 @@ class ReminderService {
       debugPrint('alarmClock schedule failed: $e, fallback exact');
       await _plugin.zonedSchedule(
         999001,
-        '收租闹钟测试',
-        '若听到/看到这条，说明本机闹钟通道可用',
+        '提醒测试',
+        '若听到/看到这条，说明本机提醒通道可用',
         when,
-        _rentAlarmDetails(fullscreen: true),
+        _alarmDetails(),
         androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
         uiLocalNotificationDateInterpretation:
             UILocalNotificationDateInterpretation.absoluteTime,
@@ -196,9 +182,9 @@ class ReminderService {
       try {
         await _plugin.show(
           999002,
-          '收租闹钟测试',
+          '提醒测试',
           '前台兜底提醒（若只看到这条，请检查系统「闹钟和提醒」与通知渠道声音）',
-          _rentAlarmDetails(fullscreen: true),
+          _alarmDetails(),
         );
       } catch (e) {
         debugPrint('test show failed: $e');
@@ -211,16 +197,12 @@ class ReminderService {
     List<Note> notes = const [],
   }) async {
     await init();
+    // 不再根据收租账期排程；pending 参数保留以兼容旧调用。
     scheduled = [];
     final next = <ScheduledAlarm>[];
-
-    for (final item in pending) {
-      if (next.length >= 48) break;
-      next.addAll(await _planFor(item));
-    }
-
     final now = DateTime.now();
     final horizon = now.add(const Duration(days: 90));
+
     for (final note in notes) {
       if (note.kind != kNoteKindMemo && note.kind != kNoteKindSchedule) {
         continue;
@@ -248,7 +230,7 @@ class ReminderService {
         if (!localWhen.isAfter(now.subtract(const Duration(minutes: 1)))) {
           continue;
         }
-        if (next.length >= 64) break;
+        if (next.length >= 56) break;
         final stamp =
             '${localWhen.year.toString().padLeft(4, '0')}'
             '${localWhen.month.toString().padLeft(2, '0')}'
@@ -268,7 +250,7 @@ class ReminderService {
           ),
         );
       }
-      if (next.length >= 64) break;
+      if (next.length >= 56) break;
     }
 
     if (!notificationsSupported || !settings.enabled) {
@@ -286,18 +268,12 @@ class ReminderService {
         ? AndroidScheduleMode.alarmClock
         : AndroidScheduleMode.inexactAllowWhileIdle;
     for (final alarm in next) {
-      final isRent = alarm.id < 800000;
       await _plugin.zonedSchedule(
         alarm.id,
         alarm.title,
         alarm.body,
         tz.TZDateTime.from(alarm.when, tz.local),
-        isRent
-            ? _rentAlarmDetails(
-                fullscreen:
-                    alarm.title == '今天收租' || alarm.title == '逾期未收',
-              )
-            : _noteAlarmDetails(),
+        _alarmDetails(),
         androidScheduleMode: mode,
         uiLocalNotificationDateInterpretation:
             UILocalNotificationDateInterpretation.absoluteTime,
@@ -306,104 +282,10 @@ class ReminderService {
     scheduled = next;
   }
 
-  Future<List<ScheduledAlarm>> _planFor(DueItem item) async {
-    final due = dateOnly(item.period.dueDate);
-    final body =
-        '${md(due)} ${item.roomLabel} 应收 ${formatYuan(item.period.amount)}';
-    final plans = <ScheduledAlarm>[];
-    final now = tz.TZDateTime.now(tz.local);
-
-    if (settings.advanceDays > 0) {
-      final advance = due.subtract(Duration(days: settings.advanceDays));
-      final when = _atHour(advance);
-      if (when.isAfter(now)) {
-        plans.add(
-          ScheduledAlarm(
-            id: item.period.id * 10,
-            when: when,
-            title: '还有 ${settings.advanceDays} 天收租',
-            body: body,
-            roomLabel: item.roomLabel,
-            periodId: item.period.id,
-          ),
-        );
-      }
-    }
-
-    final dueWhen = _atHour(due);
-    if (dueWhen.isAfter(now)) {
-      plans.add(
-        ScheduledAlarm(
-          id: item.period.id * 10 + 1,
-          when: dueWhen,
-          title: '今天收租',
-          body: body,
-          roomLabel: item.roomLabel,
-          periodId: item.period.id,
-        ),
-      );
-    }
-
-    final today = dateOnly(DateTime.now());
-    if (due.isBefore(today)) {
-      for (var i = 0; i < 7; i++) {
-        final day = today.add(Duration(days: i));
-        final when = _atHour(day);
-        if (!when.isAfter(now)) continue;
-        plans.add(
-          ScheduledAlarm(
-            id: item.period.id * 10 + 2 + i,
-            when: when,
-            title: '逾期未收',
-            body: body,
-            roomLabel: item.roomLabel,
-            periodId: item.period.id,
-          ),
-        );
-      }
-    }
-    return plans;
-  }
-
-  DateTime _atHour(DateTime day) {
-    return tz.TZDateTime(
-      tz.local,
-      day.year,
-      day.month,
-      day.day,
-      settings.hour,
-    );
-  }
-
-  NotificationDetails _rentAlarmDetails({required bool fullscreen}) {
+  NotificationDetails _alarmDetails() {
     return NotificationDetails(
       android: AndroidNotificationDetails(
-        _rentChannelId,
-        '收租闹钟',
-        channelDescription: '到期前、当天与逾期的本地闹钟提醒（不写入系统日历）',
-        importance: Importance.max,
-        priority: Priority.max,
-        category: AndroidNotificationCategory.alarm,
-        fullScreenIntent: fullscreen,
-        playSound: true,
-        enableVibration: true,
-        audioAttributesUsage: AudioAttributesUsage.alarm,
-        visibility: NotificationVisibility.public,
-        ticker: '收租提醒',
-        channelShowBadge: true,
-      ),
-      iOS: const DarwinNotificationDetails(
-        presentAlert: true,
-        presentBadge: true,
-        presentSound: true,
-      ),
-    );
-  }
-
-  NotificationDetails _noteAlarmDetails() {
-    return const NotificationDetails(
-      android: AndroidNotificationDetails(
-        _noteChannelId,
+        _channelId,
         '笔记提醒',
         channelDescription: '备忘与日程的本地提醒',
         importance: Importance.max,
@@ -416,7 +298,7 @@ class ReminderService {
         ticker: '笔记提醒',
         channelShowBadge: true,
       ),
-      iOS: DarwinNotificationDetails(
+      iOS: const DarwinNotificationDetails(
         presentAlert: true,
         presentBadge: true,
         presentSound: true,

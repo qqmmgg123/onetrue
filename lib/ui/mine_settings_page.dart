@@ -14,15 +14,15 @@ class MineSettingsPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
-    final phone = store.user?.phoneMasked ?? '';
+    final email = store.user?.emailMasked ?? '';
     return Scaffold(
       appBar: AppBar(title: const Text('设置')),
       body: ListView(
         children: [
-          if (phone.isNotEmpty) ...[
+          if (email.isNotEmpty) ...[
             ListTile(
-              title: const Text('手机号'),
-              subtitle: Text(phone),
+              title: const Text('邮箱'),
+              subtitle: Text(email),
             ),
             const Divider(height: 1),
           ],

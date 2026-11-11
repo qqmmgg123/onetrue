@@ -25,15 +25,13 @@ import '../state/app_store.dart';
 import 'agent_settings_page.dart';
 import 'busy.dart';
 
-const _welcomeText = '可以像微信一样随便聊；闲聊问答都行，也能管房源、记笔记。\n'
+const _welcomeText = '可以像微信一样随便聊；闲聊问答都行，也能帮你记笔记。\n'
     '例如：\n'
-    '· 加一个翠苑小区，再加 302\n'
-    '· 302 租给张三，月租 2800，每月 5 号交\n'
-    '· 列出未收房租\n'
     '· 记一下：周五下午见客户\n'
     '· 备忘：明天带护照\n'
     '· 下周一 10 点开会，每周重复\n'
-    '· 列出我的笔记 / 把这几条整理成文章并上架\n'
+    '· 列出我的笔记\n'
+    '· 把这几条整理成一篇文章并上架\n'
     '写操作会先让你确认。点右上角「新对话」可开干净会话。';
 
 class ChatPage extends StatefulWidget {
@@ -1175,11 +1173,6 @@ class _ChatPageState extends State<ChatPage> {
                 const SizedBox(height: 12),
                 Text(
                   '全能对话：闲聊、问答、构思写作都可以。\n\n'
-                  '房源与收租（可直接说）\n'
-                  '· 「加一个翠苑小区，再加 302」\n'
-                  '· 「302 租给张三，月租 2800，每月 5 号交」\n'
-                  '· 「列出未收房租」/「302 记已收」\n'
-                  '· 「302 电表抄到 1234」\n\n'
                   '笔记本（可直接说）\n'
                   '· 「记一下：下周开会」→ 随笔/备忘\n'
                   '· 「明天下午三点开会」→ 日程\n'
@@ -1368,7 +1361,7 @@ class _ChatPageState extends State<ChatPage> {
                               textInputAction: TextInputAction.send,
                               onSubmitted: (_) => _send(),
                               decoration: InputDecoration(
-                                hintText: '随便聊，或说加房源 / 记一下…',
+                                hintText: '随便聊，或说记一下…',
                                 hintStyle: const TextStyle(color: Colors.white54),
                                 filled: true,
                                 fillColor: const Color(0xFF2A2A2A),

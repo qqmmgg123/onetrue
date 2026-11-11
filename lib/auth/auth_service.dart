@@ -1,22 +1,15 @@
-import 'dart:convert';
+import 'package:supabase_flutter/supabase_flutter.dart' hide AuthUser;
 
-import 'package:postgres/postgres.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
-
-import '../sync/neon_connection.dart';
+import '../config/baked_env.dart';
 import '../sync/sync_settings.dart';
 import 'auth_models.dart';
-import 'password_hasher.dart';
 
-/// 手机号+密码鉴权（直连 Neon app_users）。
-/// 正式版应改为后端 Auth API，勿在客户端持有 DATABASE_URL。
+/// 邮箱 OTP 鉴权（Supabase Auth）。
 class AuthService {
   AuthService._();
   static final AuthService instance = AuthService._();
 
-  static const _kSession = 'auth_session_json';
-  static final _phoneRe = RegExp(r'^1\d{10}$');
+  static final _emailRe = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
 
   AuthUser? currentUser;
 
@@ -24,131 +17,97 @@ class AuthService {
   bool get isGuest => currentUser == null;
   bool get isLandlord => currentUser != null;
 
+  /// 当前会话 JWT（调用 Edge Function 时带上）。
+  String? get accessToken {
+    if (!BakedEnv.hasSupabase) return null;
+    return Supabase.instance.client.auth.currentSession?.accessToken;
+  }
+
+  SupabaseClient get _client {
+    if (!BakedEnv.hasSupabase) {
+      throw StateError('未配置 Supabase（SUPABASE_URL / SUPABASE_ANON_KEY）');
+    }
+    return Supabase.instance.client;
+  }
+
   Future<void> loadSession() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_kSession);
-    if (raw == null || raw.isEmpty) {
+    if (!BakedEnv.hasSupabase) {
       currentUser = null;
       return;
     }
     try {
-      final map = jsonDecode(raw) as Map<String, dynamic>;
-      final user = AuthUser.fromJson(map);
-      if (user.id.isEmpty || user.phone.isEmpty) {
+      final session = _client.auth.currentSession;
+      final user = session?.user;
+      if (user == null || user.id.isEmpty) {
         currentUser = null;
         return;
       }
-      currentUser = user;
+      currentUser = _fromSupabaseUser(user);
       await SyncSettings.instance.bindOwner(user.id);
     } catch (_) {
       currentUser = null;
     }
   }
 
-  Future<AuthUser> register({
-    required String phone,
-    required String password,
-    String displayName = '',
-  }) async {
-    final p = phone.trim();
-    final pw = password;
-    if (!_phoneRe.hasMatch(p)) {
-      throw StateError('请输入合法的 11 位手机号');
+  /// 向邮箱发送一次性验证码（sign-in / sign-up 共用）。
+  Future<void> sendEmailOtp(String email) async {
+    final e = email.trim();
+    if (!_emailRe.hasMatch(e)) {
+      throw StateError('请输入合法邮箱');
     }
-    if (pw.length < 6) {
-      throw StateError('密码至少 6 位');
-    }
-    final conn = await _open();
-    try {
-      final exists = await conn.query(
-        'SELECT id FROM app_users WHERE phone = @phone LIMIT 1',
-        substitutionValues: {'phone': p},
-      );
-      if (exists.isNotEmpty) {
-        throw StateError('该手机号已注册，请直接登录');
-      }
-      final id = const Uuid().v4();
-      final hash = PasswordHasher.hash(pw);
-      await conn.execute(
-        '''
-        INSERT INTO app_users (id, phone, password_hash, display_name)
-        VALUES (@id, @phone, @hash, @name)
-        ''',
-        substitutionValues: {
-          'id': id,
-          'phone': p,
-          'hash': hash,
-          'name': displayName.trim(),
-        },
-      );
-      final user = AuthUser(id: id, phone: p, displayName: displayName.trim());
-      await _persist(user);
-      return user;
-    } finally {
-      await conn.close();
-    }
+    await _client.auth.signInWithOtp(
+      email: e,
+      shouldCreateUser: true,
+    );
   }
 
-  Future<AuthUser> login({
-    required String phone,
-    required String password,
+  /// 校验邮箱 OTP 并建立会话。
+  Future<AuthUser> verifyEmailOtp({
+    required String email,
+    required String token,
   }) async {
-    final p = phone.trim();
-    final pw = password;
-    if (!_phoneRe.hasMatch(p)) {
-      throw StateError('请输入合法的 11 位手机号');
+    final e = email.trim();
+    final code = token.trim();
+    if (!_emailRe.hasMatch(e)) {
+      throw StateError('请输入合法邮箱');
     }
-    final conn = await _open();
-    try {
-      final rows = await conn.query(
-        '''
-        SELECT id, phone, password_hash, display_name
-        FROM app_users
-        WHERE phone = @phone
-        LIMIT 1
-        ''',
-        substitutionValues: {'phone': p},
-      );
-      if (rows.isEmpty) {
-        throw StateError('账号不存在，请先注册');
-      }
-      final row = rows.first;
-      final hash = '${row[2]}';
-      if (!PasswordHasher.verify(pw, hash)) {
-        throw StateError('密码不正确');
-      }
-      final user = AuthUser(
-        id: '${row[0]}',
-        phone: '${row[1]}',
-        displayName: '${row[3] ?? ''}',
-      );
-      await _persist(user);
-      return user;
-    } finally {
-      await conn.close();
+    if (code.isEmpty) {
+      throw StateError('请输入验证码');
     }
+    final res = await _client.auth.verifyOTP(
+      email: e,
+      token: code,
+      type: OtpType.email,
+    );
+    final user = res.user ?? _client.auth.currentUser;
+    if (user == null || user.id.isEmpty) {
+      throw StateError('验证失败，请重试');
+    }
+    final authUser = _fromSupabaseUser(user);
+    currentUser = authUser;
+    await SyncSettings.instance.bindOwner(authUser.id);
+    return authUser;
   }
 
   Future<void> logout() async {
     currentUser = null;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_kSession);
+    if (BakedEnv.hasSupabase) {
+      try {
+        await _client.auth.signOut();
+      } catch (_) {}
+    }
     await SyncSettings.instance.clearOwner();
   }
 
-  Future<void> _persist(AuthUser user) async {
-    currentUser = user;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kSession, jsonEncode(user.toJson()));
-    await SyncSettings.instance.bindOwner(user.id);
-  }
-
-  Future<PostgreSQLConnection> _open() async {
-    await SyncSettings.instance.load();
-    final url = SyncSettings.instance.databaseUrl.trim();
-    if (url.isEmpty) {
-      throw StateError('未配置数据库，无法注册/登录');
-    }
-    return NeonEndpoint.parse(url).open();
+  AuthUser _fromSupabaseUser(User user) {
+    final meta = user.userMetadata ?? const <String, dynamic>{};
+    final phone = '${user.phone ?? meta['phone'] ?? ''}'.trim();
+    final name = '${meta['display_name'] ?? meta['full_name'] ?? ''}'.trim();
+    return AuthUser(
+      id: user.id,
+      email: (user.email ?? '').trim(),
+      phone: phone,
+      displayName: name,
+    );
   }
 }

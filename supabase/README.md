@@ -1,38 +1,38 @@
-# Neon 同步与 env 打包
+# Supabase（Singapore）+ Email OTP + RLS
 
-同步已从 Supabase REST 改为 **Neon Postgres 直连**（国内通常不需要代理；可能比本地库慢一点）。
+App 通过 **Supabase Auth（邮箱 OTP）** 登录，用 **PostgREST + RLS** 同步 `notes`；
+大模型 / ASR / 识图走 **Edge Functions**，密钥放 secrets，不进 APK。
 
 ## 步骤
 
-1. 在 [neon.tech](https://neon.tech) 新建项目（区域建议新加坡 / 香港附近）
-2. 复制 Connection string 到 `supabase/env.local` 的 `DATABASE_URL`
-3. 建表：
+1. 在 [supabase.com](https://supabase.com) 新建项目，区域选 **Singapore**（或就近）
+2. Authentication → Providers → **Email** 开启；建议用 OTP / magic link（关闭强制密码亦可）
+3. 复制 Project URL、`anon` `public` key 到 `supabase/env.local`：
+   - `SUPABASE_URL`
+   - `SUPABASE_ANON_KEY`
+4. Database → 连接串（migrate 机）填 `DATABASE_URL`（**不要** bake 进 App）
+5. 建表 + RLS：
    ```powershell
    python supabase/apply_schema.py
    ```
-4. 确认 `SYNC_OWNER_ID`、`SYNC_ENABLED=true`，以及 LLM/ASR Key
-5. 打包：
+6. 部署 Edge stubs（并 `supabase secrets set` 上游 Key）：
+   ```powershell
+   supabase functions deploy llm-chat
+   supabase functions deploy asr-transcribe
+   supabase functions deploy vision-understand
+   ```
+7. 打包：
    ```powershell
    .\build_apk.ps1 -Install
    ```
 
 ## 说明
 
-- App 用 Postgres 协议同步，不再访问 `*.supabase.co` HTTPS
-- `DATABASE_URL` 会打进安装包（仅适合自用）；勿公开分发 APK
-- 多端请使用同一个 `SYNC_OWNER_ID`
-- 延迟：Neon 冷启动或跨国链路可能有 1–3 秒，属正常
+- APK 只应含 `SUPABASE_URL` + `SUPABASE_ANON_KEY`（公开）；**禁止** `service_role` / `DATABASE_URL` / 上游 LLM Key
+- 行级安全：`notes.owner_id = auth.uid()`；已上架 `article` 可对 anon/authenticated 只读
+- 多端：同一邮箱 OTP 登录即可同步（owner = Auth `user.id`）
+- 旧 Neon 直连 / `postgres` Dart 包已从 App 运行时移除；`apply_schema.py` 仍用 Python `psycopg2`
 
 ## 同步范围
 
-`properties` / `rooms`（含 `video_url`）/ `tenants` / `leases` / `lease_extras` / `rent_periods` / `meter_readings` / `period_adjustments` / `invoices` / `payments`
-
-## 房间视频（七牛优先，R2 备用 + Vercel）
-
-1. **优先**七牛：建公开空间 + 绑定 CDN 域名 → 填 `QINIU_ACCESS_KEY` / `QINIU_SECRET_KEY` / `QINIU_BUCKET` / `QINIU_PUBLIC_BASE`（按区域设 `QINIU_UPLOAD_HOST`）
-2. **备用** Cloudflare R2：建桶并开启公共访问 → 填 `R2_*` / `R2_PUBLIC_BASE`（七牛失败时自动改用）
-3. 部署 `share-web/` 到 EdgeOne Makers（见 `share-web/README.md`）→ 填 `SHARE_WEB_BASE`；分享站媒体前缀与上传端一致（七牛用 `NEXT_PUBLIC_QINIU_PUBLIC_BASE`）
-4. Neon 执行 `python supabase/apply_schema.py`（会加 `rooms.video_url` 列）
-5. `.\build_apk.ps1 -Install`
-
-App 内：房间列表/详情右侧缩略图 → 竖屏播放页 → **本机处理后再上传**（已是 H.264/MP4 则跳过转码，否则 LowQuality 硬编）；优先七牛，失败用 R2。云端转码暂关。播放会落本地缓存。
+仅 `notes`（市集浏览含 `note_stats` 阅读数）。房源/租约表不再同步。

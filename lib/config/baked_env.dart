@@ -1,20 +1,41 @@
+// LLM/ASR bake fields are deprecated but still read by temporary fallbacks.
+// ignore_for_file: deprecated_member_use_from_same_package
+
 /// 编译期注入的配置（来自 `supabase/env.local` → `dart_defines.json`）。
 /// 打包：`.\build_apk.ps1` 或
 /// `flutter build apk --dart-define-from-file=supabase/dart_defines.json`
 class BakedEnv {
   BakedEnv._();
 
-  // —— 大模型对话 ——
+  // —— Supabase（App 运行时：Auth + PostgREST + Edge）——
+  static const String supabaseUrl = String.fromEnvironment('SUPABASE_URL');
+  static const String supabaseAnonKey =
+      String.fromEnvironment('SUPABASE_ANON_KEY');
+
+  /// Edge Functions 根路径（与项目 URL 相同）。
+  static String get supabaseFunctionsBase {
+    final u = supabaseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    return u.isEmpty ? '' : '$u/functions/v1';
+  }
+
+  static bool get hasSupabase =>
+      supabaseUrl.trim().isNotEmpty && supabaseAnonKey.trim().isNotEmpty;
+
+  // —— 大模型对话（deprecated：优先走 Edge `llm-chat`；仅作临时直连回退）——
+  @Deprecated('Prefer Edge Function llm-chat; keep only as temporary fallback')
   /// auto | zhipu | baidu | silicon | oneapi | deepseek
   static const String llmProvider = String.fromEnvironment(
     'LLM_PROVIDER',
     defaultValue: 'auto',
   );
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String llmBaseUrl = String.fromEnvironment(
     'LLM_BASE_URL',
     defaultValue: 'https://api.deepseek.com/v1',
   );
+  @Deprecated('Prefer Edge Function llm-chat; do not bake keys into APK')
   static const String llmApiKey = String.fromEnvironment('LLM_API_KEY');
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String llmModel = String.fromEnvironment(
     'LLM_MODEL',
     defaultValue: 'deepseek-chat',
@@ -22,58 +43,74 @@ class BakedEnv {
   static const bool useLlm = bool.fromEnvironment('USE_LLM', defaultValue: false);
 
   /// 智谱对话（默认 glm-4-flash；识图仍用 ZHIPU_VISION_MODEL）
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String zhipuChatModel = String.fromEnvironment(
     'ZHIPU_CHAT_MODEL',
     defaultValue: 'glm-4-flash',
   );
 
   /// 百度千帆对话（OpenAI 兼容 v2，与 ASR 的 AK/SK 分开）
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String baiduLlmApiKey =
       String.fromEnvironment('BAIDU_LLM_API_KEY');
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String baiduLlmBaseUrl = String.fromEnvironment(
     'BAIDU_LLM_BASE_URL',
     defaultValue: 'https://qianfan.baidubce.com/v2',
   );
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String baiduLlmModel = String.fromEnvironment(
     'BAIDU_LLM_MODEL',
     defaultValue: 'ernie-speed-8k',
   );
 
   /// 硅基对话（空则复用 ASR_*）
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String siliconChatModel = String.fromEnvironment(
     'SILICON_CHAT_MODEL',
     defaultValue: 'Qwen/Qwen2.5-7B-Instruct',
   );
 
   /// One API / New API 聚合网关（配好后 auto 优先走这里）
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String oneApiBaseUrl =
       String.fromEnvironment('ONE_API_BASE_URL');
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String oneApiKey = String.fromEnvironment('ONE_API_KEY');
+  @Deprecated('Prefer Edge Function llm-chat')
   static const String oneApiModel = String.fromEnvironment('ONE_API_MODEL');
 
-  // —— 百度智能云短语音（ASR 第一优先）——
+  // —— 百度智能云短语音（ASR；deprecated，优先 Edge asr-transcribe）——
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String baiduAsrApiKey =
       String.fromEnvironment('BAIDU_ASR_API_KEY');
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String baiduAsrSecretKey =
       String.fromEnvironment('BAIDU_ASR_SECRET_KEY');
 
   // —— Groq Whisper（ASR 第二优先）——
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String groqApiKey = String.fromEnvironment('GROQ_API_KEY');
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String groqBaseUrl = String.fromEnvironment(
     'GROQ_BASE_URL',
     defaultValue: 'https://api.groq.com/openai/v1',
   );
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String groqAsrModel = String.fromEnvironment(
     'GROQ_ASR_MODEL',
     defaultValue: 'whisper-large-v3-turbo',
   );
 
   // —— 硅基 SenseVoice（ASR 第三优先）——
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String asrBaseUrl = String.fromEnvironment(
     'ASR_BASE_URL',
     defaultValue: 'https://api.siliconflow.cn/v1',
   );
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String asrApiKey = String.fromEnvironment('ASR_API_KEY');
+  @Deprecated('Prefer Edge Function asr-transcribe')
   static const String asrModel = String.fromEnvironment(
     'ASR_MODEL',
     defaultValue: 'FunAudioLLM/SenseVoiceSmall',
@@ -81,37 +118,46 @@ class BakedEnv {
   static const bool useCloudAsr =
       bool.fromEnvironment('USE_CLOUD_ASR', defaultValue: true);
 
-  // —— 附图理解（对话里「看图做事」）——
+  // —— 附图理解（deprecated：优先 Edge vision-understand）——
   /// 智谱免费真识图：https://open.bigmodel.cn 申请 API Key，模型 glm-4v-flash
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String zhipuApiKey = String.fromEnvironment('ZHIPU_API_KEY');
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String zhipuBaseUrl = String.fromEnvironment(
     'ZHIPU_BASE_URL',
     defaultValue: 'https://open.bigmodel.cn/api/paas/v4',
   );
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String zhipuVisionModel = String.fromEnvironment(
     'ZHIPU_VISION_MODEL',
     defaultValue: 'glm-4v-flash',
   );
   /// DeepSeek 官方真识图模型名（复用 LLM_API_KEY）
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String deepseekVisionModel = String.fromEnvironment(
     'DEEPSEEK_VISION_MODEL',
     defaultValue: 'deepseek-flash',
   );
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String geminiApiKey = String.fromEnvironment('GEMINI_API_KEY');
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String geminiVisionModel = String.fromEnvironment(
     'GEMINI_VISION_MODEL',
     defaultValue: 'gemini-2.5-flash',
   );
   /// 硅基 OCR 兜底；空则复用 ASR_*
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String visionBaseUrl = String.fromEnvironment('VISION_BASE_URL');
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String visionApiKey = String.fromEnvironment('VISION_API_KEY');
+  @Deprecated('Prefer Edge Function vision-understand')
   static const String visionModels = String.fromEnvironment(
     'VISION_MODELS',
     defaultValue:
         'deepseek-ai/DeepSeek-OCR,PaddlePaddle/PaddleOCR-VL-1.5',
   );
 
-  // —— Neon / Postgres 同步（直连连接串，适合自用打包）——
+  /// migrate-only：`apply_schema.py` 用；App 同步不再依赖。
   static const String databaseUrl = String.fromEnvironment('DATABASE_URL');
   static const String syncOwnerId = String.fromEnvironment('SYNC_OWNER_ID');
   static const bool syncEnabled =
@@ -170,7 +216,7 @@ class BakedEnv {
   static bool get hasAsrKey => asrApiKey.trim().isNotEmpty;
   static bool get hasGeminiKey => geminiApiKey.trim().isNotEmpty;
   static bool get hasZhipuKey => zhipuApiKey.trim().isNotEmpty;
-  /// 是否已内置任一对话可用 Key（免费级联或 DeepSeek / One API）。
+  /// 是否已内置任一对话可用 Key（免费级联或 DeepSeek / One API）。临时回退用。
   static bool get hasAnyChatLlmKey =>
       hasZhipuKey || hasBaiduLlmKey || hasAsrKey || hasOneApi || hasLlmKey;
   static bool get hasVisionKey =>
@@ -179,7 +225,10 @@ class BakedEnv {
       visionApiKey.trim().isNotEmpty ||
       hasAsrKey ||
       hasLlmKey;
-  static bool get hasSyncDb => databaseUrl.trim().isNotEmpty;
+
+  /// App 同步依赖 Supabase，不再看 DATABASE_URL。
+  static bool get hasSyncDb => hasSupabase;
+
   static bool get hasQiniu =>
       qiniuAccessKey.trim().isNotEmpty &&
       qiniuSecretKey.trim().isNotEmpty &&
@@ -193,7 +242,9 @@ class BakedEnv {
       r2PublicBase.trim().isNotEmpty;
 
   /// 是否已把服务商配置打进安装包（手机上不必再填 Key）。
+  /// 正式版应只 bake Supabase URL/anon；LLM/ASR Key 走 Edge secrets。
   static bool get hasBundle =>
+      hasSupabase ||
       hasLlmKey ||
       hasBaiduLlmKey ||
       hasOneApi ||
@@ -202,7 +253,6 @@ class BakedEnv {
       hasAsrKey ||
       hasGeminiKey ||
       hasZhipuKey ||
-      hasSyncDb ||
       hasQiniu ||
       hasR2;
 }

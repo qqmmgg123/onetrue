@@ -2,11 +2,12 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../auth/auth_service.dart';
+import '../config/baked_env.dart';
 import 'agent_models.dart';
 import 'agent_settings.dart';
 import 'agent_tools.dart';
 import 'chat_memory.dart';
-import 'llm_providers.dart';
 
 class LlmToolCall {
   LlmToolCall({required this.name, required this.arguments});
@@ -37,60 +38,97 @@ class LlmClient {
     String? rolledSummary,
     bool landlord = true,
   }) async {
+    final messages = _buildMessages(
+      system: system,
+      user: user,
+      inventoryContext: inventoryContext,
+      sticky: sticky,
+      history: history,
+      rolledSummary: rolledSummary,
+    );
+    final tools = toolSchemasFor(landlord: landlord);
+    final bodyBase = <String, dynamic>{
+      'temperature': 0.2,
+      'messages': messages,
+      'tools': tools,
+      'tool_choice': 'auto',
+    };
+
+    // 优先 Edge 代理（JWT）；失败且仍有 bake Key 时回退直连。
+    if (BakedEnv.hasSupabase) {
+      final token = AuthService.instance.accessToken;
+      if (token != null && token.isNotEmpty) {
+        try {
+          return await _postChat(
+            uri: Uri.parse('${BakedEnv.supabaseFunctionsBase}/llm-chat'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $token',
+              'apikey': BakedEnv.supabaseAnonKey.trim(),
+            },
+            body: bodyBase,
+            providerName: 'edge:llm-chat',
+          );
+        } catch (e) {
+          if (!BakedEnv.hasAnyChatLlmKey) rethrow;
+          // fall through to baked keys
+        }
+      }
+    }
+
     final endpoints = settings.resolveEndpoints();
     if (endpoints.isEmpty) {
       throw StateError(
-        '未配置可用对话模型。请在设置中选择厂商并填写 Key，'
-        '或打包时在 env.local 配置 ZHIPU_API_KEY / BAIDU_LLM_API_KEY / ASR_API_KEY / ONE_API_*。',
+        '未配置可用对话模型。请登录后走 Edge llm-chat，'
+        '或临时在 env.local bake Key（deprecated）。',
       );
     }
 
     final errors = <String>[];
     for (final ep in endpoints) {
       try {
-        return await _chatOnce(
-          ep: ep,
-          system: system,
-          user: user,
-          inventoryContext: inventoryContext,
-          sticky: sticky,
-          history: history,
-          rolledSummary: rolledSummary,
-          landlord: landlord,
+        final model = ep.model == 'default' ? '' : ep.model;
+        final body = <String, dynamic>{
+          ...bodyBase,
+          if (model.isNotEmpty) 'model': model,
+        };
+        final base = ep.baseUrl.replaceAll(RegExp(r'/+$'), '');
+        return await _postChat(
+          uri: Uri.parse('$base/chat/completions'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ${ep.apiKey}',
+          },
+          body: body,
+          providerName: ep.name,
         );
       } catch (e) {
         errors.add('${ep.name}: $e');
         if (!_shouldFailover(e)) {
-          // 业务/参数类错误不浪费下一家（少见）；仍允许换家试 tools 兼容
           if (!_looksLikeProviderIssue(e)) rethrow;
         }
       }
     }
     throw StateError(
       '对话模型均不可用：\n${errors.join('\n')}\n'
-      '可到设置里换厂商，或检查 Key / 限额。',
+      '可检查 Edge llm-chat / 登录态，或临时 bake Key。',
     );
   }
 
-  Future<LlmResult> _chatOnce({
-    required LlmEndpoint ep,
+  List<Map<String, String>> _buildMessages({
     required String system,
     required String user,
     required String inventoryContext,
     SessionSticky? sticky,
     List<ChatMessage> history = const [],
     String? rolledSummary,
-    bool landlord = true,
-  }) async {
-    final base = ep.baseUrl.replaceAll(RegExp(r'/+$'), '');
-    final uri = Uri.parse('$base/chat/completions');
-
+  }) {
     final messages = <Map<String, String>>[
       {'role': 'system', 'content': system},
     ];
 
     final preamble = StringBuffer()
-      ..writeln('当前账本与笔记本摘要：')
+      ..writeln('当前笔记本摘要：')
       ..writeln(inventoryContext);
     final stickyBlock = sticky?.toPromptBlock() ?? '';
     if (stickyBlock.isNotEmpty) {
@@ -101,14 +139,14 @@ class LlmClient {
     if (rolledSummary != null && rolledSummary.trim().isNotEmpty) {
       preamble
         ..writeln()
-        ..writeln('更早对话摘要（原文已截断，事实以便签、账本和笔记本为准）：')
+        ..writeln('更早对话摘要（原文已截断，事实以便签和笔记本为准）：')
         ..writeln(rolledSummary);
     }
     preamble
       ..writeln()
       ..writeln(
         '下面是本会话近期对话。用户可能分多句慢慢说，请承接上下文；'
-        '闲聊直接答；房源账本与笔记读写用 tools。不要要求对方按固定格式重说。',
+        '闲聊直接答，笔记读写用 tools。不要要求对方按固定格式重说。',
       )
       ..writeln(
         '历史里标注「已确认执行/已取消」的操作不要重复提议。',
@@ -133,23 +171,19 @@ class LlmClient {
       });
     }
     messages.add({'role': 'user', 'content': user});
+    return messages;
+  }
 
-    final model = ep.model == 'default' ? '' : ep.model;
-    final body = <String, dynamic>{
-      if (model.isNotEmpty) 'model': model,
-      'temperature': 0.2,
-      'messages': messages,
-      'tools': toolSchemasFor(landlord: landlord),
-      'tool_choice': 'auto',
-    };
-
+  Future<LlmResult> _postChat({
+    required Uri uri,
+    required Map<String, String> headers,
+    required Map<String, dynamic> body,
+    required String providerName,
+  }) async {
     final res = await http
         .post(
           uri,
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ${ep.apiKey}',
-          },
+          headers: headers,
           body: jsonEncode(body),
         )
         .timeout(const Duration(seconds: 60));
@@ -185,7 +219,7 @@ class LlmClient {
     return LlmResult(
       content: content,
       toolCalls: calls,
-      providerName: ep.name,
+      providerName: providerName,
     );
   }
 

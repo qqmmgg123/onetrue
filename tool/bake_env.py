@@ -6,14 +6,14 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-
 ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = ROOT / "supabase" / "env.local"
 OUT_FILE = ROOT / "supabase" / "dart_defines.json"
 
-# App 会打进 APK 的键
+# App 会打进 APK 的键（正式版优先只 bake SUPABASE_*；LLM/ASR Key 应走 Edge）
 APP_KEYS = {
+    "SUPABASE_URL",
+    "SUPABASE_ANON_KEY",
     "LLM_PROVIDER",
     "LLM_BASE_URL",
     "LLM_API_KEY",
@@ -45,7 +45,6 @@ APP_KEYS = {
     "VISION_BASE_URL",
     "VISION_API_KEY",
     "VISION_MODELS",
-    "DATABASE_URL",
     "SYNC_OWNER_ID",
     "SYNC_ENABLED",
     "QINIU_ACCESS_KEY",
@@ -69,6 +68,7 @@ APP_KEYS = {
 
 BOOL_KEYS = {"USE_LLM", "USE_CLOUD_ASR", "SYNC_ENABLED"}
 SECRET_KEYS = {
+    "SUPABASE_ANON_KEY",
     "LLM_API_KEY",
     "BAIDU_LLM_API_KEY",
     "ONE_API_KEY",
@@ -79,7 +79,6 @@ SECRET_KEYS = {
     "GEMINI_API_KEY",
     "ZHIPU_API_KEY",
     "VISION_API_KEY",
-    "DATABASE_URL",
     "QINIU_ACCESS_KEY",
     "QINIU_SECRET_KEY",
     "R2_SECRET_ACCESS_KEY",
@@ -102,15 +101,6 @@ def load_env(path: Path) -> dict[str, str]:
 
 def to_bool_str(v: str) -> str:
     return "true" if v.strip().lower() in ("1", "true", "yes", "on") else "false"
-
-
-def sanitize_database_url(url: str) -> str:
-    """Drop channel_binding=… — Windows cmd treats '&' as a command separator."""
-    u = urlparse(url.strip())
-    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k != "channel_binding"]
-    if not any(k == "sslmode" for k, _ in q):
-        q.append(("sslmode", "require"))
-    return urlunparse(u._replace(query=urlencode(q)))
 
 
 def main() -> int:
@@ -146,8 +136,6 @@ def main() -> int:
         if key not in env or env[key] == "":
             continue
         val = env[key]
-        if key == "DATABASE_URL":
-            val = sanitize_database_url(val)
         defines[key] = to_bool_str(val) if key in BOOL_KEYS else val
         if "&" in defines[key] and key not in BOOL_KEYS:
             print(
@@ -161,19 +149,10 @@ def main() -> int:
     )
 
     def mask(k: str, v: str) -> str:
-        if k in BOOL_KEYS or k.endswith("_URL") and k != "DATABASE_URL":
+        if k in BOOL_KEYS or k.endswith("_URL"):
             return v
         if k.endswith("_MODEL") or k == "SYNC_OWNER_ID":
             return v
-        if k == "DATABASE_URL":
-            # 隐藏密码，保留 host
-            try:
-                from urllib.parse import urlparse
-
-                u = urlparse(v)
-                return f"{u.scheme}://***@{u.hostname}:{u.port or 5432}{u.path}"
-            except Exception:
-                return "***"
         if k in SECRET_KEYS:
             if len(v) <= 8:
                 return "***"
@@ -185,9 +164,28 @@ def main() -> int:
         print(f"  {k}={mask(k, v)}")
     skip = sorted(APP_KEYS - set(defines))
     if skip:
-        print("未设置（安装包内为空，手机仍可手动配）:", ", ".join(skip))
-    if "SUPABASE_URL" in env or "SUPABASE_ANON_KEY" in env:
-        print("提示: 已改用 Neon。SUPABASE_* 可删；同步只看 DATABASE_URL。")
+        print("未设置（安装包内为空）:", ", ".join(skip))
+    if not defines.get("SUPABASE_URL") or not defines.get("SUPABASE_ANON_KEY"):
+        print(
+            "警告: 未设置 SUPABASE_URL / SUPABASE_ANON_KEY，App 无法登录与同步。",
+            file=sys.stderr,
+        )
+    if env.get("DATABASE_URL", "").strip():
+        print("提示: DATABASE_URL 仅供 apply_schema.py，不会写入 dart_defines。")
+    llm_keys = (
+        "LLM_API_KEY",
+        "ZHIPU_API_KEY",
+        "BAIDU_LLM_API_KEY",
+        "ASR_API_KEY",
+        "ONE_API_KEY",
+    )
+    baked_llm = [k for k in llm_keys if k in defines]
+    if baked_llm:
+        print(
+            "提示: 仍 bake 了上游 Key（"
+            + ", ".join(baked_llm)
+            + "）；正式分发请改 Edge secrets 并清空这些项。"
+        )
     return 0
 
 

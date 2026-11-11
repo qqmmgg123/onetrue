@@ -38,14 +38,14 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
               children: [
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: const Text('启用收租闹钟与笔记提醒'),
+                  title: const Text('启用闹钟提醒'),
                   subtitle: const Text('只在本 App 排程，不写入系统日历'),
                   value: _settings.enabled,
                   onChanged: (v) => setState(() => _settings.enabled = v),
                 ),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: const Text('收租闹钟时刻'),
+                  title: const Text('提醒时刻'),
                   subtitle: Text(
                     '每天 ${_settings.hour.toString().padLeft(2, '0')}:00',
                   ),
@@ -70,7 +70,7 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
                 ),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: const Text('收租提前几天提醒'),
+                  title: const Text('提前几天提醒'),
                   subtitle: Text('${_settings.advanceDays} 天（另有到期当天与逾期催收）'),
                 ),
                 Slider(
@@ -86,14 +86,14 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 8),
                     child: Text(
-                      '系统未允许精确闹钟，收租与日程提醒可能被推迟。'
+                      '系统未允许精确闹钟，提醒可能被推迟。'
                       '请到系统设置里给「醍醐」打开精确闹钟权限。',
                       style: TextStyle(color: Color(0xFF111111)),
                     ),
                   ),
                 const SizedBox(height: 8),
                 Text(
-                  '收租按未收账期排程；改备忘/日程提醒后，笔记闹钟也会自动重排。',
+                  '改备忘/日程提醒后，闹钟会按笔记自动重排。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
                 const SizedBox(height: 24),

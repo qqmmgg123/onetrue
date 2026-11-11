@@ -3,7 +3,9 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:provider/provider.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'config/baked_env.dart';
 import 'platform_init.dart';
 import 'share/wechat_share.dart';
 import 'state/app_store.dart';
@@ -16,6 +18,13 @@ Future<void> main() async {
     FlutterError.presentError(details);
     debugPrint('FlutterError: ${details.exceptionAsString()}');
   };
+
+  if (BakedEnv.hasSupabase) {
+    await Supabase.initialize(
+      url: BakedEnv.supabaseUrl.trim(),
+      anonKey: BakedEnv.supabaseAnonKey.trim(),
+    );
+  }
 
   initLocalDatabase();
   try {

@@ -8,7 +8,6 @@ import 'format.dart';
 import 'note_reminders_page.dart';
 import 'notes_list_page.dart';
 import 'recent_reads_page.dart';
-import 'rent_dues_page.dart';
 
 /// 底栏「醍醐」：近期笔记 / 近期阅读 / 待办事项。
 class ReminderInboxPage extends StatelessWidget {
@@ -127,25 +126,6 @@ class ReminderInboxPage extends StatelessWidget {
               Navigator.of(context).push(
                 MaterialPageRoute(
                   builder: (_) => const RecentReadsPage(),
-                ),
-              );
-            },
-          ),
-          const Divider(height: 1),
-          _HubRow(
-            title: '未收房源',
-            summary: store.pending.isEmpty
-                ? '暂无未收账期。'
-                : '${store.pending.length} 笔待收 · 最近 ${ymdCn(store.pending.first.period.dueDate)} ${store.pending.first.roomLabel}',
-            timeLabel: '最近到期',
-            timeText: store.pending.isEmpty
-                ? '—'
-                : formatFriendlyWhen(store.pending.first.period.dueDate),
-            actionText: '查看全部',
-            onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => const RentDuesPage(),
                 ),
               );
             },

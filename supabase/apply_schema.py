@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply supabase/schema.sql using Neon DATABASE_URL from env.local."""
+"""Apply supabase/schema.sql using DATABASE_URL from env.local (migrate machine only)."""
 
 from __future__ import annotations
 
@@ -29,14 +29,8 @@ def main() -> None:
     dsn = env.get("DATABASE_URL", "").strip()
     if not dsn:
         raise SystemExit(
-            "请在 supabase/env.local 填写 Neon 的 DATABASE_URL\n"
-            "例: postgresql://user:pass@ep-xxxx.region.aws.neon.tech/neondb?sslmode=require"
-        )
-    if "supabase.co" in dsn:
-        print(
-            "警告: 当前 DATABASE_URL 仍指向 Supabase。"
-            "国内访问 HTTPS/部分链路不稳；建议改成 Neon 连接串。",
-            file=sys.stderr,
+            "请在 supabase/env.local 填写 migrate 用 DATABASE_URL（勿 bake 进 App）\n"
+            "Supabase: Dashboard → Database → Connection string"
         )
 
     sql = SCHEMA.read_text(encoding="utf-8")

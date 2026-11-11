@@ -10,7 +10,6 @@ import 'calendar_page.dart';
 import 'chat_page.dart';
 import 'mine_settings_page.dart';
 import 'note_editor_page.dart';
-import 'property_actions.dart';
 import 'reminder_inbox_page.dart';
 import 'rooms_page.dart';
 
@@ -71,11 +70,6 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
                 title: const Text('新笔记'),
                 onTap: () => Navigator.pop(ctx, 'note'),
               ),
-              ListTile(
-                leading: const Icon(Icons.home_work_outlined),
-                title: const Text('加房源'),
-                onTap: () => Navigator.pop(ctx, 'property'),
-              ),
               const Divider(height: 1),
               ListTile(
                 leading: const Icon(Icons.auto_awesome),
@@ -96,8 +90,6 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
       await Navigator.of(context).push(
         MaterialPageRoute(builder: (_) => const NoteEditorPage()),
       );
-    } else if (choice == 'property') {
-      await showAddPropertyDialog(context);
     } else if (choice == 'ai') {
       await Navigator.of(context).push(
         MaterialPageRoute(builder: (_) => const ChatPage()),

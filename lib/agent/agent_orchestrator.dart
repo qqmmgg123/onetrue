@@ -30,24 +30,13 @@ class AgentOrchestrator {
   final _uuid = const Uuid();
 
   static const systemPrompt = '''
-你是「醍醐」里的全能 AI：可以闲聊、解答问题、帮忙构思与写作；同时能通过 tools 操作本地「房源账本」与「笔记本」双域。
+你是「醍醐」里的全能 AI：可以闲聊、解答问题、帮忙构思与写作；同时能通过 tools 操作用户的笔记本（随笔/备忘/日程/文章）。
 用户像微信一样随便聊；不要要求固定格式。没有对应 tool 的事，用自然语言直接答即可。
-房源账本：
-1. 只能通过提供的 tools 查询或修改本地账本；界面能做的（含改小区名、改房号、删房、删小区、退租、改附加费）都用 tools。
-2. 写操作一般一次只提议一个 tool；但抄表若用户一次报了水+电（或多种），必须用 record_meter_readings 一次录入全部，不要只录一种。
-3. 已设过的水电燃单价要改时，必须用 set_meter_rates（可只改电价或只改水价）；不要用 create_lease。
-4. 抄表可只改上月或只改本月：record_meter_reading 的 previous_reading / current_reading 可只传一个。
-5. 房间已有在租租约时：改房租/附加费/租户/单价用 update_lease、set_lease_extras、add_lease_extra、set_meter_rates，禁止再调 create_lease（会打断旧账）。
-6. 信息可以分多轮慢慢凑齐：结合会话便签和近期对话追问；凑齐再提议执行。租户姓名可选，可不填。
-7. 每月附加费是多项「名称+金额」，用 set_lease_extras / add_lease_extra，不要塞进水电单价。
-8. 本月一次性额外费用（维修、清扫等，只收一次、可多项有名称）用 add_period_fee / remove_period_fee / set_period_fees，不要和每月附加费、优惠搞混；优惠减免用 apply_period_discount。
-9. 本月房租备注（显示在应收列表，不影响金额）用 set_period_remark；清空备注时 remark 传空字符串。
-10. 算账用 preview_rent_bill（未冻结可继续补抄表）；确认出单用 issue_invoice；已冻结要改抄表/优惠/额外费用先 unfreeze_invoice 解除冻结。
-11. 房间不存在时可 auto_create_room=true。不要编造证件号；电话、租户名可空。
-笔记本：
-12. create_note / update_note / list_notes；形态互转 convert_note_kind；多篇整理成文 merge_notes_to_article（默认保留原文）；文章上架 publish_note / 下架 unpublish_note。
-13. 日程重复用 recur_freq/recur_byday/recur_until|recur_count，相对提醒用 remind_offset_min，不要只改单次 schedule_at 冒充重复。
-14. 写操作提议后等用户确认再执行；回复尽量短。
+笔记技能：
+1. 只能通过提供的 tools 查询或修改笔记本；不要假装已改数据。
+2. create_note / update_note / list_notes；形态互转 convert_note_kind；多篇整理成文 merge_notes_to_article（默认保留原文）；文章上架 publish_note / 下架 unpublish_note。
+3. 日程重复用 recur_freq/recur_byday/recur_until|recur_count，相对提醒用 remind_offset_min，不要只改单次 schedule_at 冒充重复。
+4. 写操作提议后等用户确认再执行；回复尽量短。
 ''';
 
   Future<AgentTurnResult> handleTurn({
@@ -56,15 +45,10 @@ class AgentOrchestrator {
     required SessionSticky sticky,
   }) async {
     var nextSticky = mergeStickyFromUtterance(sticky, userText);
-    // 登记槽位已齐却仍挂着 create_lease：清空意图，避免 LLM/本地再次当成「继续登记」
-    if (nextSticky.intent == 'create_lease' &&
-        missingLeaseSlots(nextSticky).isEmpty) {
-      nextSticky.intent = null;
-    }
     final packed = packConversation(
       all: priorMessages,
       system: systemPrompt,
-      inventory: '', // 占位，下面用真实摘要重算展示
+      inventory: '',
       sticky: nextSticky,
       userText: userText,
       model: settings.effectiveChatModel,
@@ -74,7 +58,7 @@ class AgentOrchestrator {
       var reply = await _local.handle(userText, sticky: nextSticky);
       if (runner.store.isGuest && reply.pending != null) {
         reply = AgentReply(
-          text: '游客可以随便聊，但改物业/租约或笔记本需要先注册登录。'
+          text: '游客可以随便聊，但改笔记本需要先注册登录。'
               '点右上角「登录/注册」即可。',
         );
       }
@@ -86,7 +70,7 @@ class AgentOrchestrator {
       if (packed.rolledSummary != null) {
         nextSticky.summary = packed.rolledSummary;
       }
-      final inventory = await _inventoryContext();
+      final inventory = await runner.runRead('list_notes', {});
       final usage = packConversation(
         all: priorMessages,
         system: systemPrompt,
@@ -98,7 +82,6 @@ class AgentOrchestrator {
       return AgentTurnResult(reply: reply, sticky: nextSticky, usage: usage);
     }
 
-    // 抄表/优惠等：本地能稳定解析时不交给大模型（避免只回复「好了」却不出现确认按钮）
     if (runner.store.isLandlord) {
       final direct = await _local.tryDirectWrite(userText, sticky: nextSticky);
       if (direct != null && direct.pending != null) {
@@ -107,7 +90,7 @@ class AgentOrchestrator {
           userText,
           pending: direct.pending,
         );
-        final inventory = await _inventoryContext();
+        final inventory = await runner.runRead('list_notes', {});
         final usage = packConversation(
           all: priorMessages,
           system: systemPrompt,
@@ -146,7 +129,7 @@ class AgentOrchestrator {
         userText,
         pending: fallback.pending,
       );
-      final inventory = await _inventoryContext();
+      final inventory = await runner.runRead('list_notes', {});
       final usage = packConversation(
         all: priorMessages,
         system: systemPrompt,
@@ -181,7 +164,7 @@ class AgentOrchestrator {
     required List<ChatMessage> priorMessages,
     required SessionSticky sticky,
   }) async {
-    final inventory = await _inventoryContext();
+    final inventory = await runner.runRead('list_notes', {});
     final packed = packConversation(
       all: priorMessages,
       system: systemPrompt,
@@ -206,7 +189,7 @@ class AgentOrchestrator {
       return (
         reply: AgentReply(
           text: (result.content == null || result.content!.trim().isEmpty)
-              ? '我再确认一下：可以说房号/租约，或让我「记一下…」「列出笔记」。'
+              ? '可以说得更具体一点，或让我「记一下…」「列出笔记」。'
               : result.content!.trim(),
         ),
         usage: packed.usage,
@@ -214,9 +197,7 @@ class AgentOrchestrator {
       );
     }
 
-    // 多个抄表 tool 合并成一次确认，避免只执行第一个。
-    final mergedMeters = _mergeMeterToolCalls(result.toolCalls);
-    final call = mergedMeters ?? result.toolCalls.first;
+    final call = result.toolCalls.first;
     if (!writeTools.contains(call.name)) {
       final out = await runner.runRead(call.name, call.arguments);
       final prefix = (result.content == null || result.content!.trim().isEmpty)
@@ -232,7 +213,7 @@ class AgentOrchestrator {
     if (runner.store.isGuest) {
       return (
         reply: AgentReply(
-          text: '游客可以随便聊，但改物业/租约或笔记本需要先注册登录。'
+          text: '游客可以随便聊，但改笔记本需要先注册登录。'
               '点右上角「登录/注册」即可。',
         ),
         usage: packed.usage,
@@ -247,61 +228,13 @@ class AgentOrchestrator {
       summary: runner.summarize(call.name, call.arguments),
     );
     final tip = (result.content == null || result.content!.trim().isEmpty)
-        ? '我帮你记好了，确认要执行吗？'
+        ? '确认要执行吗？'
         : result.content!.trim();
     return (
       reply: AgentReply(text: '$tip\n${action.summary}', pending: action),
       usage: packed.usage,
       rolledSummary: packed.rolledSummary,
     );
-  }
-
-  /// 若本轮全是抄表类写操作，合并为 record_meter_readings。
-  LlmToolCall? _mergeMeterToolCalls(List<LlmToolCall> calls) {
-    if (calls.length < 2) return null;
-    final meterOnly = calls.every(
-      (c) =>
-          c.name == 'record_meter_reading' ||
-          c.name == 'record_meter_readings',
-    );
-    if (!meterOnly) return null;
-    final readings = <Map<String, dynamic>>[];
-    String? room;
-    String? property;
-    for (final c in calls) {
-      room ??= c.arguments['room_label']?.toString();
-      property ??= c.arguments['property_name']?.toString();
-      if (c.name == 'record_meter_readings') {
-        final list = c.arguments['readings'];
-        if (list is List) {
-          for (final r in list) {
-            if (r is Map) readings.add(Map<String, dynamic>.from(r));
-          }
-        }
-      } else {
-        readings.add({
-          'kind': c.arguments['kind'],
-          'previous_reading': c.arguments['previous_reading'],
-          'current_reading': c.arguments['current_reading'],
-        });
-      }
-    }
-    if (readings.isEmpty || room == null) return null;
-    return LlmToolCall(
-      name: 'record_meter_readings',
-      arguments: {
-        'room_label': room,
-        if (property != null && property.isNotEmpty) 'property_name': property,
-        'readings': readings,
-      },
-    );
-  }
-
-
-  Future<String> _inventoryContext() async {
-    final housing = await runner.runRead('list_inventory', {});
-    final notes = await runner.runRead('list_notes', {});
-    return '$housing\n\n$notes';
   }
 
   Future<String> confirm(PendingAction action) => runner.commit(action);

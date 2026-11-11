@@ -49,8 +49,8 @@ dependencies:
   fluwx: 4.6.3
   speech_to_text: 6.5.1
   permission_handler: 11.0.1
-  # Neon / Postgres 同步（直连，不走 Supabase REST）
-  postgres: 2.6.3
+  # Supabase Auth + PostgREST（anon key；密钥走 Edge Function）
+  supabase_flutter: ^1.10.25
   crypto: 3.0.3
   video_player: 2.7.2
   image_picker: 1.0.4
