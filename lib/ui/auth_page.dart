@@ -112,7 +112,9 @@ class _AuthPageState extends State<AuthPage> {
         padding: const EdgeInsets.all(24),
         children: [
           Text(
-            _register ? '手机号注册后即可写笔记、上架文章并同步' : '使用注册时的手机号与密码登录',
+            _register
+                ? '手机号注册后即可管理房源与笔记、上架并同步'
+                : '使用注册时的手机号与密码登录',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                   color: Colors.grey.shade700,
                 ),

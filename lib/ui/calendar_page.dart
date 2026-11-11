@@ -5,6 +5,7 @@ import '../domain/models.dart';
 import '../domain/note_recur.dart';
 import '../reminders/reminder_service.dart';
 import '../state/app_store.dart';
+import 'bill_page.dart';
 import 'format.dart';
 import 'note_editor_page.dart';
 
@@ -114,6 +115,15 @@ class _CalendarPageState extends State<CalendarPage> {
     final selectedNotes = notesByDay[_selected] ?? const [];
     final noteAlarms =
         reminders.scheduled.where((a) => a.id >= 800000).toList();
+    final dayDues = store.pending
+        .where((e) => dateOnly(e.period.dueDate) == _selected)
+        .toList();
+    final monthDues = store.pending.where((e) {
+      final d = e.period.dueDate;
+      return d.year == _month.year && d.month == _month.month;
+    }).toList();
+    final rentSectionItems =
+        dayDues.isNotEmpty ? dayDues : (_mode == 'month' ? monthDues : dayDues);
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
@@ -295,6 +305,36 @@ class _CalendarPageState extends State<CalendarPage> {
               },
             ),
           ),
+        if (rentSectionItems.isNotEmpty) ...[
+          const SizedBox(height: 20),
+          Text(
+            dayDues.isNotEmpty
+                ? '${md(_selected)} 的应收'
+                : '${_month.month} 月应收（未收）',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          ...rentSectionItems.take(8).map(
+            (e) => ListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              leading: const Icon(Icons.payments_outlined),
+              title: Text(
+                '${e.roomLabel} · ${formatYuan(e.period.amount)}',
+              ),
+              subtitle: Text(
+                '${ymdCn(e.period.dueDate)} · ${e.propertyName}',
+              ),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => BillPage(periodId: e.period.id),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
         const SizedBox(height: 20),
         Row(
           children: [

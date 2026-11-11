@@ -90,7 +90,7 @@ class LlmClient {
     ];
 
     final preamble = StringBuffer()
-      ..writeln('当前笔记本摘要：')
+      ..writeln('当前账本与笔记本摘要：')
       ..writeln(inventoryContext);
     final stickyBlock = sticky?.toPromptBlock() ?? '';
     if (stickyBlock.isNotEmpty) {
@@ -101,14 +101,14 @@ class LlmClient {
     if (rolledSummary != null && rolledSummary.trim().isNotEmpty) {
       preamble
         ..writeln()
-        ..writeln('更早对话摘要（原文已截断，事实以便签和笔记本为准）：')
+        ..writeln('更早对话摘要（原文已截断，事实以便签、账本和笔记本为准）：')
         ..writeln(rolledSummary);
     }
     preamble
       ..writeln()
       ..writeln(
         '下面是本会话近期对话。用户可能分多句慢慢说，请承接上下文；'
-        '闲聊直接答，笔记读写用 tools。不要要求对方按固定格式重说。',
+        '闲聊直接答；房源账本与笔记读写用 tools。不要要求对方按固定格式重说。',
       )
       ..writeln(
         '历史里标注「已确认执行/已取消」的操作不要重复提议。',

@@ -5,6 +5,7 @@ import '../domain/models.dart';
 import '../state/app_store.dart';
 import '../sync/sync_service.dart';
 import 'format.dart';
+import 'marketplace_listing_page.dart';
 import 'note_quill.dart';
 
 /// 文章详情：初始在详情页；向右滑到作者陋室，向左滑回详情。
@@ -134,15 +135,25 @@ class _AuthorLoushiPane extends StatefulWidget {
   State<_AuthorLoushiPane> createState() => _AuthorLoushiPaneState();
 }
 
-class _AuthorLoushiPaneState extends State<_AuthorLoushiPane> {
+class _AuthorLoushiPaneState extends State<_AuthorLoushiPane>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabs;
   bool _loading = true;
   String? _error;
   List<MarketplaceArticle> _articles = const [];
+  List<MarketplaceListing> _rooms = const [];
 
   @override
   void initState() {
     super.initState();
+    _tabs = TabController(length: 2, vsync: this);
     _load();
+  }
+
+  @override
+  void dispose() {
+    _tabs.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -161,9 +172,16 @@ class _AuthorLoushiPaneState extends State<_AuthorLoushiPane> {
     try {
       final sync = SyncService(db: context.read<AppStore>().db);
       final articles = await sync.fetchListedArticles(ownerId: oid);
+      List<MarketplaceListing> rooms = const [];
+      try {
+        rooms = await sync.fetchListedRoomsByOwner(oid);
+      } catch (_) {
+        rooms = const [];
+      }
       if (!mounted) return;
       setState(() {
         _articles = articles;
+        _rooms = rooms;
         _loading = false;
       });
     } catch (e) {
@@ -184,14 +202,33 @@ class _AuthorLoushiPaneState extends State<_AuthorLoushiPane> {
           icon: const Icon(Icons.arrow_back),
           onPressed: widget.onBackToArticle,
         ),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(40),
+          child: TabBar(
+            controller: _tabs,
+            tabs: const [
+              Tab(height: 36, text: '文章'),
+              Tab(height: 36, text: '房源'),
+            ],
+          ),
+        ),
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _error != null
               ? Center(child: Text(_error!))
-              : RefreshIndicator(
-                  onRefresh: _load,
-                  child: _articleList(),
+              : TabBarView(
+                  controller: _tabs,
+                  children: [
+                    RefreshIndicator(
+                      onRefresh: _load,
+                      child: _articleList(),
+                    ),
+                    RefreshIndicator(
+                      onRefresh: _load,
+                      child: _roomList(),
+                    ),
+                  ],
                 ),
     );
   }
@@ -225,6 +262,43 @@ class _AuthorLoushiPaneState extends State<_AuthorLoushiPane> {
             Navigator.of(context).push(
               MaterialPageRoute(
                 builder: (_) => MarketplaceArticlePage(article: a),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _roomList() {
+    if (_rooms.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: const [
+          SizedBox(height: 80),
+          Center(child: Text('这位作者还没有上架房源')),
+        ],
+      );
+    }
+    return ListView.separated(
+      physics: const AlwaysScrollableScrollPhysics(),
+      itemCount: _rooms.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (context, i) {
+        final L = _rooms[i];
+        final sub = [
+          if (L.city.isNotEmpty) L.city,
+          if (L.address.isNotEmpty) L.address,
+          if (L.hasVideo) '有视频',
+        ].join(' · ');
+        return ListTile(
+          leading: Icon(L.hasVideo ? Icons.videocam : Icons.apartment),
+          title: Text('${L.propertyName} · ${L.roomLabel}'),
+          subtitle: Text(sub.isEmpty ? '已上架' : sub),
+          onTap: () {
+            Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => MarketplaceListingPage(listing: L),
               ),
             );
           },
