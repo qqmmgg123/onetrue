@@ -6,12 +6,13 @@ App 通过 **Supabase Auth（邮箱 OTP）** 登录，用 **PostgREST + RLS** �
 ## 步骤
 
 1. 在 [supabase.com](https://supabase.com) 新建项目，区域选 **Singapore**（或就近）
-2. Authentication → Providers → **Email** 开启；建议用 OTP / magic link（关闭强制密码亦可）
+2. Authentication → Providers → **Email** 开启；注册需邮箱确认时打开 Confirm email + OTP  
+   - **国内收信/短信**：见 [`AUTH_CN.md`](./AUTH_CN.md)（阿里云邮件推送 / 腾讯云 SES；短信可选）
 3. 复制 Project URL、`anon` `public` key 到 `supabase/env.local`：
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
 4. Database → 连接串（migrate 机）填 `DATABASE_URL`（**不要** bake 进 App）
-5. 建表 + RLS：
+5. 建表 + RLS（含 notes / 社交 / feedback）：
    ```powershell
    python supabase/apply_schema.py
    ```

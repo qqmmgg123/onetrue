@@ -209,18 +209,22 @@ class ReminderService {
       }
       final fires = <DateTime>[];
       if (note.kind == kNoteKindSchedule && note.scheduleAt != null) {
+        // remindOffsetMin < 0：明确不提醒
+        if (note.remindOffsetMin < 0) {
+          continue;
+        }
         final occ = expandOccurrences(
           note,
           from: now.subtract(const Duration(days: 1)),
           to: horizon,
         );
-        final offset =
-            note.remindOffsetMin < 0 ? 0 : note.remindOffsetMin;
+        final offset = note.remindOffsetMin;
         for (final start in occ) {
           fires.add(start.subtract(Duration(minutes: offset)));
         }
       } else {
-        final when = note.remindAt ?? note.scheduleAt;
+        // 备忘：仅 remindAt；无提醒则跳过（不再回退到 scheduleAt）
+        final when = note.remindAt;
         if (when != null) {
           fires.add(when.isUtc ? when.toLocal() : when);
         }

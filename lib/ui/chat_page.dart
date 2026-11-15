@@ -1295,7 +1295,7 @@ class _ChatPageState extends State<ChatPage> {
           if (_listening || _transcribing) _voicePulse(context),
           if (_pendingImage != null)
             Material(
-              color: const Color(0xFF111111),
+              color: const Color(0xFFF4F4F4),
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
                 child: Row(
@@ -1308,19 +1308,19 @@ class _ChatPageState extends State<ChatPage> {
                     Expanded(
                       child: Text(
                         _voiceMode ? '已附图 · 按住说话说明要求后松开' : '已附图 · 写上要求后点发送',
-                        style: const TextStyle(fontSize: 13, color: Colors.white70),
+                        style: const TextStyle(fontSize: 13, color: Color(0xFF666666)),
                       ),
                     ),
                     IconButton(
                       onPressed: _busy ? null : () => setState(() => _pendingImage = null),
-                      icon: const Icon(Icons.close, color: Colors.white70),
+                      icon: const Icon(Icons.close, color: Color(0xFF666666)),
                     ),
                   ],
                 ),
               ),
             ),
           Material(
-            color: const Color(0xFF111111),
+            color: Colors.white,
             child: SafeArea(
               top: false,
               child: Padding(
@@ -1339,15 +1339,20 @@ class _ChatPageState extends State<ChatPage> {
                                 height: 48,
                                 alignment: Alignment.center,
                                 decoration: BoxDecoration(
-                                  color: _listening ? const Color(0xFF333333) : Colors.white,
+                                  color: _listening
+                                      ? const Color(0xFFE0E0E0)
+                                      : const Color(0xFFF7F7F7),
                                   borderRadius: BorderRadius.circular(24),
+                                  border: Border.all(color: const Color(0xFFDDDDDD)),
                                 ),
                                 child: Text(
                                   _listening ? '松开发送…' : '按住说话',
                                   style: TextStyle(
                                     fontSize: 15,
                                     fontWeight: FontWeight.w600,
-                                    color: _listening ? Colors.white : const Color(0xFF111111),
+                                    color: _listening
+                                        ? const Color(0xFF333333)
+                                        : const Color(0xFF111111),
                                   ),
                                 ),
                               ),
@@ -1356,15 +1361,15 @@ class _ChatPageState extends State<ChatPage> {
                               controller: _input,
                               minLines: 1,
                               maxLines: 4,
-                              style: const TextStyle(color: Colors.white, fontSize: 15),
-                              cursorColor: Colors.white,
+                              style: const TextStyle(color: Color(0xFF111111), fontSize: 15),
+                              cursorColor: const Color(0xFF111111),
                               textInputAction: TextInputAction.send,
                               onSubmitted: (_) => _send(),
                               decoration: InputDecoration(
                                 hintText: '随便聊，或说记一下…',
-                                hintStyle: const TextStyle(color: Colors.white54),
+                                hintStyle: const TextStyle(color: Color(0xFF999999)),
                                 filled: true,
-                                fillColor: const Color(0xFF2A2A2A),
+                                fillColor: const Color(0xFFF5F5F5),
                                 border: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(8),
                                   borderSide: BorderSide.none,
@@ -1379,7 +1384,7 @@ class _ChatPageState extends State<ChatPage> {
                       onPressed: _busy || _transcribing ? null : _attachImage,
                       icon: Icon(
                         _pendingImage == null ? Icons.image_outlined : Icons.image,
-                        color: Colors.white70,
+                        color: const Color(0xFF666666),
                       ),
                     ),
                     IconButton(
@@ -1411,13 +1416,19 @@ class _ChatPageState extends State<ChatPage> {
                             },
                       icon: Icon(
                         _voiceMode ? Icons.keyboard_alt_outlined : Icons.mic_none,
-                        color: Colors.white70,
+                        color: const Color(0xFF666666),
                       ),
                     ),
                     if (!_voiceMode)
                       TextButton(
                         onPressed: _busy ? null : _send,
-                        child: const Text('发送', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                        child: const Text(
+                          '发送',
+                          style: TextStyle(
+                            color: Color(0xFF111111),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
                   ],
                 ),

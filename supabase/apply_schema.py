@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply supabase/schema.sql using DATABASE_URL from env.local (migrate machine only)."""
+"""Apply supabase/schema*.sql using DATABASE_URL from env.local."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / "env.local"
-SCHEMA = ROOT / "schema.sql"
+SCHEMAS = [
+    ROOT / "schema.sql",
+    ROOT / "schema_social.sql",
+    ROOT / "schema_feedback.sql",
+    ROOT / "schema_reads.sql",
+]
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -33,7 +38,6 @@ def main() -> None:
             "Supabase: Dashboard → Database → Connection string"
         )
 
-    sql = SCHEMA.read_text(encoding="utf-8")
     try:
         import psycopg2
     except ImportError:
@@ -45,19 +49,23 @@ def main() -> None:
         )
         import psycopg2
 
-    print("连接数据库并执行 schema.sql …")
+    print("连接数据库 …")
     conn = psycopg2.connect(dsn)
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
-            cur.execute(sql)
-        print("OK: schema.sql 已执行完成（Neon/Postgres）")
+            for path in SCHEMAS:
+                if not path.exists():
+                    print(f"SKIP missing {path.name}")
+                    continue
+                print(f"执行 {path.name} …")
+                cur.execute(path.read_text(encoding="utf-8"))
+                print(f"OK: {path.name}")
     finally:
         conn.close()
 
     print()
-    print("下一步：确认 env.local 里 SYNC_OWNER_ID / SYNC_ENABLED，然后:")
-    print("  .\\build_apk.ps1 -Install")
+    print("下一步：打包 .\\build_apk.ps1 -Install")
 
 
 if __name__ == "__main__":

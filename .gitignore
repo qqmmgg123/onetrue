@@ -60,6 +60,12 @@ key.properties
 supabase/env.local
 supabase/dart_defines.json
 
-# Independent web app (https://github.com/qqmmgg123/onetrue-web)
+# Independent web app（醍醐 Web：求索 / 关注 / AI，非房源分享）
 /share-web/
 
+
+# Project-local Gradle home (build_apk.ps1)
+.gradle-user/
+
+supabase/env.local.bak
+supabase/*.bak

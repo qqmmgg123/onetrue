@@ -66,7 +66,7 @@ class AppDatabase {
     final path = p.join(dir.path, 'rent_agent.db');
     _db = await openDatabase(
       path,
-      version: 13,
+      version: 14,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -84,6 +84,7 @@ class AppDatabase {
         await _upgradeToV11(db);
         await _upgradeToV12(db);
         await _upgradeToV13(db);
+        await _upgradeToV14(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) await _upgradeToV2(db);
@@ -98,6 +99,7 @@ class AppDatabase {
         if (oldVersion < 11) await _upgradeToV11(db);
         if (oldVersion < 12) await _upgradeToV12(db);
         if (oldVersion < 13) await _upgradeToV13(db);
+        if (oldVersion < 14) await _upgradeToV14(db);
       },
     );
     return _db!;
@@ -465,6 +467,39 @@ class AppDatabase {
       'ON article_reads(last_read_at DESC)',
     );
   }
+
+  /// 近期阅读按 scope 隔离：guest | userId；游客永不上传云端。
+  Future<void> _upgradeToV14(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS article_reads_v14 (
+        scope TEXT NOT NULL,
+        note_uuid TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        format TEXT NOT NULL DEFAULT 'plain',
+        city TEXT NOT NULL DEFAULT '',
+        owner_id TEXT NOT NULL DEFAULT '',
+        last_read_at TEXT NOT NULL,
+        PRIMARY KEY (scope, note_uuid)
+      )
+    ''');
+    try {
+      await db.execute('''
+        INSERT OR IGNORE INTO article_reads_v14
+          (scope, note_uuid, title, body, format, city, owner_id, last_read_at)
+        SELECT 'guest', note_uuid, title, body, format, city, owner_id, last_read_at
+        FROM article_reads
+      ''');
+    } catch (_) {}
+    await _tryExec(db, 'DROP TABLE IF EXISTS article_reads');
+    await db.execute('ALTER TABLE article_reads_v14 RENAME TO article_reads');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_article_reads_scope_last '
+      'ON article_reads(scope, last_read_at DESC)',
+    );
+  }
+
+  static const String kArticleReadScopeGuest = 'guest';
 
   Future<void> _tryExec(Database db, String sql) async {
     try {
@@ -2327,13 +2362,16 @@ class AppDatabase {
     required String format,
     String city = '',
     String ownerId = '',
+    String scope = kArticleReadScopeGuest,
     DateTime? lastReadAt,
   }) async {
+    final sc = scope.trim().isEmpty ? kArticleReadScopeGuest : scope.trim();
     final at = (lastReadAt ?? DateTime.now()).toUtc().toIso8601String();
     final db = await database;
     await db.insert(
       'article_reads',
       {
+        'scope': sc,
         'note_uuid': noteUuid,
         'title': title,
         'body': body,
@@ -2346,9 +2384,49 @@ class AppDatabase {
     );
   }
 
-  Future<List<ArticleReadRecord>> listArticleReads({int limit = 100}) async {
+  /// 用云端列表覆盖指定用户本机缓存（不碰游客桶）。
+  Future<void> replaceUserArticleReads({
+    required String userId,
+    required List<ArticleReadRecord> items,
+  }) async {
+    final uid = userId.trim();
+    if (uid.isEmpty) return;
+    final db = await database;
+    await db.delete(
+      'article_reads',
+      where: 'scope = ?',
+      whereArgs: [uid],
+    );
+    final batch = db.batch();
+    for (final r in items) {
+      if (r.noteUuid.trim().isEmpty) continue;
+      batch.insert(
+        'article_reads',
+        {
+          'scope': uid,
+          'note_uuid': r.noteUuid,
+          'title': r.title,
+          'body': r.body,
+          'format': r.format,
+          'city': r.city,
+          'owner_id': r.ownerId,
+          'last_read_at': r.lastReadAt.toUtc().toIso8601String(),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+    await batch.commit(noResult: true);
+  }
+
+  Future<List<ArticleReadRecord>> listArticleReads({
+    String scope = kArticleReadScopeGuest,
+    int limit = 100,
+  }) async {
+    final sc = scope.trim().isEmpty ? kArticleReadScopeGuest : scope.trim();
     final rows = await (await database).query(
       'article_reads',
+      where: 'scope = ?',
+      whereArgs: [sc],
       orderBy: 'last_read_at DESC',
       limit: limit,
     );
@@ -2366,8 +2444,10 @@ class AppDatabase {
     }).toList();
   }
 
-  Future<ArticleReadRecord?> latestArticleRead() async {
-    final list = await listArticleReads(limit: 1);
+  Future<ArticleReadRecord?> latestArticleRead({
+    String scope = kArticleReadScopeGuest,
+  }) async {
+    final list = await listArticleReads(scope: scope, limit: 1);
     return list.isEmpty ? null : list.first;
   }
 }

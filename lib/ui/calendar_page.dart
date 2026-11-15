@@ -15,14 +15,16 @@ class CalendarPage extends StatefulWidget {
   State<CalendarPage> createState() => _CalendarPageState();
 }
 
-class _CalendarPageState extends State<CalendarPage> {
+class _CalendarPageState extends State<CalendarPage>
+    with SingleTickerProviderStateMixin {
   static const _hourStart = 6;
   static const _hourEnd = 23;
 
   late DateTime _month;
   late DateTime _selected;
-  /// month | three
-  String _mode = 'month';
+  /// three | month — 默认三日在前
+  String _mode = 'three';
+  late final TabController _modeTab;
   late final PageController _monthPage;
   late final PageController _threePage;
   static const _monthBase = 120;
@@ -34,12 +36,48 @@ class _CalendarPageState extends State<CalendarPage> {
     final today = dateOnly(DateTime.now());
     _month = DateTime(today.year, today.month);
     _selected = today;
+    _modeTab = TabController(length: 2, vsync: this, initialIndex: 0);
+    _modeTab.addListener(_onModeTab);
     _monthPage = PageController(initialPage: _monthBase);
     _threePage = PageController(initialPage: _threeBase);
   }
 
+  void _onModeTab() {
+    if (_modeTab.indexIsChanging) return;
+    final next = _modeTab.index == 0 ? 'three' : 'month';
+    if (next == _mode) return;
+    _applyMode(next);
+  }
+
+  void _applyMode(String next) {
+    setState(() => _mode = next);
+    if (next == 'three') {
+      final today = dateOnly(DateTime.now());
+      final delta = dateOnly(_selected).difference(today).inDays;
+      final page = _threeBase + (delta / 3).round();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_threePage.hasClients) {
+          _threePage.jumpToPage(page);
+        }
+      });
+    } else {
+      final today = dateOnly(DateTime.now());
+      final base = DateTime(today.year, today.month);
+      final page = _monthBase +
+          (_month.year - base.year) * 12 +
+          (_month.month - base.month);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_monthPage.hasClients) {
+          _monthPage.jumpToPage(page);
+        }
+      });
+    }
+  }
+
   @override
   void dispose() {
+    _modeTab.removeListener(_onModeTab);
+    _modeTab.dispose();
     _monthPage.dispose();
     _threePage.dispose();
     super.dispose();
@@ -125,37 +163,17 @@ class _CalendarPageState extends State<CalendarPage> {
           style: Theme.of(context).textTheme.titleLarge,
         ),
         const SizedBox(height: 4),
-        SegmentedButton<String>(
-          segments: const [
-            ButtonSegment(value: 'month', label: Text('月历')),
-            ButtonSegment(value: 'three', label: Text('三日')),
-          ],
-          selected: {_mode},
-          onSelectionChanged: (s) {
-            final next = s.first;
-            setState(() => _mode = next);
-            if (next == 'three') {
-              final today = dateOnly(DateTime.now());
-              final delta = dateOnly(_selected).difference(today).inDays;
-              final page = _threeBase + (delta / 3).round();
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (_threePage.hasClients) {
-                  _threePage.jumpToPage(page);
-                }
-              });
-            } else {
-              final today = dateOnly(DateTime.now());
-              final base = DateTime(today.year, today.month);
-              final page = _monthBase +
-                  (_month.year - base.year) * 12 +
-                  (_month.month - base.month);
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (_monthPage.hasClients) {
-                  _monthPage.jumpToPage(page);
-                }
-              });
-            }
-          },
+        // 下划线 Tab（与求索雅集/陋室同款）；不用 TabBarView，避免与日历左右滑冲突
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TabBar(
+            controller: _modeTab,
+            isScrollable: true,
+            tabs: const [
+              Tab(height: 36, text: '三日'),
+              Tab(height: 36, text: '月历'),
+            ],
+          ),
         ),
         const SizedBox(height: 8),
         Text(

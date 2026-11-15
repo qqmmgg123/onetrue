@@ -35,8 +35,10 @@ class AgentOrchestrator {
 笔记技能：
 1. 只能通过提供的 tools 查询或修改笔记本；不要假装已改数据。
 2. create_note / update_note / list_notes；形态互转 convert_note_kind；多篇整理成文 merge_notes_to_article（默认保留原文）；文章上架 publish_note / 下架 unpublish_note。
-3. 日程重复用 recur_freq/recur_byday/recur_until|recur_count，相对提醒用 remind_offset_min，不要只改单次 schedule_at 冒充重复。
-4. 写操作提议后等用户确认再执行；回复尽量短。
+3. 写文章/整理文章时 body 必须是完整纯文本正文（不要只写标题；不要 Markdown 代码块或 JSON）。
+4. 日程重复用 recur_freq/recur_byday/recur_until|recur_count；remind_offset_min 为相对提醒（-1=不提醒）；备忘用 remind_at，禁止设为过去的时间，不提醒则不传。
+5. 用户只要把正文「贴到对话里/发给我看」时，用自然语言回复正文，不要为此调用写工具。
+6. 写操作提议后等用户确认再执行；回复尽量短。
 ''';
 
   Future<AgentTurnResult> handleTurn({

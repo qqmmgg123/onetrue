@@ -41,6 +41,9 @@ class VoiceDictation extends ChangeNotifier {
   /// 有声之后连续静音多久切一段（毫秒）。
   static const _silenceMs = 1100;
 
+  /// 开麦后若一直没检测到说话，自动关麦。
+  static const _idleNoSpeech = Duration(seconds: 5);
+
   /// 单段最长，避免超长文件。
   static const _maxSegment = Duration(seconds: 45);
 
@@ -166,6 +169,9 @@ class VoiceDictation extends ChangeNotifier {
           if (silence >= _silenceMs) {
             if (!tick.isCompleted) tick.complete();
           }
+        } else if (DateTime.now().difference(started) >= _idleNoSpeech) {
+          // 持续闲置无语音 → 结束本段并关麦
+          if (!tick.isCompleted) tick.complete();
         }
         if (DateTime.now().difference(started) >= _maxSegment) {
           if (!tick.isCompleted) tick.complete();
@@ -193,8 +199,10 @@ class VoiceDictation extends ChangeNotifier {
       return;
     }
     if (!heard) {
-      // 还没开口：丢掉空段，继续听
       _delete(file);
+      // 整段都没开口：自动停止听写，避免与键盘长期抢麦
+      onStatus?.call('未检测到说话，已关闭听写');
+      await stop();
       return;
     }
 

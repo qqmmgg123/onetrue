@@ -1,9 +1,9 @@
 # Bake supabase/env.local into APK, then build release.
 # Usage:  .\build_apk.ps1
 #         .\build_apk.ps1 -Install
-#         .\build_apk.ps1 -Publish -Changelog "修复七牛上传"
-#         .\build_apk.ps1 -Install -Publish -Changelog "……"
-# 默认强制更新；若允许跳过加 -AllowSkip
+#         .\build_apk.ps1 -Publish -Changelog "fix qiniu upload"
+#         .\build_apk.ps1 -Install -Publish -Changelog "..."
+# Default: force publish update; add -AllowSkip to allow skip
 
 param(
     [switch]$Install,
@@ -15,9 +15,47 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# Isolate Gradle home: user ~/.gradle often hits Binary store / registry.bin / jar locks on Windows
+$env:GRADLE_USER_HOME = Join-Path $PSScriptRoot ".gradle-user"
+New-Item -ItemType Directory -Force -Path $env:GRADLE_USER_HOME | Out-Null
+Write-Host "==> GRADLE_USER_HOME=$env:GRADLE_USER_HOME" -ForegroundColor DarkGray
+
 Write-Host "==> bake env.local -> dart_defines.json" -ForegroundColor Cyan
 python tool/bake_env.py
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# supabase_flutter -> sign_in_with_apple defaults compileSdk 28; machine may lack android-28
+# Must write UTF-8 without BOM or Gradle reports Unexpected character: '?'
+$appleGradle = Join-Path $env:LOCALAPPDATA "Pub\Cache\hosted\pub.dev"
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+Get-ChildItem $appleGradle -Directory -Filter "sign_in_with_apple-*" -ErrorAction SilentlyContinue | ForEach-Object {
+    $g = Join-Path $_.FullName "android\build.gradle"
+    if (Test-Path $g) {
+        $bytes = [System.IO.File]::ReadAllBytes($g)
+        $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+        $raw = [System.IO.File]::ReadAllText($g).TrimStart([char]0xFEFF)
+        $patched = $false
+        if ($raw -match 'compileSdkVersion\s+28') {
+            $raw = $raw -replace 'compileSdkVersion\s+28', 'compileSdkVersion 34'
+            $patched = $true
+            Write-Host "note: $($_.Name) compileSdkVersion 28->34" -ForegroundColor DarkYellow
+        }
+        if ($hasBom -or $patched) {
+            [System.IO.File]::WriteAllText($g, $raw, $utf8NoBom)
+            if ($hasBom) { Write-Host "note: stripped UTF-8 BOM from $($_.Name) build.gradle" -ForegroundColor DarkYellow }
+        }
+    }
+}
+
+Write-Host "==> gradle --stop (best effort)" -ForegroundColor Cyan
+Push-Location (Join-Path $PSScriptRoot "android")
+try { & .\gradlew.bat --stop 2>$null | Out-Null } catch {}
+Pop-Location
+# Also stop any daemon still tied to the old user home
+$oldTmp = Join-Path $env:USERPROFILE ".gradle\.tmp"
+if (Test-Path $oldTmp) {
+    Remove-Item -Recurse -Force $oldTmp -ErrorAction SilentlyContinue
+}
 
 $defines = Join-Path $PSScriptRoot "supabase\dart_defines.json"
 Write-Host "==> flutter build apk --release" -ForegroundColor Cyan

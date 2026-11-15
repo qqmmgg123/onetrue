@@ -5,6 +5,7 @@ import 'package:flutter_quill/flutter_quill.dart' hide Text;
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 
+import '../domain/ai_text.dart';
 import '../domain/models.dart';
 import '../domain/note_recur.dart';
 import '../domain/note_title.dart';
@@ -52,6 +53,10 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   bool _listed = false;
   bool _loading = true;
   bool _saving = false;
+  /// 进入页 / 成功保存后的指纹；未改动则跳过落库。
+  String? _baselineFingerprint;
+  bool _voiceInserting = false;
+  final _micKey = GlobalKey<NoteMicButtonState>();
   Note? _existing;
   late String _aiRefKey;
   late bool _aiExpanded;
@@ -66,6 +71,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   void initState() {
     super.initState();
     _quill = QuillController.basic();
+    _quill.addListener(_onQuillDocChanged);
+    _titleCtrl.addListener(_onKeyboardSideEdit);
     _aiRefKey = 'draft:${const Uuid().v4()}';
     final ik = widget.initialKind?.trim();
     if (ik != null && ik.isNotEmpty) {
@@ -87,6 +94,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   Future<void> _load() async {
     if (widget.noteId == null) {
       setState(() => _loading = false);
+      _captureBaseline();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _editorFocus.requestFocus();
       });
@@ -102,11 +110,13 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       if (n.uuid.isNotEmpty) {
         _aiRefKey = n.uuid;
       }
+      _quill.removeListener(_onQuillDocChanged);
       _quill.dispose();
       _quill = QuillController(
         document: documentFromBody(n.body, format: n.format),
         selection: const TextSelection.collapsed(offset: 0),
       );
+      _quill.addListener(_onQuillDocChanged);
       _scheduleAt = n.scheduleAt?.toLocal();
       _remindAt = n.remindAt?.toLocal();
       _recurFreq = normalizeRecurFreq(n.recurFreq);
@@ -122,22 +132,72 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         _recurEndMode = 'never';
       }
       if (n.kind == kNoteKindSchedule) {
-        _remindOffsetMin = n.remindOffsetMin > 0
-            ? n.remindOffsetMin
-            : offsetMinFromRemind(_scheduleAt, _remindAt);
-        _remindAt = remindAtFromOffset(_scheduleAt, _remindOffsetMin);
+        if (n.remindOffsetMin < 0) {
+          _remindOffsetMin = -1;
+          _remindAt = null;
+        } else {
+          _remindOffsetMin = n.remindOffsetMin > 0
+              ? n.remindOffsetMin
+              : (n.remindAt == null
+                  ? 0
+                  : offsetMinFromRemind(_scheduleAt, _remindAt));
+          if (_remindOffsetMin < 0) {
+            _remindAt = null;
+          } else {
+            _remindAt = remindAtFromOffset(_scheduleAt, _remindOffsetMin);
+          }
+        }
       }
       _listed = n.isListed;
       _cityCtrl.text = n.city;
     }
     setState(() => _loading = false);
+    _captureBaseline();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _editorFocus.requestFocus();
     });
   }
 
+  void _captureBaseline() {
+    _baselineFingerprint = _contentFingerprint();
+  }
+
+  String _contentFingerprint() {
+    return jsonEncode({
+      'kind': _kind,
+      'title': _titleCtrl.text,
+      'body': bodyToStorage(_quill),
+      'schedule_at': _scheduleAt?.toIso8601String(),
+      'remind_at': _remindAt?.toIso8601String(),
+      'recur_freq': _recurFreq,
+      'recur_byday': _recurByday,
+      'recur_until': _recurUntil?.toIso8601String(),
+      'recur_count': _recurCount,
+      'recur_end': _recurEndMode,
+      'remind_offset_min': _remindOffsetMin,
+      'listed': _listed,
+      'city': _cityCtrl.text.trim(),
+    });
+  }
+
+  bool get _isDirty {
+    final base = _baselineFingerprint;
+    if (base == null) return true;
+    return _contentFingerprint() != base;
+  }
+
+  void _onQuillDocChanged() => _onKeyboardSideEdit();
+
+  void _onKeyboardSideEdit() {
+    // 键盘编辑时自动关掉听写，避免语音与键盘抢输入
+    if (_voiceInserting) return;
+    _micKey.currentState?.stopIfActive();
+  }
+
   @override
   void dispose() {
+    _quill.removeListener(_onQuillDocChanged);
+    _titleCtrl.removeListener(_onKeyboardSideEdit);
     _titleCtrl.dispose();
     _cityCtrl.dispose();
     _recurCountCtrl.dispose();
@@ -213,6 +273,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
   Future<void> _pickRemindOffset() async {
     const presets = <(String, int)>[
+      ('不提醒', -1),
       ('日程开始时', 0),
       ('提前 5 分钟', 5),
       ('提前 10 分钟', 10),
@@ -240,7 +301,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
               ),
               ListTile(
                 title: const Text('自定义…'),
-                onTap: () => Navigator.pop(ctx, -1),
+                onTap: () => Navigator.pop(ctx, -2),
               ),
             ],
           ),
@@ -248,6 +309,13 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       },
     );
     if (!mounted || picked == null) return;
+    if (picked == -1) {
+      setState(() {
+        _remindOffsetMin = -1;
+        _remindAt = null;
+      });
+      return;
+    }
     if (picked >= 0) {
       setState(() {
         _remindOffsetMin = picked;
@@ -332,12 +400,17 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     var index = sel.isValid ? sel.baseOffset : docLen - 1;
     if (index < 0) index = 0;
     if (index > docLen - 1) index = docLen - 1;
-    _quill.replaceText(
-      index,
-      0,
-      t,
-      TextSelection.collapsed(offset: index + t.length),
-    );
+    _voiceInserting = true;
+    try {
+      _quill.replaceText(
+        index,
+        0,
+        t,
+        TextSelection.collapsed(offset: index + t.length),
+      );
+    } finally {
+      _voiceInserting = false;
+    }
     if (mounted) setState(() {});
   }
 
@@ -382,8 +455,17 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         final raw = args['remind_at'];
         if (raw == null || '$raw'.trim().isEmpty) {
           _remindAt = null;
+          if (_kind == kNoteKindMemo) {
+            // 备忘清空提醒
+          } else if (_kind == kNoteKindSchedule) {
+            _remindOffsetMin = -1;
+          }
         } else {
-          _remindAt = DateTime.tryParse('$raw')?.toLocal();
+          final parsed = sanitizeFutureRemind(DateTime.tryParse('$raw')?.toLocal());
+          _remindAt = parsed;
+          if (parsed == null && _kind == kNoteKindSchedule) {
+            _remindOffsetMin = -1;
+          }
         }
       }
       if (args.containsKey('recur_freq')) {
@@ -440,13 +522,28 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       if (args.containsKey('remind_offset_min')) {
         final o = args['remind_offset_min'];
         final m = o is int ? o : int.tryParse('$o') ?? 0;
-        _remindOffsetMin = m < 0 ? 0 : m;
+        // <0：不提醒；否则为提前分钟数
+        _remindOffsetMin = m < 0 ? -1 : m;
         if (_kind == kNoteKindSchedule) {
           _remindAt = remindAtFromOffset(_scheduleAt, _remindOffsetMin);
         }
       } else if (_kind == kNoteKindSchedule &&
           args.containsKey('schedule_at')) {
         _remindAt = remindAtFromOffset(_scheduleAt, _remindOffsetMin);
+      }
+      if (_kind == kNoteKindMemo && _remindAt != null) {
+        _remindAt = sanitizeFutureRemind(_remindAt);
+      }
+      if (_kind == kNoteKindSchedule &&
+          _remindAt != null &&
+          _remindOffsetMin >= 0) {
+        final fixed = sanitizeFutureRemind(_remindAt);
+        if (fixed == null) {
+          _remindOffsetMin = -1;
+          _remindAt = null;
+        } else {
+          _remindAt = fixed;
+        }
       }
       if (args.containsKey('listed')) {
         final v = args['listed'];
@@ -526,8 +623,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     DateTime? schedule = _scheduleAt;
 
     if (_kind == kNoteKindSchedule) {
-      offset = _remindOffsetMin < 0 ? 0 : _remindOffsetMin;
-      remind = schedule == null ? remind : remindAtFromOffset(schedule, offset);
+      offset = _remindOffsetMin < 0 ? -1 : _remindOffsetMin;
+      remind = schedule == null ? null : remindAtFromOffset(schedule, offset);
       if (freq == kRecurWeekly) {
         byday = (_recurByday?.isNotEmpty == true)
             ? _recurByday
@@ -545,7 +642,9 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
           count = null;
         }
       }
-    } else if (_kind != kNoteKindMemo) {
+    } else if (_kind == kNoteKindMemo) {
+      remind = sanitizeFutureRemind(remind);
+    } else {
       schedule = null;
       remind = null;
     }
@@ -615,6 +714,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       } else {
         await runBusy(context, message: '正在保存…', task: task);
       }
+      _captureBaseline();
       return true;
     } catch (e) {
       if (mounted) {
@@ -630,6 +730,10 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   }
 
   Future<void> _save() async {
+    if (!_isDirty) {
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
     final ok = await _persist(strict: true);
     if (ok && mounted) Navigator.of(context).pop();
   }
@@ -642,6 +746,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     if (plain.isEmpty && title.isEmpty && _existing == null) {
       return true;
     }
+    // 相对进入时无任何改动：不写库、不触发同步
+    if (!_isDirty) return true;
     await _persist(strict: false);
     return true;
   }
@@ -851,7 +957,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
           setState(() {});
         },
         replacePlain: (plain) {
-          replaceWithPlain(_quill, plain);
+          replaceWithPlain(_quill, sanitizeAiPlainText(plain));
           setState(() {});
         },
         replaceDelta: (delta) {
@@ -919,11 +1025,21 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                       dense: true,
                       title: const Text('提醒时间'),
                       subtitle: Text(
-                        _remindAt == null ? '未设置' : ymdHm(_remindAt!),
+                        _remindAt == null ? '不提醒' : ymdHm(_remindAt!),
                       ),
-                      trailing: TextButton(
-                        onPressed: () => _pickDateTime(schedule: false),
-                        child: const Text('选择'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_remindAt != null)
+                            TextButton(
+                              onPressed: () => setState(() => _remindAt = null),
+                              child: const Text('不提醒'),
+                            ),
+                          TextButton(
+                            onPressed: () => _pickDateTime(schedule: false),
+                            child: const Text('选择'),
+                          ),
+                        ],
                       ),
                     )
                   else
@@ -933,8 +1049,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
                     dense: true,
-                    title: const Text('上架到市集'),
-                    subtitle: const Text('游客可在市集「文章」浏览'),
+                    title: const Text('上架到雅集'),
+                    subtitle: const Text('游客可在雅集「文章」浏览'),
                     value: _listed,
                     onChanged: (v) => setState(() => _listed = v),
                   ),
@@ -995,7 +1111,10 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                     Positioned(
                       right: 6,
                       bottom: 6,
-                      child: NoteMicButton(onText: _insertVoiceText),
+                      child: NoteMicButton(
+                        key: _micKey,
+                        onText: _insertVoiceText,
+                      ),
                     ),
                   ],
                 ),

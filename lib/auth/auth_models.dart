@@ -4,12 +4,14 @@ class AuthUser {
     required this.email,
     this.phone = '',
     this.displayName = '',
+    this.avatarUrl = '',
   });
 
   final String id;
   final String email;
   final String phone;
   final String displayName;
+  final String avatarUrl;
 
   String get emailMasked {
     final e = email.trim();
@@ -27,11 +29,25 @@ class AuthUser {
     return '${p.substring(0, 3)}****${p.substring(p.length - 4)}';
   }
 
+  AuthUser copyWith({
+    String? displayName,
+    String? avatarUrl,
+    String? phone,
+  }) =>
+      AuthUser(
+        id: id,
+        email: email,
+        phone: phone ?? this.phone,
+        displayName: displayName ?? this.displayName,
+        avatarUrl: avatarUrl ?? this.avatarUrl,
+      );
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'email': email,
         'phone': phone,
         'display_name': displayName,
+        'avatar_url': avatarUrl,
       };
 
   factory AuthUser.fromJson(Map<String, dynamic> j) => AuthUser(
@@ -39,5 +55,6 @@ class AuthUser {
         email: '${j['email'] ?? ''}',
         phone: '${j['phone'] ?? ''}',
         displayName: '${j['display_name'] ?? ''}',
+        avatarUrl: '${j['avatar_url'] ?? ''}',
       );
 }

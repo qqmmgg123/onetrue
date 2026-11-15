@@ -4,12 +4,15 @@ import 'package:provider/provider.dart';
 import '../domain/models.dart';
 import '../domain/note_title.dart';
 import '../state/app_store.dart';
+import 'favorites_page.dart';
+import 'following_feed_page.dart';
 import 'format.dart';
 import 'note_reminders_page.dart';
 import 'notes_list_page.dart';
 import 'recent_reads_page.dart';
+import 'social_inbox_page.dart';
 
-/// 底栏「醍醐」：近期笔记 / 近期阅读 / 待办事项。
+/// 底栏「醍醐」：待办 / 近期笔记 / 阅读 / 关注 / 评论消息。
 class ReminderInboxPage extends StatelessWidget {
   const ReminderInboxPage({super.key});
 
@@ -96,6 +99,27 @@ class ReminderInboxPage extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         children: [
           _HubRow(
+            title: '待办事项',
+            summary: todo == null
+                ? '暂无备忘或日程。'
+                : todo.displayTitle,
+            timeLabel: '提醒时间',
+            timeText: todo == null
+                ? '—'
+                : (todoRemind == null
+                    ? '持久提醒'
+                    : formatFriendlyWhen(todoRemind)),
+            actionText: '查看全部',
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const NoteRemindersPage(),
+                ),
+              );
+            },
+          ),
+          const Divider(height: 1),
+          _HubRow(
             title: '近期笔记',
             summary: latest == null ? '还没有笔记，去「作为」写一篇吧。' : _noteSummary(latest),
             timeLabel: '编辑时间',
@@ -114,11 +138,13 @@ class ReminderInboxPage extends StatelessWidget {
           const Divider(height: 1),
           _HubRow(
             title: '近期阅读',
-            summary: latestRead == null
-                ? '还没有阅读记录，去市集看看文章吧。'
-                : _readSummary(latestRead),
+            summary: store.isGuest
+                ? '登录后才会记录近期阅读。'
+                : (latestRead == null
+                    ? '还没有阅读记录，去雅集看看文章吧。'
+                    : _readSummary(latestRead)),
             timeLabel: '阅读时间',
-            timeText: latestRead == null
+            timeText: store.isGuest || latestRead == null
                 ? '—'
                 : formatFriendlyWhen(latestRead.lastReadAt.toLocal()),
             actionText: '查看全部',
@@ -132,21 +158,45 @@ class ReminderInboxPage extends StatelessWidget {
           ),
           const Divider(height: 1),
           _HubRow(
-            title: '待办事项',
-            summary: todo == null
-                ? '暂无备忘或日程。'
-                : todo.displayTitle,
-            timeLabel: '提醒时间',
-            timeText: todo == null
-                ? '—'
-                : (todoRemind == null
-                    ? '持久提醒'
-                    : formatFriendlyWhen(todoRemind)),
-            actionText: '查看全部',
+            title: '我的收藏',
+            summary: '收藏过的文章',
+            timeLabel: '',
+            timeText: '',
+            actionText: '进入',
             onTap: () {
               Navigator.of(context).push(
                 MaterialPageRoute(
-                  builder: (_) => const NoteRemindersPage(),
+                  builder: (_) => const FavoritesPage(),
+                ),
+              );
+            },
+          ),
+          const Divider(height: 1),
+          _HubRow(
+            title: '留意的人',
+            summary: '查看留意用户最新上架的文章',
+            timeLabel: '',
+            timeText: '',
+            actionText: '进入',
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const FollowingFeedPage(),
+                ),
+              );
+            },
+          ),
+          const Divider(height: 1),
+          _HubRow(
+            title: '评点和回书',
+            summary: '别人评点、回书或推荐你的文章',
+            timeLabel: '',
+            timeText: '',
+            actionText: '进入',
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const SocialInboxPage(),
                 ),
               );
             },

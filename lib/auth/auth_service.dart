@@ -1,10 +1,11 @@
 import 'package:supabase_flutter/supabase_flutter.dart' hide AuthUser;
 
 import '../config/baked_env.dart';
+import '../social/social_api.dart';
 import '../sync/sync_settings.dart';
 import 'auth_models.dart';
 
-/// 邮箱 OTP 鉴权（Supabase Auth）。
+/// 邮箱 OTP / 密码鉴权（Supabase Auth）+ 社交档案。
 class AuthService {
   AuthService._();
   static final AuthService instance = AuthService._();
@@ -17,7 +18,6 @@ class AuthService {
   bool get isGuest => currentUser == null;
   bool get isLandlord => currentUser != null;
 
-  /// 当前会话 JWT（调用 Edge Function 时带上）。
   String? get accessToken {
     if (!BakedEnv.hasSupabase) return null;
     return Supabase.instance.client.auth.currentSession?.accessToken;
@@ -42,14 +42,13 @@ class AuthService {
         currentUser = null;
         return;
       }
-      currentUser = _fromSupabaseUser(user);
+      currentUser = await _hydrateUser(user);
       await SyncSettings.instance.bindOwner(user.id);
     } catch (_) {
       currentUser = null;
     }
   }
 
-  /// 向邮箱发送一次性验证码（sign-in / sign-up 共用）。
   Future<void> sendEmailOtp(String email) async {
     final e = email.trim();
     if (!_emailRe.hasMatch(e)) {
@@ -61,10 +60,98 @@ class AuthService {
     );
   }
 
-  /// 校验邮箱 OTP 并建立会话。
+  /// 注册结果：可能需要邮箱 OTP 确认。
+  /// - [sessionReady] true：已登录
+  /// - [needsOtp] true：等待邮箱验证码
+  Future<({bool sessionReady, bool needsOtp})> signUpWithPassword({
+    required String email,
+    required String password,
+    required String nickname,
+  }) async {
+    final e = email.trim();
+    final p = password.trim();
+    final nick = nickname.trim();
+    if (!_emailRe.hasMatch(e)) {
+      throw StateError('请输入合法邮箱');
+    }
+    if (p.length < 6) {
+      throw StateError('密码至少 6 位');
+    }
+    if (nick.isEmpty) {
+      throw StateError('请填写昵称');
+    }
+    final res = await _client.auth.signUp(
+      email: e,
+      password: p,
+      data: {'display_name': nick, 'full_name': nick},
+    );
+    final session = res.session ?? _client.auth.currentSession;
+    final user = res.user ?? session?.user;
+    if (session != null && user != null && user.id.isNotEmpty) {
+      await SyncSettings.instance.bindOwner(user.id);
+      try {
+        await SocialApi.instance.upsertMyProfile(nickname: nick);
+      } catch (_) {}
+      currentUser = await _hydrateUser(user);
+      return (sessionReady: true, needsOtp: false);
+    }
+    // 开启「Confirm email」时无 session，需验证码
+    return (sessionReady: false, needsOtp: true);
+  }
+
+  Future<void> resendSignupOtp(String email) async {
+    final e = email.trim();
+    if (!_emailRe.hasMatch(e)) {
+      throw StateError('请输入合法邮箱');
+    }
+    await _client.auth.resend(
+      type: OtpType.signup,
+      email: e,
+    );
+  }
+
+  /// 邮箱 + 密码登录；[nickname] 会写入/补全 profiles。
+  Future<AuthUser> signInWithPassword({
+    required String email,
+    required String password,
+    String nickname = '',
+  }) async {
+    final e = email.trim();
+    final p = password.trim();
+    if (!_emailRe.hasMatch(e)) {
+      throw StateError('请输入合法邮箱');
+    }
+    if (p.isEmpty) {
+      throw StateError('请输入密码');
+    }
+    final res = await _client.auth.signInWithPassword(email: e, password: p);
+    final user = res.user ?? _client.auth.currentUser;
+    if (user == null || user.id.isEmpty) {
+      throw StateError('登录失败，请检查邮箱或密码');
+    }
+    await SyncSettings.instance.bindOwner(user.id);
+    final nick = nickname.trim();
+    try {
+      if (nick.isNotEmpty) {
+        await SocialApi.instance.upsertMyProfile(nickname: nick);
+      } else {
+        await SocialApi.instance.ensureProfile(
+          fallbackNickname: _metaName(user),
+        );
+      }
+    } catch (_) {
+      // 档案表未迁移时不阻断登录
+    }
+    final authUser = await _hydrateUser(user);
+    currentUser = authUser;
+    return authUser;
+  }
+
   Future<AuthUser> verifyEmailOtp({
     required String email,
     required String token,
+    String nickname = '',
+    OtpType type = OtpType.signup,
   }) async {
     final e = email.trim();
     final code = token.trim();
@@ -77,16 +164,56 @@ class AuthService {
     final res = await _client.auth.verifyOTP(
       email: e,
       token: code,
-      type: OtpType.email,
+      type: type,
     );
     final user = res.user ?? _client.auth.currentUser;
     if (user == null || user.id.isEmpty) {
       throw StateError('验证失败，请重试');
     }
-    final authUser = _fromSupabaseUser(user);
+    await SyncSettings.instance.bindOwner(user.id);
+    final nick = nickname.trim();
+    try {
+      if (nick.isNotEmpty) {
+        await SocialApi.instance.upsertMyProfile(nickname: nick);
+      } else {
+        await SocialApi.instance.ensureProfile(
+          fallbackNickname: _metaName(user),
+        );
+      }
+    } catch (_) {}
+    final authUser = await _hydrateUser(user);
     currentUser = authUser;
-    await SyncSettings.instance.bindOwner(authUser.id);
     return authUser;
+  }
+
+  Future<void> refreshProfile() async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+    currentUser = await _hydrateUser(user);
+  }
+
+  Future<void> updateNickname(String nickname) async {
+    final n = nickname.trim();
+    if (n.isEmpty) throw StateError('昵称不能为空');
+    final p = await SocialApi.instance.upsertMyProfile(nickname: n);
+    final cur = currentUser;
+    if (cur != null) {
+      currentUser = cur.copyWith(
+        displayName: p.nickname,
+        avatarUrl: p.avatarUrl,
+      );
+    }
+  }
+
+  Future<void> updateAvatarUrl(String url) async {
+    final p = await SocialApi.instance.upsertMyProfile(avatarUrl: url);
+    final cur = currentUser;
+    if (cur != null) {
+      currentUser = cur.copyWith(
+        displayName: p.nickname,
+        avatarUrl: p.avatarUrl,
+      );
+    }
   }
 
   Future<void> logout() async {
@@ -99,15 +226,29 @@ class AuthService {
     await SyncSettings.instance.clearOwner();
   }
 
-  AuthUser _fromSupabaseUser(User user) {
+  String _metaName(User user) {
+    final meta = user.userMetadata ?? const <String, dynamic>{};
+    return '${meta['display_name'] ?? meta['full_name'] ?? ''}'.trim();
+  }
+
+  Future<AuthUser> _hydrateUser(User user) async {
     final meta = user.userMetadata ?? const <String, dynamic>{};
     final phone = '${user.phone ?? meta['phone'] ?? ''}'.trim();
-    final name = '${meta['display_name'] ?? meta['full_name'] ?? ''}'.trim();
+    var name = _metaName(user);
+    var avatar = '';
+    try {
+      final profile = await SocialApi.instance.fetchProfile(user.id);
+      if (profile != null) {
+        if (profile.nickname.trim().isNotEmpty) name = profile.nickname.trim();
+        avatar = profile.avatarUrl.trim();
+      }
+    } catch (_) {}
     return AuthUser(
       id: user.id,
       email: (user.email ?? '').trim(),
       phone: phone,
       displayName: name,
+      avatarUrl: avatar,
     );
   }
 }

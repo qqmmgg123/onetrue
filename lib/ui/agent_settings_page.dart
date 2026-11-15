@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../agent/agent_settings.dart';
 import '../agent/llm_providers.dart';
 import '../config/baked_env.dart';
-import '../sync/sync_settings.dart';
 
 class AgentSettingsPage extends StatefulWidget {
   const AgentSettingsPage({super.key});
@@ -31,11 +29,9 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
   final _asrBaseUrl = TextEditingController();
   final _asrApiKey = TextEditingController();
   final _asrModel = TextEditingController();
-  final _ownerId = TextEditingController();
   String _llmProvider = LlmProviderId.auto;
   bool _useLlm = false;
   bool _useCloudAsr = true;
-  bool _syncEnabled = false;
   bool _loading = true;
   bool _bundled = false;
   bool _showDeepseek = false;
@@ -48,9 +44,7 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
 
   Future<void> _load() async {
     final s = AgentSettings.instance;
-    final sync = SyncSettings.instance;
     await s.load();
-    await sync.load();
     if (!mounted) return;
     setState(() {
       _bundled = BakedEnv.hasBundle;
@@ -74,8 +68,6 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
       _asrModel.text = s.asrModel;
       _useLlm = s.useLlm;
       _useCloudAsr = s.useCloudAsr;
-      _syncEnabled = sync.enabled;
-      _ownerId.text = sync.ownerId;
       _showDeepseek = s.llmProvider == LlmProviderId.deepseek;
       _loading = false;
     });
@@ -100,7 +92,6 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
     _asrBaseUrl.dispose();
     _asrApiKey.dispose();
     _asrModel.dispose();
-    _ownerId.dispose();
     super.dispose();
   }
 
@@ -136,8 +127,8 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
               children: [
                 if (_bundled) ...[
                   Text(
-                    '服务商配置已随安装包内置（打包时来自 supabase/env.local）。\n'
-                    '同步数据库：Neon（直连 Postgres）。手机上只需开关与选择对话厂商。',
+                    '服务商配置已随安装包内置。手机上只需开关与选择对话厂商。\n'
+                    '登录后笔记会自动同步到当前账号。',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                           color: const Color(0xFF666666),
                         ),
@@ -360,47 +351,7 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                     ),
                   ),
                 ],
-                const SizedBox(height: 16),
-                Text('Supabase 同步',
-                    style: Theme.of(context).textTheme.titleSmall),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('启用云端同步'),
-                  subtitle: Text(
-                    BakedEnv.hasSupabase
-                        ? '已配置 SUPABASE_URL / ANON_KEY'
-                        : '未 bake Supabase，请写 env.local 后重新打包',
-                  ),
-                  value: _syncEnabled && BakedEnv.hasSupabase,
-                  onChanged: BakedEnv.hasSupabase
-                      ? (v) => setState(() => _syncEnabled = v)
-                      : null,
-                ),
-                TextField(
-                  controller: _ownerId,
-                  readOnly: true,
-                  decoration: const InputDecoration(
-                    labelText: 'owner_id（登录账号自动绑定）',
-                    helperText: '多端用同一邮箱登录即可同步；游客无 owner',
-                  ),
-                ),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: TextButton.icon(
-                    onPressed: _ownerId.text.trim().isEmpty
-                        ? null
-                        : () {
-                            Clipboard.setData(
-                              ClipboardData(text: _ownerId.text),
-                            );
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('owner_id 已复制')),
-                            );
-                          },
-                    icon: const Icon(Icons.copy, size: 18),
-                    label: const Text('复制 owner_id'),
-                  ),
-                ),
+                const SizedBox(height: 8),
                 Text(
                   '正式版只 bake Supabase URL/anon；LLM/ASR Key 放 Edge secrets，勿打进 APK。',
                   style: Theme.of(context).textTheme.bodySmall,
@@ -429,10 +380,6 @@ class _AgentSettingsPageState extends State<AgentSettingsPage> {
                       oneApiBaseUrl: _oneApiBase.text,
                       oneApiKey: _oneApiKey.text,
                       oneApiModel: _oneApiModel.text,
-                    );
-                    await SyncSettings.instance.save(
-                      enabled: _syncEnabled &&
-                          SyncSettings.instance.ownerId.trim().isNotEmpty,
                     );
                     if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(

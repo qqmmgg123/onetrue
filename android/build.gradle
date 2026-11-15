@@ -1,11 +1,19 @@
 buildscript {
-    ext.kotlin_version = '1.8.22'
+    // 与 Flutter 插件 / stdlib 对齐；勿再用 1.6.x 编译器读 1.8+ metadata
+    ext.kotlin_version = '1.9.22'
     repositories {
-        // 仅用阿里云，避免 dl.google.com 超时拖垮构建
-        maven { url 'https://maven.aliyun.com/repository/google' }
+        // public/central 优先，避免阿里云 google 对 Kotlin 回 502 拖死构建
+        maven { url 'https://maven.aliyun.com/repository/public' }
         maven { url 'https://maven.aliyun.com/repository/central' }
         maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
-        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven {
+            url 'https://maven.aliyun.com/repository/google'
+            content {
+                includeGroupByRegex 'com\\.android.*'
+                includeGroupByRegex 'com\\.google.*'
+                includeGroupByRegex 'androidx.*'
+            }
+        }
     }
 
     dependencies {
@@ -16,10 +24,17 @@ buildscript {
 
 allprojects {
     repositories {
-        maven { url 'https://maven.aliyun.com/repository/google' }
-        maven { url 'https://maven.aliyun.com/repository/central' }
         maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
         maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven {
+            url 'https://maven.aliyun.com/repository/google'
+            content {
+                includeGroupByRegex 'com\\.android.*'
+                includeGroupByRegex 'com\\.google.*'
+                includeGroupByRegex 'androidx.*'
+            }
+        }
     }
 
     configurations.all {
@@ -34,6 +49,19 @@ allprojects {
     }
 }
 
+// 插件自带 kotlin-gradle-plugin 1.6/1.7 时，统一拉到根版本，少下旧包、少踩 metadata
+subprojects { sub ->
+    sub.buildscript {
+        configurations.classpath {
+            resolutionStrategy.eachDependency { details ->
+                if (details.requested.group == 'org.jetbrains.kotlin') {
+                    details.useVersion(rootProject.ext.kotlin_version)
+                    details.because('Align plugin Kotlin to root')
+                }
+            }
+        }
+    }
+}
 
 rootProject.buildDir = '../build'
 subprojects {
@@ -42,7 +70,6 @@ subprojects {
 subprojects {
     project.evaluationDependsOn(':app')
 }
-
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }

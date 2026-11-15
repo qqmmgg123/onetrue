@@ -115,6 +115,8 @@ class MarketplaceArticle {
     this.listedAt,
     this.ownerId = '',
     this.viewCount = 0,
+    this.recommendCount = 0,
+    this.commentCount = 0,
   });
 
   final String noteUuid;
@@ -126,9 +128,28 @@ class MarketplaceArticle {
   final String ownerId;
   /// 他人访问次数（不含作者本人）。
   final int viewCount;
+  final int recommendCount;
+  final int commentCount;
 
   String get displayTitle =>
       title.trim().isNotEmpty ? title.trim() : '无标题文章';
+
+  /// 简易热度：推荐权重最高，其次评论、浏览，再靠谱新鲜度。
+  double get hotScore {
+    final ageHours = listedAt == null
+        ? 24 * 30.0
+        : DateTime.now()
+            .toUtc()
+            .difference(listedAt!.toUtc())
+            .inHours
+            .clamp(0, 24 * 90)
+            .toDouble();
+    final recency = (24 * 14 - ageHours).clamp(0, 24 * 14) / (24 * 14);
+    return recommendCount * 5.0 +
+        commentCount * 3.0 +
+        viewCount * 1.0 +
+        recency * 10.0;
+  }
 }
 
 /// 本机「近期阅读」记录。

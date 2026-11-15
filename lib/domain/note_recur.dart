@@ -34,10 +34,10 @@ bool isRecurringFreq(String? freq) {
 }
 
 /// 将相对偏移写回绝对 remindAt（日程用）。
+/// [offsetMin] < 0 表示不提醒。
 DateTime? remindAtFromOffset(DateTime? scheduleAt, int offsetMin) {
-  if (scheduleAt == null) return null;
-  final off = offsetMin < 0 ? 0 : offsetMin;
-  return scheduleAt.subtract(Duration(minutes: off));
+  if (scheduleAt == null || offsetMin < 0) return null;
+  return scheduleAt.subtract(Duration(minutes: offsetMin));
 }
 
 int offsetMinFromRemind(DateTime? scheduleAt, DateTime? remindAt) {
@@ -47,6 +47,7 @@ int offsetMinFromRemind(DateTime? scheduleAt, DateTime? remindAt) {
 }
 
 String formatRemindOffset(int minutes) {
+  if (minutes < 0) return '不提醒';
   if (minutes <= 0) return '日程开始时';
   if (minutes % (24 * 60) == 0) {
     final d = minutes ~/ (24 * 60);
@@ -57,6 +58,15 @@ String formatRemindOffset(int minutes) {
     return '提前 $h 小时';
   }
   return '提前 $minutes 分钟';
+}
+
+/// 提醒时间若已过去则视为无效（不提醒）。
+DateTime? sanitizeFutureRemind(DateTime? remindAt, {DateTime? now}) {
+  if (remindAt == null) return null;
+  final n = now ?? DateTime.now();
+  final local = remindAt.isUtc ? remindAt.toLocal() : remindAt;
+  if (!local.isAfter(n)) return null;
+  return local;
 }
 
 String formatRecurSummary({

@@ -8,6 +8,7 @@ import '../data/app_database.dart';
 import '../domain/models.dart';
 import '../domain/note_title.dart';
 import '../reminders/reminder_service.dart';
+import '../social/social_api.dart';
 import '../sync/sync_service.dart';
 import '../sync/sync_settings.dart';
 import '../ui/format.dart';
@@ -51,6 +52,12 @@ class AppStore extends ChangeNotifier {
   bool get isGuest => _auth.isGuest;
   AuthUser? get user => _auth.currentUser;
 
+  /// 近期阅读本机桶：仅登录用户的 userId。
+  String get _readsScope {
+    final id = user?.id.trim() ?? '';
+    return id.isEmpty ? AppDatabase.kArticleReadScopeGuest : id;
+  }
+
   Future<void> bootstrap() async {
     loading = true;
     error = null;
@@ -66,6 +73,7 @@ class AppStore extends ChangeNotifier {
       } else {
         // 打开即拉当前用户云端缓存（增量/全量）
         await refreshMyCache();
+        await syncArticleReadsFromCloud();
       }
     } catch (e) {
       error = e.toString();
@@ -123,7 +131,7 @@ class AppStore extends ChangeNotifier {
       properties = [];
       pending = [];
       notes = [];
-      articleReads = await _db.listArticleReads();
+      articleReads = [];
       loading = false;
       error = null;
       notifyListeners();
@@ -133,11 +141,25 @@ class AppStore extends ChangeNotifier {
     properties = await _db.listProperties();
     pending = const [];
     notes = await _db.listNotes();
-    articleReads = await _db.listArticleReads();
+    articleReads = await _db.listArticleReads(scope: _readsScope);
     await _reminders.reschedule(const [], notes: notes);
     loading = false;
     error = null;
     notifyListeners();
+  }
+
+  /// 登录用户：拉云端近期阅读覆盖本机用户缓存；游客跳过。
+  Future<void> syncArticleReadsFromCloud() async {
+    final uid = user?.id.trim() ?? '';
+    if (uid.isEmpty) return;
+    try {
+      final cloud = await SocialApi.instance.fetchMyArticleReads();
+      await _db.replaceUserArticleReads(userId: uid, items: cloud);
+      articleReads = await _db.listArticleReads(scope: uid);
+      notifyListeners();
+    } catch (_) {
+      /* 离线用本机用户缓存 */
+    }
   }
 
   Future<void> refreshMarketplace({String? city}) async {
@@ -181,6 +203,8 @@ class AppStore extends ChangeNotifier {
     }
     await reload();
     await refreshMyCache(forceFull: true);
+    // 不把游客本机阅读迁上云；只拉该账号云端阅读
+    await syncArticleReadsFromCloud();
     notifyListeners();
   }
 
@@ -190,6 +214,7 @@ class AppStore extends ChangeNotifier {
     properties = [];
     pending = [];
     notes = [];
+    articleReads = [];
     notifyListeners();
     await refreshMarketplace();
   }
@@ -312,18 +337,33 @@ class AppStore extends ChangeNotifier {
     await reload();
   }
 
-  /// 打开文章详情时：记本机近期阅读；非作者则远端 +1 访问。
+  /// 打开文章详情：仅登录用户记近期阅读（本机 + 云端）；游客不记。非作者则远端 +1 访问。
   Future<void> recordArticleOpen(MarketplaceArticle article) async {
-    await _db.upsertArticleRead(
-      noteUuid: article.noteUuid,
-      title: article.title,
-      body: article.body,
-      format: article.format,
-      city: article.city,
-      ownerId: article.ownerId,
-    );
-    articleReads = await _db.listArticleReads();
-    notifyListeners();
+    final uid = user?.id.trim() ?? '';
+    if (uid.isNotEmpty) {
+      await _db.upsertArticleRead(
+        noteUuid: article.noteUuid,
+        title: article.title,
+        body: article.body,
+        format: article.format,
+        city: article.city,
+        ownerId: article.ownerId,
+        scope: uid,
+      );
+      articleReads = await _db.listArticleReads(scope: uid);
+      notifyListeners();
+      // ignore: unawaited_futures
+      SocialApi.instance
+          .upsertArticleReadCloud(
+            noteUuid: article.noteUuid,
+            title: article.title,
+            body: article.body,
+            format: article.format,
+            city: article.city,
+            ownerId: article.ownerId,
+          )
+          .catchError((_) {});
+    }
     final viewer = user?.id;
     final owner = article.ownerId.trim();
     if (owner.isNotEmpty && viewer != null && viewer == owner) {

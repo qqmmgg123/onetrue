@@ -19,7 +19,7 @@ class VoiceInputBar extends StatelessWidget {
     this.pendingImage,
     this.onClearImage,
     this.hintText = '随便说…',
-    this.darkChrome = true,
+    this.darkChrome = false,
   });
 
   final VoiceCapture voice;
@@ -131,9 +131,16 @@ class VoiceInputBar extends StatelessWidget {
                               alignment: Alignment.center,
                               decoration: BoxDecoration(
                                 color: voice.listening
-                                    ? const Color(0xFF333333)
-                                    : Colors.white,
+                                    ? (darkChrome
+                                        ? const Color(0xFF333333)
+                                        : const Color(0xFFD8D8D8))
+                                    : (darkChrome
+                                        ? Colors.white
+                                        : Colors.white),
                                 borderRadius: BorderRadius.circular(24),
+                                border: darkChrome
+                                    ? null
+                                    : Border.all(color: const Color(0xFFCCCCCC)),
                               ),
                               child: Text(
                                 voice.listening ? '松开发送…' : '按住说话',
@@ -141,7 +148,9 @@ class VoiceInputBar extends StatelessWidget {
                                   fontSize: 15,
                                   fontWeight: FontWeight.w600,
                                   color: voice.listening
-                                      ? Colors.white
+                                      ? (darkChrome
+                                          ? Colors.white
+                                          : const Color(0xFF333333))
                                       : const Color(0xFF111111),
                                 ),
                               ),
@@ -228,10 +237,10 @@ class NoteMicButton extends StatefulWidget {
   final void Function(String text) onText;
 
   @override
-  State<NoteMicButton> createState() => _NoteMicButtonState();
+  State<NoteMicButton> createState() => NoteMicButtonState();
 }
 
-class _NoteMicButtonState extends State<NoteMicButton> {
+class NoteMicButtonState extends State<NoteMicButton> {
   late final VoiceDictation _dictation;
 
   @override
@@ -252,6 +261,12 @@ class _NoteMicButtonState extends State<NoteMicButton> {
 
   void _onTick() {
     if (mounted) setState(() {});
+  }
+
+  bool get isActive => _dictation.active;
+
+  Future<void> stopIfActive() async {
+    if (_dictation.active) await _dictation.stop();
   }
 
   @override

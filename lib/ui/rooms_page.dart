@@ -1,14 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../auth/auth_service.dart';
 import '../domain/models.dart';
+import '../social/avatar_io.dart';
 import '../state/app_store.dart';
 import 'auth_page.dart';
+import 'busy.dart';
 import 'city_utils.dart';
 import 'marketplace_article_page.dart';
 import 'note_editor_page.dart';
+import 'widgets/user_avatar.dart';
 
-/// 求索：市集 / 陋室，仅文章。
+/// 求索：雅集 / 陋室，仅文章。
 class RoomsPage extends StatefulWidget {
   const RoomsPage({super.key});
 
@@ -69,7 +73,7 @@ class _RoomsPageState extends State<RoomsPage>
           child: TabBar(
             controller: tab,
             tabs: const [
-              Tab(height: 36, text: '市集'),
+              Tab(height: 36, text: '雅集'),
               Tab(height: 36, text: '陋室'),
             ],
           ),
@@ -201,26 +205,87 @@ class _LoushiArticlesBody extends StatelessWidget {
       return tb.compareTo(ta);
     });
 
+  Future<void> _changeAvatar(BuildContext context) async {
+    final uid = AuthService.instance.currentUser?.id ?? '';
+    if (uid.isEmpty) return;
+    try {
+      final url = await pickCropUploadAvatar(context: context, userId: uid);
+      if (url == null || !context.mounted) return;
+      await runBusy(
+        context,
+        message: '更新头像…',
+        task: () => AuthService.instance.updateAvatarUrl(url),
+      );
+      await AuthService.instance.refreshProfile();
+      imageCache.clear();
+      imageCache.clearLiveImages();
+      if (context.mounted) await store.reload();
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('上传失败：$e')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final list = _listedArticles;
+    final user = store.user ?? AuthService.instance.currentUser;
+    final nick = user?.displayName.trim().isNotEmpty == true
+        ? user!.displayName
+        : '我的陋室';
+    final avatar = user?.avatarUrl ?? '';
+
+    Widget header = Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
+      child: Column(
+        children: [
+          GestureDetector(
+            onTap: () => _changeAvatar(context),
+            child: Column(
+              children: [
+                UserAvatar(url: avatar, nickname: nick, radius: 40),
+                const SizedBox(height: 6),
+                const Text(
+                  '点击更换头像',
+                  style: TextStyle(fontSize: 12, color: Color(0xFF888888)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            nick,
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+
     if (list.isEmpty) {
       return RefreshIndicator(
         onRefresh: () => store.reload(),
         child: ListView(
           physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
           children: [
-            const Text(
-              '还没有上架文章。',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 15),
+            header,
+            const Divider(height: 1),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(24, 36, 24, 8),
+              child: Text(
+                '还没有上架文章。',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 15),
+              ),
             ),
-            const SizedBox(height: 8),
-            Text(
-              '在「作为 → 新笔记」写成文章，打开「上架到市集」后会出现在这里。',
-              textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodySmall,
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Text(
+                '在「作为 → 新笔记」写成文章，打开「上架到雅集」后会出现在这里。',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
             ),
             const SizedBox(height: 20),
             Center(
@@ -244,10 +309,11 @@ class _LoushiArticlesBody extends StatelessWidget {
     return RefreshIndicator(
       onRefresh: () => store.reload(),
       child: ListView.separated(
-        itemCount: list.length,
+        itemCount: list.length + 1,
         separatorBuilder: (_, __) => const Divider(height: 1),
         itemBuilder: (context, i) {
-          final n = list[i];
+          if (i == 0) return header;
+          final n = list[i - 1];
           final uid = store.user?.id ?? '';
           return ListTile(
             leading: const Icon(Icons.article_outlined),

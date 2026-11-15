@@ -1,3 +1,4 @@
+import '../domain/ai_text.dart';
 import '../domain/models.dart';
 import '../domain/note_recur.dart';
 import '../state/app_store.dart';
@@ -47,8 +48,10 @@ final List<Map<String, dynamic>> toolSchemas = [
       'name': 'create_note',
       'description':
           '新建一条笔记。kind: note随笔/memo备忘/schedule日程/article文章。'
+          '写文章时 title+body 都要有实质内容；body 用纯文本（不要 Markdown/代码块/JSON）。'
           '日程可设 recur_freq(once|daily|weekly|monthly|yearly)、recur_byday、'
-          'recur_until/recur_count（结束，互斥）、remind_offset_min（提前分钟）',
+          'recur_until/recur_count（结束，互斥）、remind_offset_min（提前分钟，-1=不提醒）。'
+          'remind_at 仅备忘；禁止设为当前时间之前；不提醒则不传或空串。',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -61,7 +64,7 @@ final List<Map<String, dynamic>> toolSchemas = [
           },
           'remind_at': {
             'type': 'string',
-            'description': 'ISO8601 提醒时间（备忘绝对时间）',
+            'description': 'ISO8601 备忘提醒；空或不传=不提醒；须晚于现在',
           },
           'recur_freq': {'type': 'string'},
           'recur_byday': {'type': 'string'},
@@ -151,7 +154,7 @@ final List<Map<String, dynamic>> toolSchemas = [
     'type': 'function',
     'function': {
       'name': 'publish_note',
-      'description': '把文章上架到市集',
+      'description': '把文章上架到雅集',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -166,7 +169,7 @@ final List<Map<String, dynamic>> toolSchemas = [
     'type': 'function',
     'function': {
       'name': 'unpublish_note',
-      'description': '下架市集文章',
+      'description': '下架雅集文章',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -195,9 +198,9 @@ class AgentToolRunner {
       case 'merge_notes_to_article':
         return '整理成文章「${_snip(args['title'] ?? '无标题')}」（保留原文）';
       case 'publish_note':
-        return '上架文章到市集';
+        return '上架文章到雅集';
       case 'unpublish_note':
-        return '下架市集文章';
+        return '下架雅集文章';
       default:
         return '执行 $tool';
     }
@@ -265,11 +268,15 @@ class AgentToolRunner {
     return null;
   }
 
-  DateTime? _parseNoteTs(dynamic raw) {
+  DateTime? _parseNoteTs(dynamic raw, {bool mustBeFuture = false}) {
     if (raw == null) return null;
     final s = '$raw'.trim();
     if (s.isEmpty) return null;
-    return DateTime.tryParse(s);
+    final dt = DateTime.tryParse(s);
+    if (dt == null) return null;
+    final local = dt.isUtc ? dt.toLocal() : dt;
+    if (mustBeFuture) return sanitizeFutureRemind(local);
+    return local;
   }
 
   int? _parseIntArg(dynamic raw) {
@@ -341,12 +348,19 @@ class AgentToolRunner {
     }
 
     int? offset;
-    DateTime? remind = _parseNoteTs(args['remind_at']);
+    DateTime? remind =
+        _parseNoteTs(args['remind_at'], mustBeFuture: true);
     if (args.containsKey('remind_offset_min')) {
       final parsed = _parseIntArg(args['remind_offset_min']) ?? 0;
-      offset = parsed < 0 ? 0 : parsed;
+      // <0：不提醒；否则提前分钟数
+      offset = parsed < 0 ? -1 : parsed;
       if (kind == kNoteKindSchedule || kind == null) {
         remind = remindAtFromOffset(scheduleAt, offset);
+        remind = sanitizeFutureRemind(remind);
+        if (remind == null && offset >= 0 && scheduleAt != null) {
+          // 推算出的提醒已过期 → 改为不提醒
+          offset = -1;
+        }
       }
     }
 
@@ -374,17 +388,20 @@ class AgentToolRunner {
         final k = kind.isEmpty ? kNoteKindNote : kind;
         final scheduleAt = _parseNoteTs(args['schedule_at']);
         final recur = _parseRecurArgs(args, scheduleAt: scheduleAt, kind: k);
+        final remind = recur.remindAt ??
+            _parseNoteTs(args['remind_at'], mustBeFuture: true);
         final id = await store.addNote(
           kind: k,
           title: '${args['title'] ?? ''}'.trim(),
-          body: '${args['body'] ?? ''}',
+          body: sanitizeAiPlainText('${args['body'] ?? ''}'),
           scheduleAt: scheduleAt,
-          remindAt: recur.remindAt ?? _parseNoteTs(args['remind_at']),
+          remindAt: remind,
           recurFreq: recur.recurFreq == kRecurOnce ? '' : recur.recurFreq,
           recurByday: recur.recurByday,
           recurUntil: recur.recurUntil,
           recurCount: recur.recurCount,
-          remindOffsetMin: recur.remindOffsetMin ?? 0,
+          remindOffsetMin: recur.remindOffsetMin ??
+              (k == kNoteKindSchedule && remind == null ? -1 : 0),
         );
         return '已记下${_kindLabel(k)} #$id。';
       case 'update_note':
@@ -401,18 +418,21 @@ class AgentToolRunner {
         await store.saveNote(
           id: note.id,
           title: args.containsKey('title') ? '${args['title']}'.trim() : null,
-          body: args.containsKey('body') ? '${args['body']}' : null,
+          body: args.containsKey('body')
+              ? sanitizeAiPlainText('${args['body']}')
+              : null,
           scheduleAt: args.containsKey('schedule_at') ? scheduleAt : null,
           clearScheduleAt:
               args.containsKey('schedule_at') && scheduleAt == null,
           remindAt: recur.remindAt ??
               (args.containsKey('remind_at')
-                  ? _parseNoteTs(args['remind_at'])
+                  ? _parseNoteTs(args['remind_at'], mustBeFuture: true)
                   : null),
-          clearRemindAt: args.containsKey('remind_at') &&
-              (args['remind_at'] == null ||
-                  '${args['remind_at']}'.trim().isEmpty) &&
-              recur.remindOffsetMin == null,
+          clearRemindAt: (args.containsKey('remind_at') &&
+                  (args['remind_at'] == null ||
+                      '${args['remind_at']}'.trim().isEmpty) &&
+                  recur.remindOffsetMin == null) ||
+              recur.remindOffsetMin == -1,
           recurFreq: args.containsKey('recur_freq')
               ? (recur.recurFreq == kRecurOnce ? '' : recur.recurFreq)
               : null,
@@ -444,8 +464,9 @@ class AgentToolRunner {
           scheduleAt: args.containsKey('schedule_at') ? scheduleAt : null,
           remindAt: recur.remindAt ??
               (args.containsKey('remind_at')
-                  ? _parseNoteTs(args['remind_at'])
+                  ? _parseNoteTs(args['remind_at'], mustBeFuture: true)
                   : null),
+          clearRemindAt: recur.remindOffsetMin == -1,
           recurFreq: args.containsKey('recur_freq')
               ? (recur.recurFreq == kRecurOnce ? '' : recur.recurFreq)
               : null,
@@ -483,7 +504,7 @@ class AgentToolRunner {
           final n = await store.db.noteById(id);
           if (n != null) sources.add(n);
         }
-        final body = '${args['body'] ?? ''}'.trim();
+        final body = sanitizeAiPlainText('${args['body'] ?? ''}');
         if (body.isEmpty) return '整理后的正文不能为空。';
         final newId = await store.addNote(
           kind: kNoteKindArticle,

@@ -8,6 +8,7 @@ import '../update/app_update_banner.dart';
 import 'auth_page.dart';
 import 'calendar_page.dart';
 import 'chat_page.dart';
+import 'contact_feedback_page.dart';
 import 'mine_settings_page.dart';
 import 'note_editor_page.dart';
 import 'reminder_inbox_page.dart';
@@ -116,7 +117,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
               const Divider(height: 1),
               ListTile(
                 leading: const Icon(Icons.support_agent_outlined),
-                title: const Text('客服与联系'),
+                title: const Text('联系与反馈'),
                 onTap: () => Navigator.pop(ctx, 'support'),
               ),
               const SizedBox(height: 8),
@@ -132,7 +133,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
       );
     } else if (choice == 'support') {
       await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const _SupportPlaceholderPage()),
+        MaterialPageRoute(builder: (_) => const ContactFeedbackPage()),
       );
     }
   }
@@ -259,22 +260,3 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
   }
 }
 
-class _SupportPlaceholderPage extends StatelessWidget {
-  const _SupportPlaceholderPage();
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('客服与联系')),
-      body: const Center(
-        child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Text(
-            '联系方式即将上线，敬请期待。',
-            textAlign: TextAlign.center,
-          ),
-        ),
-      ),
-    );
-  }
-}

@@ -159,11 +159,13 @@ class BakedEnv {
 
   /// migrate-only：`apply_schema.py` 用；App 同步不再依赖。
   static const String databaseUrl = String.fromEnvironment('DATABASE_URL');
+  /// @Deprecated 登录后由 Auth 绑定；勿再手工 bake。
   static const String syncOwnerId = String.fromEnvironment('SYNC_OWNER_ID');
+  /// @Deprecated 登录成功即启用同步；保留编译兼容。
   static const bool syncEnabled =
-      bool.fromEnvironment('SYNC_ENABLED', defaultValue: false);
+      bool.fromEnvironment('SYNC_ENABLED', defaultValue: true);
 
-  // —— 七牛云房间视频（优先，国内更快）——
+  // —— 七牛 / R2（历史房间视频；市集已改为文章，可逐步停用）——
   static const String qiniuAccessKey =
       String.fromEnvironment('QINIU_ACCESS_KEY');
   static const String qiniuSecretKey =

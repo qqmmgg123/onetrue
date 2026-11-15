@@ -138,17 +138,22 @@ class SyncService {
     try {
       tip('上传…');
       final ordered = _orderedUnique(noteRefs);
+      var failed = 0;
       for (final ref in ordered) {
         if (_aborted) break;
         tip('上传笔记…');
-        final ok = await _upsertLocalById(ref.id);
-        if (ok) {
+        // 1=已推 0=LWW跳过（远程不旧） -1=失败
+        final code = await _upsertLocalById(ref.id);
+        if (code > 0) {
           report.pushed++;
+        } else if (code == 0) {
+          report.skipped++;
         } else {
+          failed++;
           report.skipped++;
         }
       }
-      if (report.pushed == 0 && report.skipped > 0) {
+      if (failed > 0 && report.pushed == 0) {
         report.error = '部分数据未能上传，请稍后重试';
       }
       tip('上传完成');
@@ -196,18 +201,54 @@ class SyncService {
     return list;
   }
 
-  Future<bool> _upsertLocalById(int localId) async {
+  /// 比较 updated_at：正数表示 a 更新。
+  int _cmpUpdated(Object? a, Object? b) {
+    final da = DateTime.tryParse('${_normalizeRemote(a) ?? ''}');
+    final db = DateTime.tryParse('${_normalizeRemote(b) ?? ''}');
+    if (da == null && db == null) return 0;
+    if (da == null) return -1;
+    if (db == null) return 1;
+    return da.toUtc().compareTo(db.toUtc());
+  }
+
+  /// 按 uuid 上传；远程已更新且不旧于本地则跳过，避免归户/离线把远端新数据打旧。
+  /// 返回：1 已推送，0 跳过（远程更新或不需传），-1 失败。
+  Future<int> _upsertLocalById(int localId) async {
     final rows = await (await _db.database).query(
       'notes',
       where: 'id = ?',
       whereArgs: [localId],
       limit: 1,
     );
-    if (rows.isEmpty) return false;
+    if (rows.isEmpty) return -1;
     final payload = await _toRemotePayload(rows.first);
-    if (payload == null) return false;
+    if (payload == null) return -1;
+    final uuid = '${payload['id']}';
+    final localUpdated = payload['updated_at'];
+
+    try {
+      final remote = await _client
+          .from('notes')
+          .select()
+          .eq('id', uuid)
+          .maybeSingle();
+      if (remote != null) {
+        final remoteUpdated = remote['updated_at'];
+        // 远程 >= 本地：保留远程，并回写本地缓存（防重复/混乱）
+        if (_cmpUpdated(remoteUpdated, localUpdated) >= 0) {
+          await _applyRemoteRow(
+            Map<String, dynamic>.from(remote),
+            force: true,
+          );
+          return 0;
+        }
+      }
+    } catch (e) {
+      debugPrint('upsert LWW check failed for $uuid: $e');
+    }
+
     await _client.from('notes').upsert(payload);
-    return true;
+    return 1;
   }
 
   Future<int> _pullRemote({
@@ -312,11 +353,22 @@ class SyncService {
     return true;
   }
 
-  /// 远程覆盖本地缓存（服务端权威）。
-  Future<bool> _applyRemoteRow(Map<String, dynamic> remote) async {
+  /// 拉取远程行：默认 LWW（本地更新则跳过）；[force] 用于推送冲突时强制对齐远程。
+  Future<bool> _applyRemoteRow(
+    Map<String, dynamic> remote, {
+    bool force = false,
+  }) async {
     final uuid = '${remote['id']}';
     final remoteUpdated = '${_normalizeRemote(remote['updated_at'])}';
     final local = await _db.rowByUuid('notes', uuid);
+
+    if (!force && local != null) {
+      final localUpdated = local['updated_at'];
+      // 本地严格更新 → 保留本地，等下次推送；同版本跳过避免无意义写库
+      if (_cmpUpdated(localUpdated, remoteUpdated) >= 0) {
+        return false;
+      }
+    }
 
     final sourceRaw = remote['source_note_uuids'];
     final sourceStr = sourceRaw is String
@@ -342,9 +394,9 @@ class SyncService {
         'recur_until': remote['recur_until'] == null
             ? null
             : _normalizeRemote(remote['recur_until']),
-        'recur_count': remote['recur_count'],
-        'remind_offset_min': remote['remind_offset_min'] ?? 0,
-        'listing_status': remote['listing_status'] ?? 'draft',
+        'deleted_at': remote['deleted_at'] == null
+            ? null
+            : _normalizeRemote(remote['deleted_at']),
         'listed_at': remote['listed_at'] == null
             ? null
             : _normalizeRemote(remote['listed_at']),
@@ -353,9 +405,9 @@ class SyncService {
         'sort_order': remote['sort_order'] ?? 0,
         'source_note_uuids': sourceStr,
         'updated_at': remoteUpdated,
-        'deleted_at': remote['deleted_at'] == null
-            ? null
-            : _normalizeRemote(remote['deleted_at']),
+        'recur_count': remote['recur_count'],
+        'remind_offset_min': remote['remind_offset_min'] ?? 0,
+        'listing_status': remote['listing_status'] ?? 'draft',
       },
       local,
     );
@@ -389,7 +441,7 @@ class SyncService {
         .from('notes')
         .select(
           'id, title, body, format, city, listed_at, owner_id, '
-          'note_stats(view_count)',
+          'note_stats(view_count, recommend_count, comment_count)',
         )
         .is_('deleted_at', null)
         .eq('kind', 'article')
@@ -407,10 +459,13 @@ class SyncService {
         .order('listed_at', ascending: false)
         .limit(200);
 
-    return (rows as List).map((row) {
+    final list = (rows as List).map((row) {
       final map = Map<String, dynamic>.from(row as Map);
       return _articleFromMap(map);
     }).toList();
+    // 热度排序：推荐/评论/浏览 + 新鲜度
+    list.sort((a, b) => b.hotScore.compareTo(a.hotScore));
+    return list;
   }
 
   MarketplaceArticle _articleFromMap(Map<String, dynamic> map) {
@@ -422,16 +477,25 @@ class SyncService {
       listedAt = DateTime.tryParse('$raw');
     }
     var viewCount = 0;
+    var recommendCount = 0;
+    var commentCount = 0;
     final stats = map['note_stats'];
+    Map? statsMap;
     if (stats is Map) {
-      final vc = stats['view_count'];
-      viewCount = vc is int ? vc : int.tryParse('$vc') ?? 0;
-    } else if (stats is List && stats.isNotEmpty) {
-      final first = stats.first;
-      if (first is Map) {
-        final vc = first['view_count'];
-        viewCount = vc is int ? vc : int.tryParse('$vc') ?? 0;
-      }
+      statsMap = stats;
+    } else if (stats is List && stats.isNotEmpty && stats.first is Map) {
+      statsMap = stats.first as Map;
+    }
+    if (statsMap != null) {
+      viewCount = statsMap['view_count'] is int
+          ? statsMap['view_count'] as int
+          : int.tryParse('${statsMap['view_count']}') ?? 0;
+      recommendCount = statsMap['recommend_count'] is int
+          ? statsMap['recommend_count'] as int
+          : int.tryParse('${statsMap['recommend_count']}') ?? 0;
+      commentCount = statsMap['comment_count'] is int
+          ? statsMap['comment_count'] as int
+          : int.tryParse('${statsMap['comment_count']}') ?? 0;
     }
     return MarketplaceArticle(
       noteUuid: '${map['id'] ?? ''}',
@@ -442,6 +506,8 @@ class SyncService {
       listedAt: listedAt,
       ownerId: '${map['owner_id'] ?? ''}',
       viewCount: viewCount,
+      recommendCount: recommendCount,
+      commentCount: commentCount,
     );
   }
 

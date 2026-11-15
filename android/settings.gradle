@@ -1,8 +1,16 @@
 def aliyunRepos = {
-    maven { url 'https://maven.aliyun.com/repository/google' }
-    maven { url 'https://maven.aliyun.com/repository/central' }
+    // public/central 优先：Kotlin 等不在 google 仓；阿里云 google 对缺失包常回 502 而非 404，会拖死解析
     maven { url 'https://maven.aliyun.com/repository/public' }
+    maven { url 'https://maven.aliyun.com/repository/central' }
     maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+    maven {
+        url 'https://maven.aliyun.com/repository/google'
+        content {
+            includeGroupByRegex 'com\\.android.*'
+            includeGroupByRegex 'com\\.google.*'
+            includeGroupByRegex 'androidx.*'
+        }
+    }
 }
 
 gradle.beforeProject { project ->
