@@ -66,7 +66,7 @@ class AppDatabase {
     final path = p.join(dir.path, 'rent_agent.db');
     _db = await openDatabase(
       path,
-      version: 14,
+      version: 17,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -85,6 +85,9 @@ class AppDatabase {
         await _upgradeToV12(db);
         await _upgradeToV13(db);
         await _upgradeToV14(db);
+        await _upgradeToV15(db);
+        await _upgradeToV16(db);
+        await _upgradeToV17(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) await _upgradeToV2(db);
@@ -100,6 +103,9 @@ class AppDatabase {
         if (oldVersion < 12) await _upgradeToV12(db);
         if (oldVersion < 13) await _upgradeToV13(db);
         if (oldVersion < 14) await _upgradeToV14(db);
+        if (oldVersion < 15) await _upgradeToV15(db);
+        if (oldVersion < 16) await _upgradeToV16(db);
+        if (oldVersion < 17) await _upgradeToV17(db);
       },
     );
     return _db!;
@@ -497,6 +503,27 @@ class AppDatabase {
       'CREATE INDEX IF NOT EXISTS idx_article_reads_scope_last '
       'ON article_reads(scope, last_read_at DESC)',
     );
+  }
+
+  Future<void> _upgradeToV15(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE notes ADD COLUMN cover_url TEXT NOT NULL DEFAULT ''",
+    );
+  }
+
+  /// 近期阅读快照带封面，列表卡片可直接显示。
+  Future<void> _upgradeToV16(Database db) async {
+    await _tryExec(
+      db,
+      "ALTER TABLE article_reads ADD COLUMN cover_url TEXT NOT NULL DEFAULT ''",
+    );
+  }
+
+  /// 备忘置顶 / 办结。
+  Future<void> _upgradeToV17(Database db) async {
+    await _tryExec(db, 'ALTER TABLE notes ADD COLUMN pinned_at TEXT');
+    await _tryExec(db, 'ALTER TABLE notes ADD COLUMN completed_at TEXT');
   }
 
   static const String kArticleReadScopeGuest = 'guest';
@@ -2161,8 +2188,11 @@ class AppDatabase {
       listingStatus: r['listing_status'] as String? ?? kListingDraft,
       listedAt: parseTs(r['listed_at']),
       city: r['city'] as String? ?? '',
+      coverUrl: r['cover_url'] as String? ?? '',
       parentUuid: r['parent_uuid'] as String?,
       sortOrder: (r['sort_order'] as int?) ?? 0,
+      pinnedAt: parseTs(r['pinned_at']),
+      completedAt: parseTs(r['completed_at']),
       sourceNoteUuids: sources,
       updatedAt: parseTs(r['updated_at']) ?? DateTime.now().toUtc(),
     );
@@ -2222,6 +2252,7 @@ class AppDatabase {
     String listingStatus = kListingDraft,
     DateTime? listedAt,
     String city = '',
+    String coverUrl = '',
     String? parentUuid,
     int sortOrder = 0,
     List<String> sourceNoteUuids = const [],
@@ -2242,6 +2273,7 @@ class AppDatabase {
       'listing_status': listingStatus,
       'listed_at': listedAt?.toUtc().toIso8601String(),
       'city': city.trim(),
+      'cover_url': coverUrl.trim(),
       'parent_uuid': parentUuid,
       'sort_order': sortOrder,
       'source_note_uuids': jsonEncode(sourceNoteUuids),
@@ -2272,8 +2304,14 @@ class AppDatabase {
     DateTime? listedAt,
     bool clearListedAt = false,
     String? city,
+    String? coverUrl,
+    bool clearCoverUrl = false,
     String? parentUuid,
     int? sortOrder,
+    DateTime? pinnedAt,
+    bool clearPinnedAt = false,
+    DateTime? completedAt,
+    bool clearCompletedAt = false,
     List<String>? sourceNoteUuids,
   }) async {
     final patch = <String, Object?>{..._touchSyncCols()};
@@ -2320,8 +2358,23 @@ class AppDatabase {
       patch['listed_at'] = listedAt.toUtc().toIso8601String();
     }
     if (city != null) patch['city'] = city.trim();
+    if (clearCoverUrl) {
+      patch['cover_url'] = '';
+    } else if (coverUrl != null) {
+      patch['cover_url'] = coverUrl.trim();
+    }
     if (parentUuid != null) patch['parent_uuid'] = parentUuid;
     if (sortOrder != null) patch['sort_order'] = sortOrder;
+    if (clearPinnedAt) {
+      patch['pinned_at'] = null;
+    } else if (pinnedAt != null) {
+      patch['pinned_at'] = pinnedAt.toUtc().toIso8601String();
+    }
+    if (clearCompletedAt) {
+      patch['completed_at'] = null;
+    } else if (completedAt != null) {
+      patch['completed_at'] = completedAt.toUtc().toIso8601String();
+    }
     if (sourceNoteUuids != null) {
       patch['source_note_uuids'] = jsonEncode(sourceNoteUuids);
     }
@@ -2361,6 +2414,7 @@ class AppDatabase {
     required String body,
     required String format,
     String city = '',
+    String coverUrl = '',
     String ownerId = '',
     String scope = kArticleReadScopeGuest,
     DateTime? lastReadAt,
@@ -2377,6 +2431,7 @@ class AppDatabase {
         'body': body,
         'format': format,
         'city': city,
+        'cover_url': coverUrl.trim(),
         'owner_id': ownerId,
         'last_read_at': at,
       },
@@ -2409,6 +2464,7 @@ class AppDatabase {
           'body': r.body,
           'format': r.format,
           'city': r.city,
+          'cover_url': r.coverUrl.trim(),
           'owner_id': r.ownerId,
           'last_read_at': r.lastReadAt.toUtc().toIso8601String(),
         },
@@ -2437,6 +2493,7 @@ class AppDatabase {
         body: r['body'] as String? ?? '',
         format: r['format'] as String? ?? kNoteFormatPlain,
         city: r['city'] as String? ?? '',
+        coverUrl: r['cover_url'] as String? ?? '',
         ownerId: r['owner_id'] as String? ?? '',
         lastReadAt: DateTime.tryParse(r['last_read_at'] as String? ?? '') ??
             DateTime.now().toUtc(),
@@ -2449,5 +2506,19 @@ class AppDatabase {
   }) async {
     final list = await listArticleReads(scope: scope, limit: 1);
     return list.isEmpty ? null : list.first;
+  }
+
+  Future<void> deleteArticleRead({
+    required String noteUuid,
+    required String scope,
+  }) async {
+    final nid = noteUuid.trim();
+    final sc = scope.trim().isEmpty ? kArticleReadScopeGuest : scope.trim();
+    if (nid.isEmpty) return;
+    await (await database).delete(
+      'article_reads',
+      where: 'scope = ? AND note_uuid = ?',
+      whereArgs: [sc, nid],
+    );
   }
 }

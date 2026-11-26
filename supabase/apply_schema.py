@@ -13,6 +13,13 @@ SCHEMAS = [
     ROOT / "schema_social.sql",
     ROOT / "schema_feedback.sql",
     ROOT / "schema_reads.sql",
+    ROOT / "schema_articles_public.sql",
+    ROOT / "schema_admonition.sql",
+    ROOT / "schema_article_availability.sql",
+    ROOT / "schema_note_cover.sql",
+    ROOT / "schema_note_pin_complete.sql",
+    ROOT / "schema_notif_actor_select.sql",
+    ROOT / "schema_notif_owner_delete.sql",
 ]
 
 

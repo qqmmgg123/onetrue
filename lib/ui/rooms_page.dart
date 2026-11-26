@@ -5,14 +5,20 @@ import '../auth/auth_service.dart';
 import '../domain/models.dart';
 import '../social/avatar_io.dart';
 import '../state/app_store.dart';
+import 'article_feed_card.dart';
 import 'auth_page.dart';
 import 'busy.dart';
 import 'city_utils.dart';
+import 'favorites_page.dart';
+import 'following_feed_page.dart';
 import 'marketplace_article_page.dart';
 import 'note_editor_page.dart';
+import 'open_article.dart';
+import 'recent_reads_page.dart';
+import 'social_inbox_page.dart';
 import 'widgets/user_avatar.dart';
 
-/// 求索：雅集 / 陋室，仅文章。
+/// 阅读：推荐 / 留意 / 近期 / 收藏 / 我的 / 留言。
 class RoomsPage extends StatefulWidget {
   const RoomsPage({super.key});
 
@@ -22,68 +28,102 @@ class RoomsPage extends StatefulWidget {
 
 class _RoomsPageState extends State<RoomsPage>
     with SingleTickerProviderStateMixin {
-  TabController? _mainTab;
+  late final TabController _tabs;
+
+  static const _labels = ['推荐', '留意', '近期', '收藏', '我的', '留言'];
 
   @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    final landlord = context.read<AppStore>().isLandlord;
-    if (landlord && _mainTab == null) {
-      _mainTab = TabController(length: 2, vsync: this);
-      _mainTab!.addListener(() {
-        if (!_mainTab!.indexIsChanging) setState(() {});
-      });
-    }
+  void initState() {
+    super.initState();
+    _tabs = TabController(length: _labels.length, vsync: this);
   }
 
   @override
   void dispose() {
-    _mainTab?.dispose();
+    _tabs.dispose();
     super.dispose();
+  }
+
+  Future<void> _openAuth() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const AuthPage()),
+    );
+  }
+
+  Future<void> _openNewArticle(AppStore store) async {
+    if (store.isGuest) {
+      await _openAuth();
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            const NoteEditorPage(initialKind: kNoteKindArticle),
+      ),
+    );
+  }
+
+  Widget _loginCta(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('登录后可查看此内容', textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: _openAuth,
+              child: const Text('登录'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
-    if (store.isGuest) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('求索'),
-          actions: [
-            TextButton(
-              onPressed: () async {
-                await Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const AuthPage()),
-                );
-              },
-              child: const Text('登录/注册'),
-            ),
-          ],
-        ),
-        body: _MarketplaceArticlesBody(store: store),
-      );
-    }
+    final guest = store.isGuest;
 
-    final tab = _mainTab!;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('求索'),
+        title: const Text('阅读'),
+        actions: [
+          if (guest)
+            TextButton(
+              onPressed: _openAuth,
+              child: const Text('登录'),
+            )
+          else
+            IconButton(
+              tooltip: '写文章',
+              icon: const Icon(Icons.add),
+              onPressed: () => _openNewArticle(store),
+            ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(40),
           child: TabBar(
-            controller: tab,
-            tabs: const [
-              Tab(height: 36, text: '雅集'),
-              Tab(height: 36, text: '陋室'),
+            controller: _tabs,
+            isScrollable: true,
+            tabs: [
+              for (final label in _labels)
+                Tab(height: 36, text: label),
             ],
           ),
         ),
       ),
       body: TabBarView(
-        controller: tab,
+        controller: _tabs,
         children: [
           _MarketplaceArticlesBody(store: store),
-          _LoushiArticlesBody(store: store),
+          guest ? _loginCta(context) : const FollowingFeedPage(embedded: true),
+          guest ? _loginCta(context) : const RecentReadsPage(embedded: true),
+          guest ? _loginCta(context) : const FavoritesPage(embedded: true),
+          guest ? _loginCta(context) : _MyArticlesBody(store: store),
+          guest ? _loginCta(context) : const SocialInboxPage(embedded: true),
         ],
       ),
     );
@@ -144,64 +184,39 @@ class _MarketplaceArticlesBodyState extends State<_MarketplaceArticlesBody> {
     if (_locating || store.marketplaceLoading) {
       return const Center(child: CircularProgressIndicator());
     }
-    if (store.marketplaceArticles.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: () => store.refreshMarketplace(city: store.marketplaceCity),
-        child: ListView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
+    return ArticleFeedGrid(
+      articles: store.marketplaceArticles,
+      onRefresh: () => store.refreshMarketplace(city: store.marketplaceCity),
+      onOpen: (a) => openMarketplaceArticle(context, a),
+      empty: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
+        child: Column(
           children: [
-            const Text('暂无上架文章。', textAlign: TextAlign.center),
+            const Text('暂无文章。', textAlign: TextAlign.center),
             const SizedBox(height: 8),
             Text(
-              '有内容的用户上架后会出现在这里。登录后可在「陋室」发布自己的文章。',
+              '有内容的用户发布后会出现在这里。登录后可在「我的」发布自己的文章。',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.bodySmall,
             ),
           ],
         ),
-      );
-    }
-    return RefreshIndicator(
-      onRefresh: () => store.refreshMarketplace(city: store.marketplaceCity),
-      child: ListView.separated(
-        itemCount: store.marketplaceArticles.length,
-        separatorBuilder: (_, __) => const Divider(height: 1),
-        itemBuilder: (context, i) {
-          final a = store.marketplaceArticles[i];
-          return ListTile(
-            leading: const Icon(Icons.article_outlined),
-            title: Text(a.displayTitle),
-            subtitle: Text(
-              [
-                '文章',
-                if (a.city.isNotEmpty) a.city,
-              ].join(' · '),
-            ),
-            onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => MarketplaceArticlePage(article: a),
-                ),
-              );
-            },
-          );
-        },
       ),
     );
   }
 }
 
-class _LoushiArticlesBody extends StatelessWidget {
-  const _LoushiArticlesBody({required this.store});
+/// 「我的」：本机文章（不按上架状态过滤）。
+class _MyArticlesBody extends StatelessWidget {
+  const _MyArticlesBody({required this.store});
   final AppStore store;
 
-  List<Note> get _listedArticles => store.notes
-      .where((n) => n.kind == kNoteKindArticle && n.isListed)
+  List<Note> get _articles => store.notes
+      .where((n) => n.kind == kNoteKindArticle)
       .toList()
     ..sort((a, b) {
-      final ta = a.listedAt ?? a.updatedAt;
-      final tb = b.listedAt ?? b.updatedAt;
+      final ta = a.updatedAt;
+      final tb = b.updatedAt;
       return tb.compareTo(ta);
     });
 
@@ -230,11 +245,11 @@ class _LoushiArticlesBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final list = _listedArticles;
+    final list = _articles;
     final user = store.user ?? AuthService.instance.currentUser;
     final nick = user?.displayName.trim().isNotEmpty == true
         ? user!.displayName
-        : '我的陋室';
+        : '我';
     final avatar = user?.avatarUrl ?? '';
 
     Widget header = Padding(
@@ -263,86 +278,109 @@ class _LoushiArticlesBody extends StatelessWidget {
       ),
     );
 
-    if (list.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: () => store.reload(),
-        child: ListView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          children: [
-            header,
-            const Divider(height: 1),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(24, 36, 24, 8),
-              child: Text(
-                '还没有上架文章。',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 15),
-              ),
+    final uid = store.user?.id ?? '';
+    final articles = list
+        .map(
+          (n) => MarketplaceArticle(
+            noteUuid: n.uuid,
+            title: n.title,
+            body: n.body,
+            format: n.format,
+            city: n.city,
+            coverUrl: n.coverUrl,
+            listedAt: n.listedAt,
+            ownerId: uid,
+            recommendCount: 0,
+            commentCount: 0,
+            viewCount: 0,
+          ),
+        )
+        .toList();
+
+    Future<void> openArticle(MarketplaceArticle a) async {
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => MarketplaceArticlePage(article: a),
+        ),
+      );
+    }
+
+    Future<void> deleteArticle(MarketplaceArticle a) async {
+      Note? note;
+      for (final n in list) {
+        if (n.uuid == a.noteUuid) {
+          note = n;
+          break;
+        }
+      }
+      if (note == null) return;
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('删除这篇文章？'),
+          content: Text('确认删除「${a.displayTitle}」？删除后无法恢复。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
             ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Text(
-                '在「作为 → 新笔记」写成文章，打开「上架到雅集」后会出现在这里。',
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ),
-            const SizedBox(height: 20),
-            Center(
-              child: OutlinedButton(
-                onPressed: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => const NoteEditorPage(
-                        initialKind: kNoteKindArticle,
-                      ),
-                    ),
-                  );
-                },
-                child: const Text('去写文章'),
-              ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除'),
             ),
           ],
         ),
       );
+      if (ok != true || !context.mounted) return;
+      await runBusy(
+        context,
+        message: '正在删除…',
+        task: () => store.removeNote(note!.id),
+      );
     }
-    return RefreshIndicator(
+
+    return ArticleFeedGrid(
+      articles: articles,
+      header: Column(
+        children: [
+          header,
+          const Divider(height: 1),
+        ],
+      ),
       onRefresh: () => store.reload(),
-      child: ListView.separated(
-        itemCount: list.length + 1,
-        separatorBuilder: (_, __) => const Divider(height: 1),
-        itemBuilder: (context, i) {
-          if (i == 0) return header;
-          final n = list[i - 1];
-          final uid = store.user?.id ?? '';
-          return ListTile(
-            leading: const Icon(Icons.article_outlined),
-            title: Text(n.displayTitle),
-            subtitle: Text(
-              [
-                '已上架',
-                if (n.city.isNotEmpty) n.city,
-              ].join(' · '),
+      onOpen: openArticle,
+      deleteMode: ArticleFeedDeleteMode.always,
+      onDelete: deleteArticle,
+      empty: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 36, 24, 24),
+        child: Column(
+          children: [
+            const Text(
+              '还没有文章。',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 15),
             ),
-            onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => MarketplaceArticlePage(
-                    article: MarketplaceArticle(
-                      noteUuid: n.uuid,
-                      title: n.title,
-                      body: n.body,
-                      format: n.format,
-                      city: n.city,
-                      listedAt: n.listedAt,
-                      ownerId: uid,
+            const SizedBox(height: 8),
+            Text(
+              '点右上角「+」写成文章并发布后会出现在这里。',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 20),
+            OutlinedButton(
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => const NoteEditorPage(
+                      initialKind: kNoteKindArticle,
                     ),
                   ),
-                ),
-              );
-            },
-          );
-        },
+                );
+              },
+              child: const Text('去写文章'),
+            ),
+          ],
+        ),
       ),
     );
   }

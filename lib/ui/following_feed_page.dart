@@ -4,13 +4,15 @@ import 'package:provider/provider.dart';
 import '../domain/models.dart';
 import '../social/social_api.dart';
 import '../state/app_store.dart';
-import 'format.dart';
-import 'marketplace_article_page.dart';
-import 'note_quill.dart';
+import 'article_feed_card.dart';
+import 'open_article.dart';
 
-/// 醍醐 → 留意的人：按最新上架时间展示留意用户的文章。
+/// 留意的人：按最新时间展示留意用户的文章。
 class FollowingFeedPage extends StatefulWidget {
-  const FollowingFeedPage({super.key});
+  const FollowingFeedPage({super.key, this.embedded = false});
+
+  /// 嵌入阅读 Tab 时不画独立 Scaffold / AppBar。
+  final bool embedded;
 
   @override
   State<FollowingFeedPage> createState() => _FollowingFeedPageState();
@@ -48,75 +50,37 @@ class _FollowingFeedPageState extends State<FollowingFeedPage> {
     }
   }
 
+  Widget _body(bool loggedIn) {
+    if (!loggedIn) {
+      return const Center(child: Text('登录后可查看留意动态'));
+    }
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(child: Text(_error!));
+    }
+    return ArticleFeedGrid(
+      articles: _items,
+      onRefresh: _load,
+      onOpen: (a) => openMarketplaceArticle(context, a),
+      empty: const Padding(
+        padding: EdgeInsets.fromLTRB(24, 48, 24, 24),
+        child: Text(
+          '还没有留意的人，或对方暂无文章。\n去阅读推荐打开文章后点作者头像留意吧。',
+          textAlign: TextAlign.center,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final loggedIn = context.watch<AppStore>().user != null;
+    if (widget.embedded) return _body(loggedIn);
     return Scaffold(
       appBar: AppBar(title: const Text('留意的人')),
-      body: !loggedIn
-          ? const Center(child: Text('登录后可查看留意动态'))
-          : _loading
-              ? const Center(child: CircularProgressIndicator())
-              : _error != null
-                  ? Center(child: Text(_error!))
-                  : RefreshIndicator(
-                      onRefresh: _load,
-                      child: _items.isEmpty
-                          ? ListView(
-                              physics: const AlwaysScrollableScrollPhysics(),
-                              padding: const EdgeInsets.all(24),
-                              children: const [
-                                SizedBox(height: 48),
-                                Text(
-                                  '还没有留意的人，或对方暂无上架文章。\n去雅集文章详情滑到作者陋室点留意吧。',
-                                  textAlign: TextAlign.center,
-                                ),
-                              ],
-                            )
-                          : ListView.separated(
-                              itemCount: _items.length,
-                              separatorBuilder: (_, __) =>
-                                  const Divider(height: 1),
-                              itemBuilder: (context, i) {
-                                final a = _items[i];
-                                final plain = plainTextFromStoredBody(
-                                  a.body,
-                                  format: a.format,
-                                )
-                                    .replaceAll(RegExp(r'\s+'), ' ')
-                                    .trim();
-                                final summary = plain.isEmpty
-                                    ? a.displayTitle
-                                    : (plain.length > 72
-                                        ? '${plain.substring(0, 72)}…'
-                                        : plain);
-                                return ListTile(
-                                  title: Text(a.displayTitle),
-                                  subtitle: Text(
-                                    [
-                                      summary,
-                                      if (a.listedAt != null)
-                                        formatFriendlyWhen(
-                                          a.listedAt!.toLocal(),
-                                        ),
-                                      '❤ ${a.recommendCount} · 评 ${a.commentCount}',
-                                    ].join('\n'),
-                                    maxLines: 4,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                  isThreeLine: true,
-                                  onTap: () {
-                                    Navigator.of(context).push(
-                                      MaterialPageRoute(
-                                        builder: (_) =>
-                                            MarketplaceArticlePage(article: a),
-                                      ),
-                                    );
-                                  },
-                                );
-                              },
-                            ),
-                    ),
+      body: _body(loggedIn),
     );
   }
 }

@@ -2,18 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../agent/agent_settings.dart';
-import '../auth/auth_gate.dart';
 import '../state/app_store.dart';
 import '../update/app_update_banner.dart';
 import 'auth_page.dart';
 import 'calendar_page.dart';
-import 'chat_page.dart';
 import 'contact_feedback_page.dart';
+import 'l2_side_drawer.dart';
+import 'memo_list_page.dart';
 import 'mine_settings_page.dart';
-import 'note_editor_page.dart';
-import 'reminder_inbox_page.dart';
+import 'notes_home_page.dart';
 import 'rooms_page.dart';
 
+/// 一级：笔记 → 备忘 → 日常 → 阅读 → 其他
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
 
@@ -22,8 +22,17 @@ class AppShell extends StatefulWidget {
 }
 
 class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
-  int _index = 0;
+  static const _kNotes = 0;
+  static const _kMemo = 1;
+  static const _kCal = 2;
+  static const _kRead = 3;
+  static const _kOther = 4;
+
+  int _index = _kRead;
+  bool? _wasGuest;
   DateTime? _lastResumePull;
+  final _memoDrawerKey = GlobalKey<L2SideDrawerState>();
+  final _calDrawerKey = GlobalKey<L2SideDrawerState>();
 
   @override
   void initState() {
@@ -43,7 +52,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
     if (state != AppLifecycleState.resumed) return;
     if (!mounted) return;
     final store = context.read<AppStore>();
-    if (!store.isLandlord) return;
+    if (store.isGuest) return;
     final now = DateTime.now();
     if (_lastResumePull != null &&
         now.difference(_lastResumePull!) < const Duration(seconds: 8)) {
@@ -54,48 +63,16 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
     store.refreshMyCache();
   }
 
-  Future<void> _onAsAction() async {
-    final store = context.read<AppStore>();
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      builder: (ctx) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(height: 8),
-              Text('作为', style: Theme.of(ctx).textTheme.titleMedium),
-              const Divider(height: 16),
-              ListTile(
-                leading: const Icon(Icons.edit_note),
-                title: const Text('新笔记'),
-                onTap: () => Navigator.pop(ctx, 'note'),
-              ),
-              const Divider(height: 1),
-              ListTile(
-                leading: const Icon(Icons.auto_awesome),
-                title: const Text('找 AI'),
-                onTap: () => Navigator.pop(ctx, 'ai'),
-              ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        );
-      },
-    );
-    if (!mounted || choice == null) return;
-
-    if (choice == 'note') {
-      final ok = store.isLandlord || await requireLandlord(context);
-      if (!ok || !mounted) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const NoteEditorPage()),
-      );
-    } else if (choice == 'ai') {
-      await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const ChatPage()),
-      );
+  void _syncDefaultTab(bool isGuest) {
+    if (_wasGuest == null) {
+      _wasGuest = isGuest;
+      _index = isGuest ? _kRead : _kNotes;
+      return;
     }
+    if (_wasGuest == isGuest) return;
+    _wasGuest = isGuest;
+    // 登录后落到笔记；退出后落到阅读
+    _index = isGuest ? _kRead : _kNotes;
   }
 
   Future<void> _onOtherAction() async {
@@ -111,7 +88,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
               const Divider(height: 16),
               ListTile(
                 leading: const Icon(Icons.settings_outlined),
-                title: const Text('设置'),
+                title: const Text('账号设置'),
                 onTap: () => Navigator.pop(ctx, 'settings'),
               ),
               const Divider(height: 1),
@@ -141,84 +118,41 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
-    final landlord = store.isLandlord;
+    final guest = store.isGuest;
+    _syncDefaultTab(guest);
 
-    // 游客：求索；房东：醍醐 / 光阴 / 求索
-    // 「作为」「其他」不占 IndexedStack，点开弹窗
-    final titles = landlord
-        ? const ['醍醐', '光阴', '求索']
-        : const ['求索'];
-    final pages = landlord
-        ? const <Widget>[
-            ReminderInboxPage(),
-            CalendarPage(),
-            RoomsPage(),
-          ]
-        : const <Widget>[
-            RoomsPage(),
-          ];
-    final asIndex = pages.length;
-    final otherIndex = pages.length + 1;
-    final destinations = landlord
-        ? const [
-            NavigationDestination(
-              icon: Icon(Icons.notifications_none),
-              selectedIcon: Icon(Icons.notifications),
-              label: '醍醐',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.calendar_month_outlined),
-              selectedIcon: Icon(Icons.calendar_month),
-              label: '光阴',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.explore_outlined),
-              selectedIcon: Icon(Icons.explore),
-              label: '求索',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.edit_outlined),
-              selectedIcon: Icon(Icons.edit),
-              label: '作为',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.more_horiz),
-              selectedIcon: Icon(Icons.more_horiz),
-              label: '其他',
-            ),
-          ]
-        : const [
-            NavigationDestination(
-              icon: Icon(Icons.explore_outlined),
-              selectedIcon: Icon(Icons.explore),
-              label: '求索',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.edit_outlined),
-              selectedIcon: Icon(Icons.edit),
-              label: '作为',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.more_horiz),
-              selectedIcon: Icon(Icons.more_horiz),
-              label: '其他',
-            ),
-          ];
+    const titles = ['笔记', '备忘', '日常', '阅读'];
+    final pages = <Widget>[
+      const NotesHomePage(),
+      MemoListPage(drawerKey: _memoDrawerKey),
+      CalendarPage(drawerKey: _calDrawerKey),
+      const RoomsPage(),
+    ];
 
-    if (_index >= pages.length) {
-      _index = 0;
-    }
-
-    final seekIndex = landlord ? 2 : 0;
-    final onSeek = _index == seekIndex;
+    final onRead = _index == _kRead;
+    final safeIndex = _index.clamp(0, pages.length - 1);
+    final showL2Menu = safeIndex == _kMemo || safeIndex == _kCal;
 
     return Scaffold(
-      appBar: onSeek
+      appBar: onRead
           ? null
           : AppBar(
-              title: Text(titles[_index]),
+              leading: showL2Menu
+                  ? IconButton(
+                      tooltip: '菜单',
+                      onPressed: () {
+                        if (safeIndex == _kMemo) {
+                          _memoDrawerKey.currentState?.toggle();
+                        } else if (safeIndex == _kCal) {
+                          _calDrawerKey.currentState?.toggle();
+                        }
+                      },
+                      icon: const L2MenuIcon(),
+                    )
+                  : null,
+              title: Text(titles[safeIndex]),
               actions: [
-                if (!landlord)
+                if (guest)
                   TextButton(
                     onPressed: () async {
                       await Navigator.of(context).push(
@@ -226,37 +160,52 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
                       );
                     },
                     child: const Text('登录/注册'),
-                  )
-                else
-                  IconButton(
-                    tooltip: '检查更新',
-                    onPressed: () => runManualUpdateCheck(context),
-                    icon: const Icon(Icons.system_update_alt, size: 20),
                   ),
               ],
             ),
       body: AppUpdateHost(
         child: IndexedStack(
-          index: _index,
+          index: safeIndex,
           children: pages,
         ),
       ),
       bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
+        selectedIndex: _index > _kRead ? _kRead : _index,
         onDestinationSelected: (i) {
-          if (i == asIndex) {
-            _onAsAction();
-            return;
-          }
-          if (i == otherIndex) {
+          if (i == _kOther) {
             _onOtherAction();
             return;
           }
           setState(() => _index = i);
         },
-        destinations: destinations,
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.edit_note_outlined),
+            selectedIcon: Icon(Icons.edit_note),
+            label: '笔记',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.sticky_note_2_outlined),
+            selectedIcon: Icon(Icons.sticky_note_2),
+            label: '备忘',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.calendar_month_outlined),
+            selectedIcon: Icon(Icons.calendar_month),
+            label: '日常',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.menu_book_outlined),
+            selectedIcon: Icon(Icons.menu_book),
+            label: '阅读',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.more_horiz),
+            selectedIcon: Icon(Icons.more_horiz),
+            label: '其他',
+          ),
+        ],
       ),
     );
   }
 }
-

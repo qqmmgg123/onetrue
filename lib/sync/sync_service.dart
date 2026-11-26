@@ -324,8 +324,11 @@ class SyncService {
       'listing_status': row['listing_status'] ?? 'draft',
       'listed_at': row['listed_at'],
       'city': row['city'] ?? '',
+      'cover_url': row['cover_url'] ?? '',
       'parent_uuid': row['parent_uuid'],
       'sort_order': row['sort_order'] ?? 0,
+      'pinned_at': row['pinned_at'],
+      'completed_at': row['completed_at'],
       'source_note_uuids': sourceUuids,
     };
   }
@@ -401,8 +404,15 @@ class SyncService {
             ? null
             : _normalizeRemote(remote['listed_at']),
         'city': remote['city'] ?? '',
+        'cover_url': remote['cover_url'] ?? '',
         'parent_uuid': remote['parent_uuid']?.toString(),
         'sort_order': remote['sort_order'] ?? 0,
+        'pinned_at': remote['pinned_at'] == null
+            ? null
+            : _normalizeRemote(remote['pinned_at']),
+        'completed_at': remote['completed_at'] == null
+            ? null
+            : _normalizeRemote(remote['completed_at']),
         'source_note_uuids': sourceStr,
         'updated_at': remoteUpdated,
         'recur_count': remote['recur_count'],
@@ -424,7 +434,7 @@ class SyncService {
     return const [];
   }
 
-  /// 市集：已上架文章（anon/authenticated 可读 listed articles）。
+  /// 市集：全部文章（anon/authenticated 可读 kind=article；不再要求 listed）。
   Future<List<MarketplaceArticle>> fetchListedArticles({
     String? city,
     String? ownerId,
@@ -440,12 +450,11 @@ class SyncService {
     var query = _client
         .from('notes')
         .select(
-          'id, title, body, format, city, listed_at, owner_id, '
+          'id, title, body, format, city, cover_url, listed_at, owner_id, '
           'note_stats(view_count, recommend_count, comment_count)',
         )
         .is_('deleted_at', null)
-        .eq('kind', 'article')
-        .eq('listing_status', 'listed');
+        .eq('kind', 'article');
 
     if (ownerFilter.isNotEmpty) {
       query = query.eq('owner_id', ownerFilter);
@@ -503,6 +512,7 @@ class SyncService {
       body: '${map['body'] ?? ''}',
       format: '${map['format'] ?? 'plain'}',
       city: '${map['city'] ?? ''}',
+      coverUrl: '${map['cover_url'] ?? ''}',
       listedAt: listedAt,
       ownerId: '${map['owner_id'] ?? ''}',
       viewCount: viewCount,
@@ -522,13 +532,12 @@ class SyncService {
     try {
       final note = await _client
           .from('notes')
-          .select('id, owner_id, deleted_at, kind, listing_status')
+          .select('id, owner_id, deleted_at, kind')
           .eq('id', id)
           .maybeSingle();
       if (note == null) return;
       if (note['deleted_at'] != null) return;
       if ('${note['kind']}' != 'article') return;
-      if ('${note['listing_status']}' != 'listed') return;
       if (viewer.isNotEmpty && '${note['owner_id']}' == viewer) return;
 
       final existing = await _client

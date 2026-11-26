@@ -5,16 +5,21 @@ import 'package:flutter_quill/flutter_quill.dart' hide Text;
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 
+import '../auth/auth_service.dart';
 import '../domain/ai_text.dart';
 import '../domain/models.dart';
 import '../domain/note_recur.dart';
 import '../domain/note_title.dart';
+import '../media/note_image_upload.dart';
+import '../social/social_api.dart';
 import '../state/app_store.dart';
 import 'busy.dart';
 import 'format.dart';
 import 'note_ai_panel.dart';
 import 'note_quill.dart';
+import 'quill_image_embed.dart';
 import 'voice_input_bar.dart';
+import 'widgets/cover_image.dart';
 
 class NoteEditorPage extends StatefulWidget {
   const NoteEditorPage({
@@ -51,6 +56,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   String _recurEndMode = 'never';
   int _remindOffsetMin = 0;
   bool _listed = false;
+  String _coverUrl = '';
   bool _loading = true;
   bool _saving = false;
   /// 进入页 / 成功保存后的指纹；未改动则跳过落库。
@@ -66,6 +72,71 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
   bool get _aiDefaultExpanded =>
       _kind == kNoteKindNote || _kind == kNoteKindArticle;
+
+  bool _isAdmin = false;
+  bool _aiBusy = false;
+
+  /// 笔记 / 备忘 / 日常 / 文章 / 谏言
+  String get _kindNoun {
+    switch (_kind) {
+      case kNoteKindMemo:
+        return '备忘';
+      case kNoteKindSchedule:
+        return '日常';
+      case kNoteKindArticle:
+        return '文章';
+      case kNoteKindAdmonition:
+        return '谏言';
+      default:
+        return '笔记';
+    }
+  }
+
+  /// 保存 / 添加 / 安排 / 发布 / 推荐
+  String get _primaryActionLabel {
+    switch (_kind) {
+      case kNoteKindMemo:
+        return '添加';
+      case kNoteKindSchedule:
+        return '安排';
+      case kNoteKindArticle:
+        return '发布';
+      case kNoteKindAdmonition:
+        return '推荐';
+      default:
+        return '保存';
+    }
+  }
+
+  String get _busyMessage {
+    switch (_kind) {
+      case kNoteKindMemo:
+        return '正在添加…';
+      case kNoteKindSchedule:
+        return '正在安排…';
+      case kNoteKindArticle:
+        return '正在发布…';
+      case kNoteKindAdmonition:
+        return '正在推荐…';
+      default:
+        return '正在保存…';
+    }
+  }
+
+  String get _kindHint {
+    switch (_kind) {
+      case kNoteKindMemo:
+        return '将笔记添加到备忘';
+      case kNoteKindSchedule:
+        return '将笔记安排到日常';
+      case kNoteKindArticle:
+        return '将笔记发布到阅读';
+      case kNoteKindAdmonition:
+        return '推荐到谏言';
+      default:
+        return '记录你的念头和思绪';
+    }
+  }
 
   @override
   void initState() {
@@ -83,12 +154,21 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       if (_kind == kNoteKindSchedule) {
         _remindOffsetMin = 0;
         _remindAt = remindAtFromOffset(_scheduleAt, _remindOffsetMin);
-      } else if (_kind == kNoteKindMemo) {
-        _remindAt = widget.initialScheduleAt;
       }
     }
     _aiExpanded = _aiDefaultExpanded;
+    _loadAdmin();
     _load();
+  }
+
+  Future<void> _loadAdmin() async {
+    try {
+      final uid = context.read<AppStore>().user?.id;
+      if (uid == null || uid.isEmpty) return;
+      final p = await SocialApi.instance.fetchProfile(uid);
+      if (!mounted) return;
+      setState(() => _isAdmin = p?.isAdmin == true);
+    } catch (_) {}
   }
 
   Future<void> _load() async {
@@ -150,6 +230,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
       _listed = n.isListed;
       _cityCtrl.text = n.city;
+      _coverUrl = n.coverUrl;
     }
     setState(() => _loading = false);
     _captureBaseline();
@@ -177,7 +258,64 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       'remind_offset_min': _remindOffsetMin,
       'listed': _listed,
       'city': _cityCtrl.text.trim(),
+      'cover_url': _coverUrl.trim(),
     });
+  }
+
+  Future<void> _pickCover() async {
+    final uid = AuthService.instance.currentUser?.id ?? '';
+    if (uid.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先登录再上传封面')),
+      );
+      return;
+    }
+    try {
+      final url = await runBusy(
+        context,
+        message: '上传封面…',
+        task: () => pickAndUploadNoteImage(userId: uid, folder: 'covers'),
+      );
+      if (!mounted || url == null || url.isEmpty) return;
+      setState(() => _coverUrl = url);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('封面上传失败：$e')),
+      );
+    }
+  }
+
+  Future<void> _insertBodyImage() async {
+    final uid = AuthService.instance.currentUser?.id ?? '';
+    if (uid.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先登录再插入图片')),
+      );
+      return;
+    }
+    try {
+      final url = await runBusy(
+        context,
+        message: '上传图片…',
+        task: () => pickAndUploadNoteImage(userId: uid, folder: 'note-images'),
+      );
+      if (!mounted || url == null || url.isEmpty) return;
+      final index = _quill.selection.baseOffset;
+      final i = index < 0 ? _quill.document.length - 1 : index;
+      _quill.document.insert(i, BlockEmbed.image(url));
+      _quill.document.insert(i + 1, '\n');
+      _quill.updateSelection(
+        TextSelection.collapsed(offset: i + 2),
+        ChangeSource.LOCAL,
+      );
+      _onKeyboardSideEdit();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('图片上传失败：$e')),
+      );
+    }
   }
 
   bool get _isDirty {
@@ -232,7 +370,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            schedule ? '日程开始时间须晚于现在' : '提醒时间须晚于现在',
+            schedule ? '日常开始时间须晚于现在' : '提醒时间须晚于现在',
           ),
         ),
       );
@@ -274,7 +412,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   Future<void> _pickRemindOffset() async {
     const presets = <(String, int)>[
       ('不提醒', -1),
-      ('日程开始时', 0),
+      ('日常开始时', 0),
       ('提前 5 分钟', 5),
       ('提前 10 分钟', 10),
       ('提前 15 分钟', 15),
@@ -426,7 +564,9 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       'recur_count': _recurCount,
       'recur_end': _recurEndMode,
       'remind_offset_min': _remindOffsetMin,
-      'listed': _listed,
+      'listed': _kind == kNoteKindArticle ||
+          _kind == kNoteKindAdmonition ||
+          _listed,
       'city': _cityCtrl.text.trim(),
     };
   }
@@ -434,10 +574,20 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   void _applyNoteOptions(Map<String, dynamic> args) {
     setState(() {
       if (args.containsKey('kind')) {
-        final k = '${args['kind']}'.trim();
-        if (k.isNotEmpty) {
-          _kind = k;
+        final normalized = normalizeNoteKind(
+          '${args['kind']}',
+          allowAdmonition: _isAdmin,
+        );
+        if (normalized != null) {
+          _kind = normalized;
+          if (normalized == kNoteKindArticle ||
+              normalized == kNoteKindAdmonition) {
+            _listed = true;
+          }
           _aiExpanded = _aiDefaultExpanded;
+          if (normalized == kNoteKindSchedule && _scheduleAt == null) {
+            _scheduleAt = DateTime.now();
+          }
         }
       }
       if (args.containsKey('title')) {
@@ -547,7 +697,17 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
       if (args.containsKey('listed')) {
         final v = args['listed'];
-        _listed = v == true || v == 1 || '$v' == 'true';
+        final on = v == true || v == 1 || '$v' == 'true';
+        _listed = on;
+        if (on &&
+            _kind != kNoteKindArticle &&
+            _kind != kNoteKindAdmonition) {
+          _kind = kNoteKindArticle;
+        }
+      }
+      // 形态为文章/谏言时草稿上下文与保存一致：视为上架
+      if (_kind == kNoteKindArticle || _kind == kNoteKindAdmonition) {
+        _listed = true;
       }
       if (args.containsKey('city')) {
         _cityCtrl.text = '${args['city']}';
@@ -571,7 +731,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       // 已有笔记被清空：严格模式拦，返回仍保存空正文
       if (strict) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('写点内容再保存')),
+          SnackBar(content: Text('写点内容再$_primaryActionLabel')),
         );
         return false;
       }
@@ -582,7 +742,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              _kind == kNoteKindSchedule ? '日程必须填写标题' : '文章必须填写标题',
+              _kind == kNoteKindSchedule ? '日常必须填写标题' : '文章必须填写标题',
             ),
           ),
         );
@@ -590,13 +750,13 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
       if (_kind == kNoteKindSchedule && _scheduleAt == null) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('请设置日程时间')),
+          const SnackBar(content: Text('请设置日常时间')),
         );
         return false;
       }
       if (plain.isEmpty && title.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('写点内容再保存')),
+          SnackBar(content: Text('写点内容再$_primaryActionLabel')),
         );
         return false;
       }
@@ -604,13 +764,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       title = suggestNoteTitle(
         title: '',
         body: body,
-        fallback: _kind == kNoteKindArticle
-            ? '文章'
-            : _kind == kNoteKindSchedule
-                ? '日程'
-                : _kind == kNoteKindMemo
-                    ? '备忘'
-                    : '随笔',
+        fallback: _kindNoun,
       );
     }
 
@@ -642,9 +796,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
           count = null;
         }
       }
-    } else if (_kind == kNoteKindMemo) {
-      remind = sanitizeFutureRemind(remind);
     } else {
+      // 备忘 / 笔记 / 文章：不写提醒时间（备忘不再有提醒 UI）
       schedule = null;
       remind = null;
     }
@@ -667,16 +820,16 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
             recurCount: count,
             remindOffsetMin: offset,
             city: _cityCtrl.text.trim(),
+            coverUrl: _kind == kNoteKindArticle ? _coverUrl.trim() : '',
           );
-          if (_listed && _kind == kNoteKindArticle) {
-            await store.setNoteListing(
-              noteId: id,
-              listed: true,
-              city: _cityCtrl.text.trim(),
-            );
-          }
           final created = await store.db.noteById(id);
           if (created != null) _existing = created;
+          // 文章→阅读；谏言→侧栏推荐
+          if ((_kind == kNoteKindArticle || _kind == kNoteKindAdmonition) &&
+              created != null) {
+            await store.setNoteListing(noteId: created.id, listed: true);
+            _listed = true;
+          }
         } else {
           await store.saveNote(
             id: _existing!.id,
@@ -697,33 +850,37 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
             clearRecurCount: count == null,
             remindOffsetMin: offset,
             city: _cityCtrl.text.trim(),
+            coverUrl: _kind == kNoteKindArticle ? _coverUrl.trim() : '',
+            clearCoverUrl: _kind != kNoteKindArticle,
           );
-          if (_kind == kNoteKindArticle) {
-            await store.setNoteListing(
-              noteId: _existing!.id,
-              listed: _listed,
-              city: _cityCtrl.text.trim(),
-            );
+          if (_kind == kNoteKindArticle || _kind == kNoteKindAdmonition) {
+            await store.setNoteListing(noteId: _existing!.id, listed: true);
+            _listed = true;
+          } else if (_existing!.isListed) {
+            await store.setNoteListing(noteId: _existing!.id, listed: false);
+            _listed = false;
           }
+        }
+        if (_kind == kNoteKindArticle) {
+          await store.refreshMarketplace();
         }
       }
 
-      // 点保存 / 返回自动保存都弹模态框，避免网络同步时页面「卡住无提示」
       if (!mounted) {
         await task();
       } else {
-        await runBusy(context, message: '正在保存…', task: task);
+        await runBusy(context, message: _busyMessage, task: task);
       }
+      // 采基线前同步 listed，避免文章/谏言保存后仍判脏
       _captureBaseline();
       return true;
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('保存失败：$e')),
+          SnackBar(content: Text('$_primaryActionLabel失败：$e')),
         );
       }
-      // 返回自动保存失败时仍允许离开，避免卡死在编辑页
-      return !strict;
+      return false;
     } finally {
       _saving = false;
     }
@@ -735,21 +892,188 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       return;
     }
     final ok = await _persist(strict: true);
+    // 成功后一律 pop；跳转到阅读「我的」等深层 Tab 切换暂不做。
     if (ok && mounted) Navigator.of(context).pop();
   }
 
-  Future<bool> _autoSaveAndLeave() async {
+  /// 离开守卫：空草稿 / 未改动直接走；否则询问是否保存。
+  Future<bool> _confirmLeave() async {
     if (_saving) return false;
     final plain = bodyPlain(_quill);
     final title = _titleCtrl.text.trim();
-    // 空草稿直接走，不弹保存框
     if (plain.isEmpty && title.isEmpty && _existing == null) {
       return true;
     }
-    // 相对进入时无任何改动：不写库、不触发同步
     if (!_isDirty) return true;
-    await _persist(strict: false);
-    return true;
+
+    final choice = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          content: Text(
+            '离开当前$_kindNoun可能丢失\n是否$_primaryActionLabel？',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'yes'),
+              child: const Text('是'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'no'),
+              child: const Text('否'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'back'),
+              child: const Text('返回'),
+            ),
+          ],
+        );
+      },
+    );
+    if (choice == 'yes') {
+      return await _persist(strict: true);
+    }
+    if (choice == 'no') return true;
+    return false;
+  }
+
+  /// 与阅读页 `.reader-cover` / CoverImage 16:9 一致，所见即所得。
+  Widget _coverPicker(ColorScheme cs) {
+    final url = _coverUrl.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          '封面（与发布后阅读页同为 16:9）',
+          style: Theme.of(context).textTheme.labelMedium,
+        ),
+        const SizedBox(height: 6),
+        Material(
+          color: const Color(0xFFF0F0F0),
+          borderRadius: BorderRadius.circular(10),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: _aiBusy ? null : _pickCover,
+            child: url.isEmpty
+                ? const AspectRatio(
+                    aspectRatio: 16 / 9,
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.add_photo_alternate_outlined, size: 28),
+                          SizedBox(height: 6),
+                          Text('上传封面', style: TextStyle(fontSize: 13)),
+                        ],
+                      ),
+                    ),
+                  )
+                : Stack(
+                    children: [
+                      CoverImage(
+                        url: url,
+                        aspectRatio: 16 / 9,
+                        borderRadius: 0,
+                      ),
+                      Positioned(
+                        right: 4,
+                        bottom: 4,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            TextButton(
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                backgroundColor: const Color(0x88000000),
+                              ),
+                              onPressed: _aiBusy ? null : _pickCover,
+                              child: const Text('更换'),
+                            ),
+                            const SizedBox(width: 4),
+                            TextButton(
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                backgroundColor: const Color(0x88000000),
+                              ),
+                              onPressed: _aiBusy
+                                  ? null
+                                  : () => setState(() => _coverUrl = ''),
+                              child: const Text('清除'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _openArticlePreview() async {
+    final title = _titleCtrl.text.trim().isEmpty
+        ? suggestNoteTitle(
+            title: '',
+            body: jsonEncode(_quill.document.toDelta().toJson()),
+            fallback: '文章',
+          )
+        : _titleCtrl.text.trim();
+    final previewQuill = QuillController(
+      document: Document.fromJson(_quill.document.toDelta().toJson()),
+      selection: const TextSelection.collapsed(offset: 0),
+    );
+    final focus = FocusNode();
+    if (!mounted) {
+      previewQuill.dispose();
+      focus.dispose();
+      return;
+    }
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (ctx) => Scaffold(
+          appBar: AppBar(
+            title: const Text('预览（发布后效果）'),
+          ),
+          body: ListView(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+            children: [
+              if (_coverUrl.trim().isNotEmpty) ...[
+                CoverImage(
+                  url: _coverUrl.trim(),
+                  aspectRatio: 16 / 9,
+                  borderRadius: 10,
+                ),
+                const SizedBox(height: 14),
+              ],
+              Text(
+                title,
+                style: Theme.of(ctx).textTheme.headlineSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+              const SizedBox(height: 12),
+              QuillEditor(
+                controller: previewQuill,
+                focusNode: focus,
+                scrollController: ScrollController(),
+                scrollable: false,
+                padding: EdgeInsets.zero,
+                autoFocus: false,
+                readOnly: true,
+                expands: false,
+                showCursor: false,
+                enableInteractiveSelection: true,
+                embedBuilders: kNoteEmbedBuilders,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    previewQuill.dispose();
+    focus.dispose();
   }
 
   Widget _kindChip(String kind, String label) {
@@ -761,7 +1085,9 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         borderRadius: BorderRadius.circular(16),
         child: InkWell(
           borderRadius: BorderRadius.circular(16),
-          onTap: () {
+          onTap: _aiBusy
+              ? null
+              : () {
             setState(() {
               _kind = kind;
               _aiExpanded = _aiDefaultExpanded;
@@ -816,7 +1142,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       ListTile(
         contentPadding: EdgeInsets.zero,
         dense: true,
-        title: const Text('日程时间'),
+        title: const Text('日常时间'),
         subtitle: Text(_scheduleAt == null ? '未设置' : ymdHm(_scheduleAt!)),
         trailing: TextButton(
           onPressed: () => _pickDateTime(schedule: true),
@@ -960,6 +1286,10 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
           replaceWithPlain(_quill, sanitizeAiPlainText(plain));
           setState(() {});
         },
+        appendPlain: (plain) {
+          appendWithPlain(_quill, sanitizeAiPlainText(plain));
+          setState(() {});
+        },
         replaceDelta: (delta) {
           replaceWithDeltaJson(_quill, delta);
           setState(() {});
@@ -978,38 +1308,64 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         body: Center(child: CircularProgressIndicator()),
       );
     }
-    final needTime = _kind == kNoteKindMemo || _kind == kNoteKindSchedule;
     final cs = Theme.of(context).colorScheme;
 
     return WillPopScope(
-      onWillPop: _autoSaveAndLeave,
+      onWillPop: _confirmLeave,
       child: Scaffold(
         appBar: AppBar(
-          title: Text(_existing == null ? '新笔记' : '编辑笔记'),
+          title: Text(_existing == null ? '新$_kindNoun' : '编辑$_kindNoun'),
           actions: [
-            TextButton(onPressed: _save, child: const Text('保存')),
+            if (_kind == kNoteKindArticle)
+              TextButton(
+                onPressed: _aiBusy ? null : _openArticlePreview,
+                child: const Text('预览'),
+              ),
+            Padding(
+              padding: const EdgeInsets.only(right: 10),
+              child: FilledButton(
+                onPressed: _aiBusy ? null : _save,
+                style: FilledButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                ),
+                child: Text(_primaryActionLabel),
+              ),
+            ),
           ],
         ),
         body: Column(
         children: [
           Expanded(
-            child: ListView(
+            child: AbsorbPointer(
+              absorbing: _aiBusy,
+              child: Opacity(
+                opacity: _aiBusy ? 0.55 : 1,
+                child: ListView(
               padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
               children: [
+                Text(
+                  _kindHint,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 8),
                 SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
                   child: Row(
                     children: [
-                      _kindChip(kNoteKindNote, '随笔'),
-                      _kindChip(kNoteKindArticle, '文章'),
+                      _kindChip(kNoteKindNote, '笔记'),
                       _kindChip(kNoteKindMemo, '备忘'),
-                      _kindChip(kNoteKindSchedule, '日程'),
+                      _kindChip(kNoteKindSchedule, '日常'),
+                      _kindChip(kNoteKindArticle, '文章'),
+                      if (_isAdmin)
+                        _kindChip(kNoteKindAdmonition, '谏言'),
                     ],
                   ),
                 ),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _titleCtrl,
+                  readOnly: _aiBusy,
                   decoration: InputDecoration(
                     labelText: _titleRequired ? '标题（必填）' : '标题（可选）',
                     hintText: _titleRequired ? '必填标题' : '标题（可选）',
@@ -1017,73 +1373,48 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                     isDense: true,
                   ),
                 ),
-                if (needTime) ...[
-                  const SizedBox(height: 4),
-                  if (_kind == kNoteKindMemo)
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      dense: true,
-                      title: const Text('提醒时间'),
-                      subtitle: Text(
-                        _remindAt == null ? '不提醒' : ymdHm(_remindAt!),
-                      ),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (_remindAt != null)
-                            TextButton(
-                              onPressed: () => setState(() => _remindAt = null),
-                              child: const Text('不提醒'),
-                            ),
-                          TextButton(
-                            onPressed: () => _pickDateTime(schedule: false),
-                            child: const Text('选择'),
-                          ),
-                        ],
-                      ),
-                    )
-                  else
-                    ..._scheduleOptions(),
-                ],
                 if (_kind == kNoteKindArticle) ...[
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    dense: true,
-                    title: const Text('上架到雅集'),
-                    subtitle: const Text('游客可在雅集「文章」浏览'),
-                    value: _listed,
-                    onChanged: (v) => setState(() => _listed = v),
-                  ),
-                  TextField(
-                    controller: _cityCtrl,
-                    decoration: const InputDecoration(
-                      labelText: '城市（上架筛选，可空）',
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
+                  const SizedBox(height: 8),
+                  _coverPicker(cs),
+                ],
+                if (_kind == kNoteKindSchedule) ...[
+                  const SizedBox(height: 4),
+                  ..._scheduleOptions(),
                 ],
                 const SizedBox(height: 8),
-                QuillToolbar.basic(
-                  controller: _quill,
-                  multiRowsDisplay: false,
-                  showFontFamily: false,
-                  showInlineCode: false,
-                  showColorButton: false,
-                  showBackgroundColorButton: false,
-                  showCodeBlock: false,
-                  showQuote: false,
-                  showLink: false,
-                  showSearchButton: false,
-                  showSubscript: false,
-                  showSuperscript: false,
-                  showStrikeThrough: false,
-                  showUnderLineButton: false,
-                  showListCheck: false,
-                  showIndent: false,
-                  showAlignmentButtons: true,
-                  showDirection: false,
-                  toolbarIconSize: 18,
+                Row(
+                  children: [
+                    Expanded(
+                      child: QuillToolbar.basic(
+                        controller: _quill,
+                        multiRowsDisplay: false,
+                        showFontFamily: false,
+                        showInlineCode: false,
+                        showColorButton: false,
+                        showBackgroundColorButton: false,
+                        showCodeBlock: false,
+                        showQuote: false,
+                        showLink: false,
+                        showSearchButton: false,
+                        showSubscript: false,
+                        showSuperscript: false,
+                        showStrikeThrough: false,
+                        showUnderLineButton: false,
+                        showListNumbers: true,
+                        showListBullets: true,
+                        showListCheck: false,
+                        showIndent: false,
+                        showAlignmentButtons: true,
+                        showDirection: false,
+                        toolbarIconSize: 18,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '插入图片',
+                      onPressed: _aiBusy ? null : _insertBodyImage,
+                      icon: const Icon(Icons.image_outlined, size: 22),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 4),
                 Stack(
@@ -1102,23 +1433,27 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                         scrollable: true,
                         padding: EdgeInsets.zero,
                         autoFocus: false,
-                        readOnly: false,
+                        readOnly: _aiBusy,
                         expands: false,
                         minHeight: 150,
                         placeholder: '写点什么…',
+                        embedBuilders: kNoteEmbedBuilders,
                       ),
                     ),
-                    Positioned(
-                      right: 6,
-                      bottom: 6,
-                      child: NoteMicButton(
-                        key: _micKey,
-                        onText: _insertVoiceText,
+                    if (!_aiBusy)
+                      Positioned(
+                        right: 6,
+                        bottom: 6,
+                        child: NoteMicButton(
+                          key: _micKey,
+                          onText: _insertVoiceText,
+                        ),
                       ),
-                    ),
                   ],
                 ),
               ],
+            ),
+              ),
             ),
           ),
           Divider(height: 1, color: cs.outline),
@@ -1128,6 +1463,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                 refKey: _aiRefKey,
                 expanded: true,
                 onExpandedChanged: (v) => setState(() => _aiExpanded = v),
+                onBusyChanged: (v) => setState(() => _aiBusy = v),
                 getters: _draftGetters,
                 setters: _draftSetters,
               ),
@@ -1137,6 +1473,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
               refKey: _aiRefKey,
               expanded: false,
               onExpandedChanged: (v) => setState(() => _aiExpanded = v),
+              onBusyChanged: (v) => setState(() => _aiBusy = v),
               getters: _draftGetters,
               setters: _draftSetters,
             ),

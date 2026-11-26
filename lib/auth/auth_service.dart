@@ -3,7 +3,11 @@ import 'package:supabase_flutter/supabase_flutter.dart' hide AuthUser;
 import '../config/baked_env.dart';
 import '../social/social_api.dart';
 import '../sync/sync_settings.dart';
+import '../util/user_facing_error.dart';
 import 'auth_models.dart';
+
+StateError _authErr(Object e, String fallback) =>
+    StateError(userFacingError(e, fallback: fallback));
 
 /// 邮箱 OTP / 密码鉴权（Supabase Auth）+ 社交档案。
 class AuthService {
@@ -25,7 +29,11 @@ class AuthService {
 
   SupabaseClient get _client {
     if (!BakedEnv.hasSupabase) {
-      throw StateError('未配置 Supabase（SUPABASE_URL / SUPABASE_ANON_KEY）');
+      throw StateError(
+        '未配置 Supabase（SUPABASE_URL / SUPABASE_ANON_KEY）。'
+        '请用 .\\run_app.ps1 或 .\\build_apk.ps1 启动/打包，'
+        '不要直接 flutter run（env.local 不会自动打进 App）',
+      );
     }
     return Supabase.instance.client;
   }
@@ -54,16 +62,22 @@ class AuthService {
     if (!_emailRe.hasMatch(e)) {
       throw StateError('请输入合法邮箱');
     }
-    await _client.auth.signInWithOtp(
-      email: e,
-      shouldCreateUser: true,
-    );
+    try {
+      await _client.auth.signInWithOtp(
+        email: e,
+        shouldCreateUser: true,
+      );
+    } catch (err) {
+      throw _authErr(err, '发送验证码失败');
+    }
   }
 
   /// 注册结果：可能需要邮箱 OTP 确认。
   /// - [sessionReady] true：已登录
-  /// - [needsOtp] true：等待邮箱验证码
-  Future<({bool sessionReady, bool needsOtp})> signUpWithPassword({
+  /// - [needsOtp] true：等待邮箱验证码（含「已登记未验证」）
+  /// - [otpHint] 给 UI 的发信提示
+  Future<({bool sessionReady, bool needsOtp, String? otpHint})>
+      signUpWithPassword({
     required String email,
     required String password,
     required String nickname,
@@ -80,23 +94,47 @@ class AuthService {
     if (nick.isEmpty) {
       throw StateError('请填写昵称');
     }
-    final res = await _client.auth.signUp(
-      email: e,
-      password: p,
-      data: {'display_name': nick, 'full_name': nick},
-    );
-    final session = res.session ?? _client.auth.currentSession;
-    final user = res.user ?? session?.user;
-    if (session != null && user != null && user.id.isNotEmpty) {
-      await SyncSettings.instance.bindOwner(user.id);
+    try {
+      final res = await _client.auth.signUp(
+        email: e,
+        password: p,
+        data: {'display_name': nick, 'full_name': nick},
+      );
+      final session = res.session ?? _client.auth.currentSession;
+      final user = res.user ?? session?.user;
+      if (session != null && user != null && user.id.isNotEmpty) {
+        await SyncSettings.instance.bindOwner(user.id);
+        try {
+          await SocialApi.instance.upsertMyProfile(nickname: nick);
+        } catch (_) {}
+        currentUser = await _hydrateUser(user);
+        return (sessionReady: true, needsOtp: false, otpHint: null);
+      }
+      // 已注册且已验证：静默成功 + identities 为空
+      final identities = user?.identities;
+      if (identities != null && identities.isEmpty) {
+        throw StateError('该邮箱已注册，请直接登录');
+      }
+      // 新注册或未验证：再 resend，提高收到验证码概率
+      var hint = '验证码已发送到邮箱，请查收后完成注册';
       try {
-        await SocialApi.instance.upsertMyProfile(nickname: nick);
-      } catch (_) {}
-      currentUser = await _hydrateUser(user);
-      return (sessionReady: true, needsOtp: false);
+        await resendSignupOtp(e);
+      } catch (mailErr) {
+        final m = mailErr.toString().toLowerCase();
+        if (m.contains('rate') || m.contains('security purposes')) {
+          hint = '验证码发送较频繁，请稍后再点「重发验证码」，或查收此前邮件（含垃圾箱）';
+        }
+      }
+      return (sessionReady: false, needsOtp: true, otpHint: hint);
+    } catch (err) {
+      if (err is StateError) rethrow;
+      throw _authErr(err, '注册失败');
     }
-    // 开启「Confirm email」时无 session，需验证码
-    return (sessionReady: false, needsOtp: true);
+  }
+
+  /// 已登记未验证：主动发注册验证码并进入验证流程。
+  Future<void> beginEmailVerification(String email) async {
+    await resendSignupOtp(email);
   }
 
   Future<void> resendSignupOtp(String email) async {
@@ -104,10 +142,71 @@ class AuthService {
     if (!_emailRe.hasMatch(e)) {
       throw StateError('请输入合法邮箱');
     }
-    await _client.auth.resend(
-      type: OtpType.signup,
-      email: e,
-    );
+    try {
+      await _client.auth.resend(
+        type: OtpType.signup,
+        email: e,
+      );
+    } catch (err) {
+      throw _authErr(err, '发送验证码失败');
+    }
+  }
+
+  /// 忘记密码：向邮箱发送恢复验证码（需 Reset password 模板含 `{{ .Token }}`）。
+  Future<void> sendPasswordResetOtp(String email) async {
+    final e = email.trim();
+    if (!_emailRe.hasMatch(e)) {
+      throw StateError('请输入合法邮箱');
+    }
+    try {
+      await _client.auth.resetPasswordForEmail(e);
+    } catch (err) {
+      throw _authErr(err, '发送验证码失败');
+    }
+  }
+
+  /// 用恢复 OTP 验证身份并设置新密码。
+  Future<AuthUser> resetPasswordWithOtp({
+    required String email,
+    required String token,
+    required String newPassword,
+  }) async {
+    final e = email.trim();
+    final code = token.trim();
+    final p = newPassword.trim();
+    if (!_emailRe.hasMatch(e)) {
+      throw StateError('请输入合法邮箱');
+    }
+    if (code.isEmpty) {
+      throw StateError('请输入验证码');
+    }
+    if (p.length < 6) {
+      throw StateError('新密码至少 6 位');
+    }
+    try {
+      final res = await _client.auth.verifyOTP(
+        email: e,
+        token: code,
+        type: OtpType.recovery,
+      );
+      final user = res.user ?? _client.auth.currentUser;
+      if (user == null || user.id.isEmpty) {
+        throw StateError('验证失败，请重试');
+      }
+      await _client.auth.updateUser(UserAttributes(password: p));
+      await SyncSettings.instance.bindOwner(user.id);
+      try {
+        await SocialApi.instance.ensureProfile(
+          fallbackNickname: _metaName(user),
+        );
+      } catch (_) {}
+      final authUser = await _hydrateUser(user);
+      currentUser = authUser;
+      return authUser;
+    } catch (err) {
+      if (err is StateError) rethrow;
+      throw _authErr(err, '重置密码失败');
+    }
   }
 
   /// 邮箱 + 密码登录；[nickname] 会写入/补全 profiles。
@@ -124,27 +223,32 @@ class AuthService {
     if (p.isEmpty) {
       throw StateError('请输入密码');
     }
-    final res = await _client.auth.signInWithPassword(email: e, password: p);
-    final user = res.user ?? _client.auth.currentUser;
-    if (user == null || user.id.isEmpty) {
-      throw StateError('登录失败，请检查邮箱或密码');
-    }
-    await SyncSettings.instance.bindOwner(user.id);
-    final nick = nickname.trim();
     try {
-      if (nick.isNotEmpty) {
-        await SocialApi.instance.upsertMyProfile(nickname: nick);
-      } else {
-        await SocialApi.instance.ensureProfile(
-          fallbackNickname: _metaName(user),
-        );
+      final res = await _client.auth.signInWithPassword(email: e, password: p);
+      final user = res.user ?? _client.auth.currentUser;
+      if (user == null || user.id.isEmpty) {
+        throw StateError('登录失败，请检查邮箱或密码');
       }
-    } catch (_) {
-      // 档案表未迁移时不阻断登录
+      await SyncSettings.instance.bindOwner(user.id);
+      final nick = nickname.trim();
+      try {
+        if (nick.isNotEmpty) {
+          await SocialApi.instance.upsertMyProfile(nickname: nick);
+        } else {
+          await SocialApi.instance.ensureProfile(
+            fallbackNickname: _metaName(user),
+          );
+        }
+      } catch (_) {
+        // 档案表未迁移时不阻断登录
+      }
+      final authUser = await _hydrateUser(user);
+      currentUser = authUser;
+      return authUser;
+    } catch (err) {
+      if (err is StateError) rethrow;
+      throw _authErr(err, '登录失败');
     }
-    final authUser = await _hydrateUser(user);
-    currentUser = authUser;
-    return authUser;
   }
 
   Future<AuthUser> verifyEmailOtp({
@@ -161,29 +265,34 @@ class AuthService {
     if (code.isEmpty) {
       throw StateError('请输入验证码');
     }
-    final res = await _client.auth.verifyOTP(
-      email: e,
-      token: code,
-      type: type,
-    );
-    final user = res.user ?? _client.auth.currentUser;
-    if (user == null || user.id.isEmpty) {
-      throw StateError('验证失败，请重试');
-    }
-    await SyncSettings.instance.bindOwner(user.id);
-    final nick = nickname.trim();
     try {
-      if (nick.isNotEmpty) {
-        await SocialApi.instance.upsertMyProfile(nickname: nick);
-      } else {
-        await SocialApi.instance.ensureProfile(
-          fallbackNickname: _metaName(user),
-        );
+      final res = await _client.auth.verifyOTP(
+        email: e,
+        token: code,
+        type: type,
+      );
+      final user = res.user ?? _client.auth.currentUser;
+      if (user == null || user.id.isEmpty) {
+        throw StateError('验证失败，请重试');
       }
-    } catch (_) {}
-    final authUser = await _hydrateUser(user);
-    currentUser = authUser;
-    return authUser;
+      await SyncSettings.instance.bindOwner(user.id);
+      final nick = nickname.trim();
+      try {
+        if (nick.isNotEmpty) {
+          await SocialApi.instance.upsertMyProfile(nickname: nick);
+        } else {
+          await SocialApi.instance.ensureProfile(
+            fallbackNickname: _metaName(user),
+          );
+        }
+      } catch (_) {}
+      final authUser = await _hydrateUser(user);
+      currentUser = authUser;
+      return authUser;
+    } catch (err) {
+      if (err is StateError) rethrow;
+      throw _authErr(err, '验证失败');
+    }
   }
 
   Future<void> refreshProfile() async {

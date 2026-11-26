@@ -191,8 +191,19 @@ create policy social_notif_owner_update on public.social_notifications
   using (user_id = auth.uid())
   with check (user_id = auth.uid());
 
+drop policy if exists social_notif_owner_delete on public.social_notifications;
+create policy social_notif_owner_delete on public.social_notifications
+  for delete to authenticated
+  using (user_id = auth.uid());
+
 -- inserts come from authenticated clients acting as actor; recipient must be target
 drop policy if exists social_notif_actor_insert on public.social_notifications;
 create policy social_notif_actor_insert on public.social_notifications
   for insert to authenticated
   with check (actor_id = auth.uid());
+
+-- 允许发起人读自己发出的行（INSERT…RETURNING）
+drop policy if exists social_notif_actor_select on public.social_notifications;
+create policy social_notif_actor_select on public.social_notifications
+  for select to authenticated
+  using (user_id = auth.uid() or actor_id = auth.uid());

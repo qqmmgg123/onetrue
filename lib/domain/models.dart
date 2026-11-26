@@ -25,6 +25,7 @@ const kNoteKindNote = 'note';
 const kNoteKindMemo = 'memo';
 const kNoteKindSchedule = 'schedule';
 const kNoteKindArticle = 'article';
+const kNoteKindAdmonition = 'admonition';
 
 const kNoteFormatPlain = 'plain';
 const kNoteFormatQuill = 'quill';
@@ -48,8 +49,11 @@ class Note {
     this.listingStatus = kListingDraft,
     this.listedAt,
     this.city = '',
+    this.coverUrl = '',
     this.parentUuid,
     this.sortOrder = 0,
+    this.pinnedAt,
+    this.completedAt,
     this.sourceNoteUuids = const [],
     required this.updatedAt,
   });
@@ -74,13 +78,21 @@ class Note {
   final String listingStatus;
   final DateTime? listedAt;
   final String city;
+  /// 文章封面公开 URL；空则阅读卡片用占位。
+  final String coverUrl;
   final String? parentUuid;
   final int sortOrder;
+  /// 备忘置顶时间；非空表示已置顶。
+  final DateTime? pinnedAt;
+  /// 备忘办结时间；非空表示已办结（禁用编辑）。
+  final DateTime? completedAt;
   final List<String> sourceNoteUuids;
   final DateTime updatedAt;
 
   bool get isListed => listingStatus == kListingListed;
   bool get hasTitle => title.trim().isNotEmpty;
+  bool get isPinned => pinnedAt != null;
+  bool get isCompleted => completedAt != null;
 
   /// 列表展示用：有标题用标题；否则从正文纯文本抽首行（兼容 Quill JSON）。
   String get displayTitle => suggestNoteTitle(
@@ -95,11 +107,33 @@ class Note {
       case kNoteKindMemo:
         return '备忘';
       case kNoteKindSchedule:
-        return '日程';
+        return '日常';
       case kNoteKindArticle:
         return '文章';
+      case kNoteKindAdmonition:
+        return '谏言';
       default:
-        return '随笔';
+        return '笔记';
+    }
+  }
+}
+
+/// 阅读点开校验结果。
+enum ArticleAvailability {
+  ok,
+  deleted,
+  delisted,
+}
+
+extension ArticleAvailabilityMessage on ArticleAvailability {
+  String get userMessage {
+    switch (this) {
+      case ArticleAvailability.ok:
+        return '';
+      case ArticleAvailability.deleted:
+        return '文章已删除';
+      case ArticleAvailability.delisted:
+        return '该文章已下架';
     }
   }
 }
@@ -112,11 +146,14 @@ class MarketplaceArticle {
     required this.body,
     required this.format,
     this.city = '',
+    this.coverUrl = '',
     this.listedAt,
     this.ownerId = '',
     this.viewCount = 0,
     this.recommendCount = 0,
     this.commentCount = 0,
+    this.deleted = false,
+    this.delisted = false,
   });
 
   final String noteUuid;
@@ -124,12 +161,17 @@ class MarketplaceArticle {
   final String body;
   final String format;
   final String city;
+  final String coverUrl;
   final DateTime? listedAt;
   final String ownerId;
   /// 他人访问次数（不含作者本人）。
   final int viewCount;
   final int recommendCount;
   final int commentCount;
+  /// 收藏/近期里原文已被作者删除时为 true（列表仍可显示记录）。
+  final bool deleted;
+  /// 已改成非文章类型（对阅读侧视为下架）。
+  final bool delisted;
 
   String get displayTitle =>
       title.trim().isNotEmpty ? title.trim() : '无标题文章';
@@ -160,6 +202,7 @@ class ArticleReadRecord {
     required this.body,
     required this.format,
     this.city = '',
+    this.coverUrl = '',
     this.ownerId = '',
     required this.lastReadAt,
   });
@@ -169,6 +212,7 @@ class ArticleReadRecord {
   final String body;
   final String format;
   final String city;
+  final String coverUrl;
   final String ownerId;
   final DateTime lastReadAt;
 
@@ -181,6 +225,7 @@ class ArticleReadRecord {
         body: body,
         format: format,
         city: city,
+        coverUrl: coverUrl,
         ownerId: ownerId,
       );
 }

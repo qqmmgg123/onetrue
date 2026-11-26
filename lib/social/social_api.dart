@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/baked_env.dart';
@@ -18,6 +19,25 @@ class SocialApi {
 
   String? get _uid => _client.auth.currentUser?.id;
 
+  // —— admonitions（谏言）——
+
+  Future<List<AdmonitionItem>> fetchAdmonitions({int limit = 30}) async {
+    final rows = await _client
+        .from('notes')
+        .select('id, title, body, format, listed_at')
+        .eq('kind', 'admonition')
+        .eq('listing_status', 'listed')
+        .is_('deleted_at', null)
+        .order('listed_at', ascending: false)
+        .limit(limit);
+    final out = <AdmonitionItem>[];
+    for (final r in (rows as List)) {
+      final item = AdmonitionItem.fromMap(Map<String, dynamic>.from(r as Map));
+      if (item.id.isNotEmpty) out.add(item);
+    }
+    return out;
+  }
+
   // —— profiles ——
 
   Future<UserProfile?> fetchProfile(String userId) async {
@@ -25,7 +45,7 @@ class SocialApi {
     if (id.isEmpty) return null;
     final row = await _client
         .from('profiles')
-        .select('id, nickname, avatar_url')
+        .select('id, nickname, avatar_url, is_admin')
         .eq('id', id)
         .maybeSingle();
     if (row == null) return null;
@@ -37,7 +57,7 @@ class SocialApi {
     if (list.isEmpty) return {};
     final rows = await _client
         .from('profiles')
-        .select('id, nickname, avatar_url')
+        .select('id, nickname, avatar_url, is_admin')
         .in_('id', list);
     final out = <String, UserProfile>{};
     for (final r in (rows as List)) {
@@ -64,7 +84,7 @@ class SocialApi {
     final row = await _client
         .from('profiles')
         .upsert(payload)
-        .select('id, nickname, avatar_url')
+        .select('id, nickname, avatar_url, is_admin')
         .single();
     return UserProfile.fromMap(Map<String, dynamic>.from(row as Map));
   }
@@ -149,19 +169,18 @@ class SocialApi {
         .toList();
   }
 
-  /// 关注的人最新上架文章（按 listed_at 倒序）。
+  /// 关注的人最新文章（按 listed_at 倒序；不再要求 listed）。
   Future<List<MarketplaceArticle>> fetchFollowingArticles({int limit = 100}) async {
     final ids = await followingIds();
     if (ids.isEmpty) return const [];
     final rows = await _client
         .from('notes')
         .select(
-          'id, title, body, format, city, listed_at, owner_id, '
+          'id, title, body, format, city, cover_url, listed_at, owner_id, '
           'note_stats(view_count, recommend_count, comment_count)',
         )
         .is_('deleted_at', null)
         .eq('kind', 'article')
-        .eq('listing_status', 'listed')
         .in_('owner_id', ids)
         .order('listed_at', ascending: false)
         .limit(limit);
@@ -199,6 +218,7 @@ class SocialApi {
       body: '${map['body'] ?? ''}',
       format: '${map['format'] ?? 'plain'}',
       city: '${map['city'] ?? ''}',
+      coverUrl: '${map['cover_url'] ?? ''}',
       listedAt: listedAt,
       ownerId: '${map['owner_id'] ?? ''}',
       viewCount: viewCount,
@@ -315,7 +335,49 @@ class SocialApi {
     return true;
   }
 
-  /// 我的收藏：按收藏时间倒序。
+  /// 原文是否仍可作为文章打开。优先 RPC；失败则本地探测。
+  Future<ArticleAvailability> resolveArticleAvailability(
+    String noteId, {
+    bool hintDeleted = false,
+    bool hintDelisted = false,
+  }) async {
+    if (hintDeleted) return ArticleAvailability.deleted;
+    if (hintDelisted) return ArticleAvailability.delisted;
+    final nid = noteId.trim();
+    if (nid.isEmpty || !BakedEnv.hasSupabase) {
+      return ArticleAvailability.delisted;
+    }
+    try {
+      final raw = await _client.rpc(
+        'article_availability',
+        params: {'p_id': nid},
+      );
+      final s = '$raw'.trim().toLowerCase();
+      if (s == 'ok') return ArticleAvailability.ok;
+      if (s == 'deleted') return ArticleAvailability.deleted;
+      if (s == 'delisted' || s == 'missing') {
+        return ArticleAvailability.delisted;
+      }
+    } catch (_) {
+      /* RPC 未部署时走探测 */
+    }
+    try {
+      final row = await _client
+          .from('notes')
+          .select('id, kind, deleted_at')
+          .eq('id', nid)
+          .maybeSingle();
+      if (row != null) {
+        if (row['deleted_at'] != null) return ArticleAvailability.deleted;
+        if ('${row['kind']}' != 'article') return ArticleAvailability.delisted;
+        return ArticleAvailability.ok;
+      }
+    } catch (_) {}
+    // 他人侧 RLS 不可见：删文或已改类型都当「已下架」更贴近阅读入口
+    return ArticleAvailability.delisted;
+  }
+
+  /// 我的收藏：按收藏时间倒序。删文/改类型后仍保留记录（stub），点开再提示。
   Future<List<MarketplaceArticle>> fetchMyFavorites({int limit = 200}) async {
     final uid = _uid;
     if (uid == null) return const [];
@@ -331,21 +393,46 @@ class SocialApi {
         .toList();
     if (ids.isEmpty) return const [];
 
+    // 含 kind：作者自己改类型后仍能读到行，标成下架 stub。
     final rows = await _client
         .from('notes')
         .select(
-          'id, title, body, format, city, listed_at, owner_id, '
+          'id, title, body, format, city, cover_url, listed_at, owner_id, kind, '
           'note_stats(view_count, recommend_count, comment_count)',
         )
         .in_('id', ids)
         .is_('deleted_at', null);
     final byId = <String, MarketplaceArticle>{};
     for (final r in (rows as List)) {
-      final a = _articleFromMap(Map<String, dynamic>.from(r as Map));
-      if (a.noteUuid.isNotEmpty) byId[a.noteUuid] = a;
+      final map = Map<String, dynamic>.from(r as Map);
+      final id = '${map['id'] ?? ''}';
+      if (id.isEmpty) continue;
+      if ('${map['kind']}' != 'article') {
+        byId[id] = MarketplaceArticle(
+          noteUuid: id,
+          title: '${map['title'] ?? ''}'.trim().isEmpty
+              ? '已下架的文章'
+              : '${map['title']}',
+          body: '',
+          format: 'plain',
+          ownerId: '${map['owner_id'] ?? ''}',
+          delisted: true,
+        );
+        continue;
+      }
+      byId[id] = _articleFromMap(map);
     }
-    // 保持收藏时间顺序
-    return ids.map((id) => byId[id]).whereType<MarketplaceArticle>().toList();
+    return [
+      for (final id in ids)
+        byId[id] ??
+            MarketplaceArticle(
+              noteUuid: id,
+              title: '已删除的文章',
+              body: '',
+              format: 'plain',
+              deleted: true,
+            ),
+    ];
   }
 
   Future<void> _bumpRecommend(String noteId, int delta) async {
@@ -452,19 +539,38 @@ class SocialApi {
 
     await _bumpComment(noteId.trim(), 1);
 
-    // 通知：回复优先通知被回复者；否则通知作者（自己评自己不通知）
-    final notifyUid = rid.isNotEmpty ? rid : noteOwnerId.trim();
-    if (notifyUid.isNotEmpty && notifyUid != uid) {
-      try {
+    // 留言：顶层评点 → 通知文章作者（不含回复）
+    // 回复：仅通知明确被回书的人（reply_to_user_id）
+    try {
+      String notifyUid = '';
+      String kind = '';
+      if (pid.isEmpty) {
+        kind = 'comment';
+        notifyUid = noteOwnerId.trim();
+        if (notifyUid.isEmpty) {
+          final note = await _client
+              .from('notes')
+              .select('owner_id')
+              .eq('id', noteId.trim())
+              .maybeSingle();
+          notifyUid = '${note?['owner_id'] ?? ''}'.trim();
+        }
+      } else if (rid.isNotEmpty) {
+        kind = 'reply';
+        notifyUid = rid;
+      }
+      if (notifyUid.isNotEmpty && notifyUid != uid && kind.isNotEmpty) {
         await _client.from('social_notifications').insert({
           'user_id': notifyUid,
           'actor_id': uid,
-          'kind': pid.isNotEmpty ? 'reply' : 'comment',
+          'kind': kind,
           'note_id': noteId.trim(),
           'comment_id': '${(row as Map)['id']}',
           'body': text.length > 80 ? '${text.substring(0, 80)}…' : text,
         });
-      } catch (_) {}
+      }
+    } catch (e, st) {
+      debugPrint('social_notifications insert failed: $e\n$st');
     }
 
     final me = await fetchProfile(uid);
@@ -580,28 +686,62 @@ class SocialApi {
     }).eq('user_id', uid).in_('id', list);
   }
 
+  /// 从留言与回复中移除一条提醒（不删评点/文章）。
+  Future<void> deleteNotification(String id) async {
+    final uid = _uid;
+    final nid = id.trim();
+    if (uid == null) throw StateError('请先登录');
+    if (nid.isEmpty) return;
+    await _client
+        .from('social_notifications')
+        .delete()
+        .eq('user_id', uid)
+        .eq('id', nid);
+  }
+
   // —— 近期阅读（仅登录用户；游客永不写此表）——
 
   Future<List<ArticleReadRecord>> fetchMyArticleReads({int limit = 100}) async {
     final uid = _uid;
     if (uid == null) return const [];
-    final rows = await _client
-        .from('user_article_reads')
-        .select(
-          'note_id, title, body, format, city, owner_id, last_read_at',
-        )
-        .eq('user_id', uid)
-        .order('last_read_at', ascending: false)
-        .limit(limit);
-    return (rows as List).map((r) {
+    // 近期是用户侧快照；封面优先快照 cover_url，否则回落 notes.cover_url。
+    List rows;
+    try {
+      rows = await _client
+          .from('user_article_reads')
+          .select(
+            'note_id, title, body, format, city, cover_url, owner_id, '
+            'last_read_at, notes(cover_url)',
+          )
+          .eq('user_id', uid)
+          .order('last_read_at', ascending: false)
+          .limit(limit) as List;
+    } catch (_) {
+      rows = await _client
+          .from('user_article_reads')
+          .select(
+            'note_id, title, body, format, city, owner_id, '
+            'last_read_at, notes(cover_url)',
+          )
+          .eq('user_id', uid)
+          .order('last_read_at', ascending: false)
+          .limit(limit) as List;
+    }
+    return rows.map((r) {
       final m = Map<String, dynamic>.from(r as Map);
       final at = m['last_read_at'];
+      final snapCover = '${m['cover_url'] ?? ''}'.trim();
+      final note = m['notes'];
+      final noteCover = note is Map
+          ? '${note['cover_url'] ?? ''}'.trim()
+          : '';
       return ArticleReadRecord(
         noteUuid: '${m['note_id'] ?? ''}',
         title: '${m['title'] ?? ''}',
         body: '${m['body'] ?? ''}',
         format: '${m['format'] ?? 'plain'}',
         city: '${m['city'] ?? ''}',
+        coverUrl: snapCover.isNotEmpty ? snapCover : noteCover,
         ownerId: '${m['owner_id'] ?? ''}',
         lastReadAt: at is DateTime
             ? at.toUtc()
@@ -616,6 +756,7 @@ class SocialApi {
     required String body,
     required String format,
     String city = '',
+    String coverUrl = '',
     String ownerId = '',
     DateTime? lastReadAt,
   }) async {
@@ -624,7 +765,7 @@ class SocialApi {
     if (uid == null) throw StateError('请先登录');
     if (nid.isEmpty) throw StateError('无效文章');
     final at = (lastReadAt ?? DateTime.now()).toUtc().toIso8601String();
-    await _client.from('user_article_reads').upsert({
+    final payload = <String, dynamic>{
       'user_id': uid,
       'note_id': nid,
       'title': title,
@@ -633,6 +774,30 @@ class SocialApi {
       'city': city,
       'owner_id': ownerId.trim().isEmpty ? null : ownerId.trim(),
       'last_read_at': at,
-    }, onConflict: 'user_id,note_id');
+      'cover_url': coverUrl.trim(),
+    };
+    try {
+      await _client
+          .from('user_article_reads')
+          .upsert(payload, onConflict: 'user_id,note_id');
+    } catch (_) {
+      // 云端尚未加 cover_url 列时降级写入，列表仍可通过 notes 联表显示封面
+      payload.remove('cover_url');
+      await _client
+          .from('user_article_reads')
+          .upsert(payload, onConflict: 'user_id,note_id');
+    }
+  }
+
+  Future<void> deleteArticleReadCloud(String noteUuid) async {
+    final uid = _uid;
+    final nid = noteUuid.trim();
+    if (uid == null) throw StateError('请先登录');
+    if (nid.isEmpty) return;
+    await _client
+        .from('user_article_reads')
+        .delete()
+        .eq('user_id', uid)
+        .eq('note_id', nid);
   }
 }

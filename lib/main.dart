@@ -5,6 +5,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'app_nav.dart';
 import 'config/baked_env.dart';
 import 'platform_init.dart';
 import 'share/wechat_share.dart';
@@ -58,6 +59,7 @@ class RentAgentApp extends StatelessWidget {
       value: store,
       child: MaterialApp(
         title: '醍醐',
+        navigatorKey: appNavigatorKey,
         debugShowCheckedModeBanner: false,
         locale: const Locale('zh', 'CN'),
         supportedLocales: const [

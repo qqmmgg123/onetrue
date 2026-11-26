@@ -235,6 +235,7 @@ class AppStore extends ChangeNotifier {
     int? recurCount,
     int remindOffsetMin = 0,
     String city = '',
+    String coverUrl = '',
     List<String> sourceNoteUuids = const [],
   }) async {
     final resolved = resolveNoteTitleForSave(
@@ -242,6 +243,18 @@ class AppStore extends ChangeNotifier {
       title: title,
       body: body,
     );
+    // 新备忘插到最前（比当前最小 sort_order 再小 1）
+    var sortOrder = 0;
+    if (kind == kNoteKindMemo) {
+      final memos = notes.where((n) => n.kind == kNoteKindMemo);
+      if (memos.isNotEmpty) {
+        var minSo = memos.first.sortOrder;
+        for (final m in memos) {
+          if (m.sortOrder < minSo) minSo = m.sortOrder;
+        }
+        sortOrder = minSo - 1;
+      }
+    }
     final id = await _db.insertNote(
       kind: kind,
       title: resolved,
@@ -256,6 +269,8 @@ class AppStore extends ChangeNotifier {
       recurCount: recurCount,
       remindOffsetMin: remindOffsetMin,
       city: city,
+      coverUrl: coverUrl,
+      sortOrder: sortOrder,
       sourceNoteUuids: sourceNoteUuids,
     );
     await _publish([(table: 'notes', id: id)]);
@@ -283,6 +298,9 @@ class AppStore extends ChangeNotifier {
     bool clearRecurCount = false,
     int? remindOffsetMin,
     String? city,
+    String? coverUrl,
+    bool clearCoverUrl = false,
+    int? sortOrder,
     List<String>? sourceNoteUuids,
   }) async {
     final existing = await _db.noteById(id);
@@ -315,7 +333,44 @@ class AppStore extends ChangeNotifier {
       clearRecurCount: clearRecurCount,
       remindOffsetMin: remindOffsetMin,
       city: city,
+      coverUrl: coverUrl,
+      clearCoverUrl: clearCoverUrl,
+      sortOrder: sortOrder,
       sourceNoteUuids: sourceNoteUuids,
+    );
+    await _publish([(table: 'notes', id: id)]);
+    await reload();
+  }
+
+  /// 备忘拖拽排序（已弃用 UI；保留 API 兼容）。
+  Future<void> reorderMemos(List<int> orderedIds) async {
+    if (orderedIds.isEmpty) return;
+    for (var i = 0; i < orderedIds.length; i++) {
+      await _db.updateNote(id: orderedIds[i], sortOrder: i);
+    }
+    await _publish([
+      for (final id in orderedIds) (table: 'notes', id: id),
+    ]);
+    await reload();
+  }
+
+  /// 备忘置顶 / 取消置顶。
+  Future<void> setMemoPinned(int id, {required bool pinned}) async {
+    await _db.updateNote(
+      id: id,
+      pinnedAt: pinned ? DateTime.now().toUtc() : null,
+      clearPinnedAt: !pinned,
+    );
+    await _publish([(table: 'notes', id: id)]);
+    await reload();
+  }
+
+  /// 备忘办结 / 取消办结。
+  Future<void> setMemoCompleted(int id, {required bool completed}) async {
+    await _db.updateNote(
+      id: id,
+      completedAt: completed ? DateTime.now().toUtc() : null,
+      clearCompletedAt: !completed,
     );
     await _publish([(table: 'notes', id: id)]);
     await reload();
@@ -325,6 +380,23 @@ class AppStore extends ChangeNotifier {
     await _db.deleteNote(id);
     await _publish([(table: 'notes', id: id)]);
     await reload();
+    // 推荐流缓存需立刻刷新；近期/收藏是用户侧记录，保留，点开再提示已删除。
+    await refreshMarketplace();
+  }
+
+  /// 从近期阅读移除（本机 + 云端）。
+  Future<void> removeArticleRead(String noteUuid) async {
+    final uid = user?.id.trim() ?? '';
+    final nid = noteUuid.trim();
+    if (uid.isEmpty || nid.isEmpty) return;
+    await _db.deleteArticleRead(noteUuid: nid, scope: uid);
+    articleReads = await _db.listArticleReads(scope: uid);
+    notifyListeners();
+    try {
+      await SocialApi.instance.deleteArticleReadCloud(nid);
+    } catch (_) {
+      /* 离线稍后同步时可再清 */
+    }
   }
 
   Future<void> setNoteListing({
@@ -347,6 +419,7 @@ class AppStore extends ChangeNotifier {
         body: article.body,
         format: article.format,
         city: article.city,
+        coverUrl: article.coverUrl,
         ownerId: article.ownerId,
         scope: uid,
       );
@@ -360,6 +433,7 @@ class AppStore extends ChangeNotifier {
             body: article.body,
             format: article.format,
             city: article.city,
+            coverUrl: article.coverUrl,
             ownerId: article.ownerId,
           )
           .catchError((_) {});

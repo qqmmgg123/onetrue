@@ -59,7 +59,7 @@ String resolveNoteTitleForSave({
     return suggestNoteTitle(
       title: '',
       body: body,
-      fallback: kind == kNoteKindMemo ? '备忘' : '随笔',
+      fallback: kind == kNoteKindMemo ? '备忘' : '笔记',
     );
   }
   return '';

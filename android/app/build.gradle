@@ -73,6 +73,8 @@ flutter {
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    // 桌面角标（各启动器支持不一；避免旧插件 compileSdk 29）
+    implementation 'me.leolin:ShortcutBadger:1.1.22@aar'
     // 离线中文 ASR（模型首次按需下载，不打进 APK）
     implementation 'com.alphacephei:vosk-android:0.3.47'
     // 微信 HEVC → H.264 硬编（比 video_compress 稳）

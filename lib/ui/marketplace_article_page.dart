@@ -9,12 +9,17 @@ import '../social/social_api.dart';
 import '../social/social_models.dart';
 import '../state/app_store.dart';
 import '../sync/sync_service.dart';
+import 'article_feed_card.dart';
 import 'busy.dart';
 import 'format.dart';
+import 'note_editor_page.dart';
 import 'note_quill.dart';
+import 'open_article.dart';
+import 'quill_image_embed.dart';
+import 'widgets/cover_image.dart';
 import 'widgets/user_avatar.dart';
 
-/// 文章详情：初始在详情；向左滑到作者陋室，向右滑回详情。
+/// 文章详情：作者头像可点进作者文章列表；本人可编辑本机笔记。
 class MarketplaceArticlePage extends StatefulWidget {
   const MarketplaceArticlePage({
     super.key,
@@ -30,70 +35,6 @@ class MarketplaceArticlePage extends StatefulWidget {
 }
 
 class _MarketplaceArticlePageState extends State<MarketplaceArticlePage> {
-  late final PageController _page;
-
-  @override
-  void initState() {
-    super.initState();
-    // 0=详情，1=作者陋室：从详情向左滑到陋室
-    _page = PageController(initialPage: 0);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      context.read<AppStore>().recordArticleOpen(widget.article);
-    });
-  }
-
-  @override
-  void dispose() {
-    _page.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: PageView(
-        controller: _page,
-        children: [
-          _ArticleDetailPane(
-            article: widget.article,
-            highlightCommentId: widget.highlightCommentId,
-            onOpenAuthor: () => _page.animateToPage(
-              1,
-              duration: const Duration(milliseconds: 280),
-              curve: Curves.easeOut,
-            ),
-          ),
-          _AuthorLoushiPane(
-            ownerId: widget.article.ownerId,
-            onBackToArticle: () => _page.animateToPage(
-              0,
-              duration: const Duration(milliseconds: 280),
-              curve: Curves.easeOut,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ArticleDetailPane extends StatefulWidget {
-  const _ArticleDetailPane({
-    required this.article,
-    required this.onOpenAuthor,
-    this.highlightCommentId,
-  });
-
-  final MarketplaceArticle article;
-  final VoidCallback onOpenAuthor;
-  final String? highlightCommentId;
-
-  @override
-  State<_ArticleDetailPane> createState() => _ArticleDetailPaneState();
-}
-
-class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
   late final QuillController _quill;
   final _focus = FocusNode();
   final _scroll = ScrollController();
@@ -107,6 +48,22 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
   List<ArticleComment> _comments = const [];
   bool _loadingSocial = true;
   ArticleComment? _replyingTo;
+  UserProfile? _author;
+
+  bool get _isSelf {
+    final me = AuthService.instance.currentUser?.id ?? '';
+    final oid = widget.article.ownerId.trim();
+    return me.isNotEmpty && oid.isNotEmpty && me == oid;
+  }
+
+  Note? _localNote(AppStore store) {
+    final uuid = widget.article.noteUuid.trim();
+    if (uuid.isEmpty) return null;
+    for (final n in store.notes) {
+      if (n.uuid == uuid) return n;
+    }
+    return null;
+  }
 
   @override
   void initState() {
@@ -118,7 +75,22 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
       document: documentFromBody(a.body, format: a.format),
       selection: const TextSelection.collapsed(offset: 0),
     );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      context.read<AppStore>().recordArticleOpen(widget.article);
+    });
     _loadSocial();
+    _loadAuthor();
+  }
+
+  Future<void> _loadAuthor() async {
+    final oid = widget.article.ownerId.trim();
+    if (oid.isEmpty) return;
+    try {
+      final p = await SocialApi.instance.fetchProfile(oid);
+      if (!mounted) return;
+      setState(() => _author = p);
+    } catch (_) {}
   }
 
   Future<void> _loadSocial() async {
@@ -162,6 +134,53 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
     _commentInput.dispose();
     _quill.dispose();
     super.dispose();
+  }
+
+  Future<void> _openAuthor() async {
+    final oid = widget.article.ownerId.trim();
+    if (oid.isEmpty) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _AuthorArticlesPage(ownerId: oid),
+      ),
+    );
+  }
+
+  Future<void> _editLocal(Note note) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NoteEditorPage(noteId: note.id),
+      ),
+    );
+  }
+
+  Future<void> _deleteLocal(Note note) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除这篇文章？'),
+        content: Text('确认删除「${note.displayTitle}」？删除后无法恢复。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final store = context.read<AppStore>();
+    await runBusy(
+      context,
+      message: '正在删除…',
+      task: () => store.removeNote(note.id),
+    );
+    if (!mounted) return;
+    Navigator.of(context).pop();
   }
 
   Future<void> _toggleLike() async {
@@ -229,7 +248,7 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
     final store = context.read<AppStore>();
     if (store.user == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请先登录再评点')),
+        const SnackBar(content: Text('请先登录再留言')),
       );
       return;
     }
@@ -304,7 +323,10 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
               Expanded(
                 child: Text(
                   c.authorNickname.isEmpty ? '用户' : c.authorNickname,
-                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13,
+                  ),
                 ),
               ),
               Text(
@@ -316,7 +338,7 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
           if (c.replyToNickname.isNotEmpty) ...[
             const SizedBox(height: 4),
             Text(
-              '回书 @${c.replyToNickname}',
+              '回复 @${c.replyToNickname}',
               style: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
             ),
           ],
@@ -326,7 +348,7 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
             alignment: Alignment.centerRight,
             child: TextButton(
               onPressed: () => setState(() => _replyingTo = c),
-              child: const Text('回书'),
+              child: const Text('回复'),
             ),
           ),
         ],
@@ -337,19 +359,39 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
   @override
   Widget build(BuildContext context) {
     final article = widget.article;
+    final store = context.watch<AppStore>();
+    final local = _isSelf ? _localNote(store) : null;
+    final coverUrl = (local?.coverUrl.trim().isNotEmpty == true)
+        ? local!.coverUrl
+        : article.coverUrl;
+    final nick = _author?.displayName.trim().isNotEmpty == true
+        ? _author!.displayName
+        : (_isSelf
+            ? (AuthService.instance.currentUser?.displayName ?? '我')
+            : '作者');
+    final avatar = _isSelf
+        ? (AuthService.instance.currentUser?.avatarUrl ??
+            _author?.avatarUrl ??
+            '')
+        : (_author?.avatarUrl ?? '');
+
     return Scaffold(
       appBar: AppBar(
         title: Text(article.displayTitle),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => Navigator.of(context).maybePop(),
-        ),
         actions: [
-          if (article.ownerId.trim().isNotEmpty)
+          if (local != null) ...[
             TextButton(
-              onPressed: widget.onOpenAuthor,
-              child: const Text('作者陋室'),
+              onPressed: () => _editLocal(local),
+              child: const Text('编辑'),
             ),
+            TextButton(
+              onPressed: () => _deleteLocal(local),
+              child: Text(
+                '删除',
+                style: TextStyle(color: Colors.red.shade700),
+              ),
+            ),
+          ],
         ],
       ),
       body: Column(
@@ -359,6 +401,41 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
               controller: _scroll,
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
               children: [
+                if (coverUrl.trim().isNotEmpty) ...[
+                  CoverImage(
+                    url: coverUrl,
+                    aspectRatio: 16 / 9,
+                    borderRadius: 10,
+                  ),
+                  const SizedBox(height: 14),
+                ],
+                if (article.ownerId.trim().isNotEmpty)
+                  InkWell(
+                    onTap: _openAuthor,
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Row(
+                        children: [
+                          UserAvatar(
+                            url: avatar,
+                            nickname: nick,
+                            radius: 18,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              nick,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                                fontSize: 15,
+                              ),
+                            ),
+                          ),
+                          const Icon(Icons.chevron_right, size: 20),
+                        ],
+                      ),
+                    ),
+                  ),
                 if (article.city.isNotEmpty || article.listedAt != null)
                   Text(
                     [
@@ -380,6 +457,7 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
                   expands: false,
                   showCursor: false,
                   enableInteractiveSelection: true,
+                  embedBuilders: kNoteEmbedBuilders,
                 ),
                 const SizedBox(height: 16),
                 Row(
@@ -412,15 +490,9 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
                     ),
                   ],
                 ),
-                Text(
-                  article.ownerId.trim().isEmpty
-                      ? '向左滑动可查看作者陋室（若已关联作者）。'
-                      : '向左滑动打开作者陋室；向右滑回本文。',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
                 const SizedBox(height: 20),
                 Text(
-                  '评点',
+                  '留言',
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
                 const SizedBox(height: 8),
@@ -432,7 +504,7 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
                 else if (_comments.isEmpty)
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 12),
-                    child: Text('还没有评点，来抢沙发吧'),
+                    child: Text('还没有留言，来抢沙发吧'),
                   )
                 else
                   ..._buildCommentTree(),
@@ -445,7 +517,7 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
               child: ListTile(
                 dense: true,
                 title: Text(
-                  '回书 ${_replyingTo!.authorNickname.isEmpty ? '用户' : _replyingTo!.authorNickname}',
+                  '回复 ${_replyingTo!.authorNickname.isEmpty ? '用户' : _replyingTo!.authorNickname}',
                   style: const TextStyle(fontSize: 13),
                 ),
                 trailing: IconButton(
@@ -466,7 +538,8 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
                       minLines: 1,
                       maxLines: 3,
                       decoration: InputDecoration(
-                        hintText: _replyingTo == null ? '写评点…' : '写回书…',
+                        hintText:
+                            _replyingTo == null ? '写留言…' : '写回复…',
                         isDense: true,
                         filled: true,
                         fillColor: const Color(0xFFF5F5F5),
@@ -488,20 +561,17 @@ class _ArticleDetailPaneState extends State<_ArticleDetailPane> {
   }
 }
 
-class _AuthorLoushiPane extends StatefulWidget {
-  const _AuthorLoushiPane({
-    required this.ownerId,
-    required this.onBackToArticle,
-  });
+/// 作者文章列表（由头像/昵称点入）。
+class _AuthorArticlesPage extends StatefulWidget {
+  const _AuthorArticlesPage({required this.ownerId});
 
   final String ownerId;
-  final VoidCallback onBackToArticle;
 
   @override
-  State<_AuthorLoushiPane> createState() => _AuthorLoushiPaneState();
+  State<_AuthorArticlesPage> createState() => _AuthorArticlesPageState();
 }
 
-class _AuthorLoushiPaneState extends State<_AuthorLoushiPane> {
+class _AuthorArticlesPageState extends State<_AuthorArticlesPage> {
   bool _loading = true;
   String? _error;
   List<MarketplaceArticle> _articles = const [];
@@ -597,7 +667,6 @@ class _AuthorLoushiPaneState extends State<_AuthorLoushiPane> {
         task: () => AuthService.instance.updateAvatarUrl(url),
       );
       await AuthService.instance.refreshProfile();
-      // 清掉旧 NetworkImage 缓存
       imageCache.clear();
       imageCache.clearLiveImages();
       if (!mounted) return;
@@ -629,100 +698,64 @@ class _AuthorLoushiPaneState extends State<_AuthorLoushiPane> {
             '')
         : (_profile?.avatarUrl ?? '');
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('作者陋室'),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: widget.onBackToArticle,
-        ),
+    final header = Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 0),
+      child: Column(
+        children: [
+          GestureDetector(
+            onTap: _isSelf ? _changeAvatar : null,
+            child: Column(
+              children: [
+                UserAvatar(url: avatar, nickname: nick, radius: 40),
+                if (_isSelf)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text(
+                      '点击更换头像',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF888888),
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 10),
+                Text(
+                  nick,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (!_isSelf && widget.ownerId.trim().isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  FilledButton(
+                    onPressed: _followBusy ? null : _toggleFollow,
+                    child: Text(_following ? '已留意' : '留意'),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Divider(height: 1),
+        ],
       ),
+    );
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('作者文章')),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _error != null
               ? Center(child: Text(_error!))
-              : RefreshIndicator(
+              : ArticleFeedGrid(
+                  articles: _articles,
+                  header: header,
                   onRefresh: _load,
-                  child: ListView(
-                    physics: const AlwaysScrollableScrollPhysics(),
-                    children: [
-                      const SizedBox(height: 20),
-                      Center(
-                        child: GestureDetector(
-                          onTap: _isSelf ? _changeAvatar : null,
-                          child: Column(
-                            children: [
-                              UserAvatar(
-                                url: avatar,
-                                nickname: nick,
-                                radius: 40,
-                              ),
-                              if (_isSelf)
-                                const Padding(
-                                  padding: EdgeInsets.only(top: 6),
-                                  child: Text(
-                                    '点击更换头像',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: Color(0xFF888888),
-                                    ),
-                                  ),
-                                ),
-                              const SizedBox(height: 10),
-                              Text(
-                                nick,
-                                style: const TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              if (!_isSelf &&
-                                  widget.ownerId.trim().isNotEmpty) ...[
-                                const SizedBox(height: 12),
-                                FilledButton(
-                                  onPressed: _followBusy ? null : _toggleFollow,
-                                  child: Text(_following ? '已留意' : '留意'),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      const Divider(height: 1),
-                      if (_articles.isEmpty)
-                        const Padding(
-                          padding: EdgeInsets.only(top: 48),
-                          child: Center(child: Text('这位作者还没有上架文章')),
-                        )
-                      else
-                        ...List.generate(_articles.length, (i) {
-                          final a = _articles[i];
-                          return Column(
-                            children: [
-                              ListTile(
-                                leading: const Icon(Icons.article_outlined),
-                                title: Text(a.displayTitle),
-                                subtitle: Text(
-                                  [
-                                    if (a.city.isNotEmpty) a.city,
-                                    '❤ ${a.recommendCount} · 评 ${a.commentCount}',
-                                  ].join(' · '),
-                                ),
-                                onTap: () {
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (_) =>
-                                          MarketplaceArticlePage(article: a),
-                                    ),
-                                  );
-                                },
-                              ),
-                              const Divider(height: 1),
-                            ],
-                          );
-                        }),
-                    ],
+                  onOpen: (a) => openMarketplaceArticle(context, a),
+                  empty: const Padding(
+                    padding: EdgeInsets.only(top: 48),
+                    child: Center(child: Text('这位作者还没有文章')),
                   ),
                 ),
     );

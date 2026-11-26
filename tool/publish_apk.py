@@ -66,6 +66,35 @@ def qiniu_upload_token(ak: str, sk: str, bucket: str, key: str, ttl: int = 3600)
     return f"{ak}:{b64url(sign)}:{encoded}"
 
 
+def _norm_upload_host(raw: str) -> str:
+    host = (raw or "").strip()
+    if not host:
+        return "https://upload.qiniup.com"
+    return host if "://" in host else f"https://{host}"
+
+
+def _upload_host_candidates(primary: str) -> list[str]:
+    """主域名失败时换备用上传域（同账号一般均可，握手超时常见）。"""
+    primary = _norm_upload_host(primary)
+    fallbacks = [
+        primary,
+        "https://up-as0.qiniup.com",
+        "https://upload-as0.qiniup.com",
+        "https://up.qiniup.com",
+        "https://upload.qiniup.com",
+        "https://up-z2.qiniup.com",
+        "https://upload-z2.qiniup.com",
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for h in fallbacks:
+        n = _norm_upload_host(h)
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def qiniu_put_file(
     *,
     ak: str,
@@ -75,9 +104,9 @@ def qiniu_put_file(
     key: str,
     file_path: Path,
     content_type: str,
+    retries: int = 3,
 ) -> None:
     token = qiniu_upload_token(ak, sk, bucket, key)
-    host = upload_host if "://" in upload_host else f"https://{upload_host}"
     boundary = f"----RentAgent{int(time.time())}"
     body = bytearray()
 
@@ -99,19 +128,47 @@ def qiniu_put_file(
     body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
     body.extend(data)
     body.extend(f"\r\n--{boundary}--\r\n".encode())
+    payload = bytes(body)
 
-    req = urllib.request.Request(
-        host.rstrip("/") + "/",
-        data=bytes(body),
-        method="POST",
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=600) as res:
-            if res.status < 200 or res.status >= 300:
-                raise SystemExit(f"上传失败 HTTP {res.status}: {res.read()[:500]!r}")
-    except urllib.error.HTTPError as e:
-        raise SystemExit(f"上传失败 HTTP {e.code}: {e.read()[:800]!r}") from e
+    hosts = _upload_host_candidates(upload_host)
+    last_err: BaseException | None = None
+    for host in hosts:
+        for attempt in range(1, retries + 1):
+            req = urllib.request.Request(
+                host.rstrip("/") + "/",
+                data=payload,
+                method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=600) as res:
+                    if res.status < 200 or res.status >= 300:
+                        raise SystemExit(
+                            f"上传失败 HTTP {res.status}: {res.read()[:500]!r}"
+                        )
+                if host != _norm_upload_host(upload_host) or attempt > 1:
+                    print(f"  上传成功 via {host} (attempt {attempt})")
+                return
+            except urllib.error.HTTPError as e:
+                # 4xx 换域也没用（凭证/权限）；5xx/网络可重试
+                body_snip = e.read()[:800]
+                if e.code and 400 <= e.code < 500 and e.code != 408:
+                    raise SystemExit(f"上传失败 HTTP {e.code}: {body_snip!r}") from e
+                last_err = e
+                print(
+                    f"  上传 HTTP {e.code} @ {host} attempt {attempt}/{retries}，重试…",
+                    file=sys.stderr,
+                )
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_err = e
+                print(
+                    f"  上传网络失败 @ {host} attempt {attempt}/{retries}: {e}",
+                    file=sys.stderr,
+                )
+            time.sleep(min(2 * attempt, 8))
+        print(f"  换上传域名重试…", file=sys.stderr)
+
+    raise SystemExit(f"上传失败（已重试多域名）: {last_err}")
 
 
 def normalize_public_base(raw: str) -> str:

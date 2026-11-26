@@ -39,7 +39,10 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('启用闹钟提醒'),
-                  subtitle: const Text('只在本 App 排程，不写入系统日历'),
+                  subtitle: const Text(
+                    '日程提醒会走系统闹钟通道：通知带关闭/延后，'
+                    '并尽量弹出响铃页；桌面角标视手机品牌而定',
+                  ),
                   value: _settings.enabled,
                   onChanged: (v) => setState(() => _settings.enabled = v),
                 ),
@@ -93,7 +96,9 @@ class _ReminderSettingsPageState extends State<ReminderSettingsPage> {
                   ),
                 const SizedBox(height: 8),
                 Text(
-                  '改备忘/日程提醒后，闹钟会按笔记自动重排。',
+                  '改日程提醒后会自动重排。角标一般为「近 36 小时内」待响提醒数；'
+                  '部分国产桌面不支持数字角标。锁屏全屏响铃需系统允许「全屏通知」。'
+                  '无法 100% 复刻系统时钟 App（受厂商与商店策略限制）。',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
                 const SizedBox(height: 24),

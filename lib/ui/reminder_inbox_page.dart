@@ -141,7 +141,7 @@ class ReminderInboxPage extends StatelessWidget {
             summary: store.isGuest
                 ? '登录后才会记录近期阅读。'
                 : (latestRead == null
-                    ? '还没有阅读记录，去雅集看看文章吧。'
+                    ? '还没有阅读记录，去阅读看看文章吧。'
                     : _readSummary(latestRead)),
             timeLabel: '阅读时间',
             timeText: store.isGuest || latestRead == null
@@ -174,7 +174,7 @@ class ReminderInboxPage extends StatelessWidget {
           const Divider(height: 1),
           _HubRow(
             title: '留意的人',
-            summary: '查看留意用户最新上架的文章',
+            summary: '查看留意用户最新文章',
             timeLabel: '',
             timeText: '',
             actionText: '进入',
@@ -188,8 +188,8 @@ class ReminderInboxPage extends StatelessWidget {
           ),
           const Divider(height: 1),
           _HubRow(
-            title: '评点和回书',
-            summary: '别人评点、回书或推荐你的文章',
+            title: '留言',
+            summary: '别人留言、回复或推荐你的文章',
             timeLabel: '',
             timeText: '',
             actionText: '进入',

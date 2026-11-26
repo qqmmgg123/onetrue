@@ -104,35 +104,48 @@ ThemeData buildAppTheme() {
         backgroundColor: ink,
         foregroundColor: bg,
         elevation: 0,
-        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
     ),
     outlinedButtonTheme: OutlinedButtonThemeData(
       style: OutlinedButton.styleFrom(
         foregroundColor: ink,
         side: const BorderSide(color: line),
-        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
     ),
     textButtonTheme: TextButtonThemeData(
-      style: TextButton.styleFrom(foregroundColor: ink),
+      style: TextButton.styleFrom(
+        foregroundColor: ink,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
     ),
-    inputDecorationTheme: const InputDecorationTheme(
-      border: UnderlineInputBorder(borderSide: BorderSide(color: line)),
-      enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: line)),
-      focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: ink)),
+    inputDecorationTheme: InputDecorationTheme(
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: const BorderSide(color: line),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: const BorderSide(color: line),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: const BorderSide(color: ink),
+      ),
       isDense: true,
     ),
-    snackBarTheme: const SnackBarThemeData(
+    snackBarTheme: SnackBarThemeData(
       backgroundColor: ink,
-      contentTextStyle: TextStyle(color: bg),
+      contentTextStyle: const TextStyle(color: bg),
       behavior: SnackBarBehavior.floating,
       elevation: 0,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
     ),
-    dialogTheme: const DialogTheme(
+    dialogTheme: DialogTheme(
       elevation: 0,
       backgroundColor: bg,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
     ),
     progressIndicatorTheme: const ProgressIndicatorThemeData(color: ink),
     switchTheme: SwitchThemeData(

@@ -16,7 +16,7 @@ class MineSettingsPage extends StatelessWidget {
     final store = context.watch<AppStore>();
     final email = store.user?.emailMasked ?? '';
     return Scaffold(
-      appBar: AppBar(title: const Text('设置')),
+      appBar: AppBar(title: const Text('账号设置')),
       body: ListView(
         children: [
           if (email.isNotEmpty) ...[

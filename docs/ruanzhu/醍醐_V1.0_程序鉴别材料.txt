@@ -1,0 +1,3069 @@
+醍醐 V1.0 程序鉴别材料（一般交存）
+交存方式：前30页+后30页
+每页行数：50
+源文件数：86
+源码总行数（含文件头标记）：26135
+
+// ===== FILE: lib/agent/agent_models.dart =====
+enum ChatRole { user, assistant, system }
+
+class ChatMessage {
+  const ChatMessage({
+    required this.role,
+    required this.text,
+    this.pending,
+    this.confirmed,
+  });
+
+  final ChatRole role;
+  final String text;
+  final PendingAction? pending;
+  final bool? confirmed;
+}
+
+/// 写操作先挂起，用户点确认后才真正落库。
+class PendingAction {
+  PendingAction({
+    required this.id,
+    required this.tool,
+    required this.args,
+    required this.summary,
+  });
+
+  final String id;
+  final String tool;
+  final Map<String, dynamic> args;
+  final String summary;
+}
+
+class AgentReply {
+  AgentReply({
+    required this.text,
+    this.pending,
+  });
+
+  final String text;
+  final PendingAction? pending;
+}
+
+// ===== FILE: lib/agent/agent_orchestrator.dart =====
+import 'package:uuid/uuid.dart';
+
+import 'agent_models.dart';
+import 'agent_settings.dart';
+import 'agent_tools.dart';
+import 'chat_memory.dart';
+import 'llm_client.dart';
+
+import 'local_agent.dart';
+
+class AgentTurnResult {
+  AgentTurnResult({
+    required this.reply,
+    required this.sticky,
+    required this.usage,
+  });
+
+  final AgentReply reply;
+  final SessionSticky sticky;
+  final ContextUsage usage;
+}
+
+class AgentOrchestrator {
+  AgentOrchestrator(this.runner, {AgentSettings? settings})
+      : settings = settings ?? AgentSettings.instance,
+        _local = LocalAgent(runner);
+
+  final AgentToolRunner runner;
+  final AgentSettings settings;
+  final LocalAgent _local;
+  final _uuid = const Uuid();
+
+  static const systemPrompt = '''
+你是「醍醐」里的全能 AI：可以闲聊、解答问题、帮忙构思与写作；同时能通过 tools 操作用户的笔记本（随笔/备忘/日程/文章）。
+用户像微信一样随便聊；不要要求固定格式。没有对应 tool 的事，用自然语言直接答即可。
+笔记技能：
+1. 只能通过提供的 tools 查询或修改笔记本；不要假装已改数据。
+2. create_note / update_note / list_notes；形态互转 convert_note_kind；多篇整理成文 merge_notes_to_article（默认保留原文）；文章上架 publish_note / 下架 unpublish_note。
+3. 写文章/整理文章时 body 必须是完整纯文本正文（不要只写标题；不要 Markdown 代码块或 JSON）。
+4. 日程重复用 recur_freq/recur_byday/recur_until|recur_count；remind_offset_min 为相对提醒（-1=不提醒）；备忘用 remind_at，禁止设为过去的时间，不提醒则不传。
+5. 用户只要把正文「贴到对话里/发给我看」时，用自然语言回复正文，不要为此调用写工具。
+6. 写操作提议后等用户确认再执行；回复尽量短。
+''';
+
+  Future<AgentTurnResult> handleTurn({
+    required String userText,
+    required List<ChatMessage> priorMessages,
+    required SessionSticky sticky,
+  }) async {
+    var nextSticky = mergeStickyFromUtterance(sticky, userText);
+    final packed = packConversation(
+      all: priorMessages,
+      system: systemPrompt,
+      inventory: '',
+      sticky: nextSticky,
+      userText: userText,
+      model: settings.effectiveChatModel,
+    );
+
+
+    if (!settings.hasLlm) {
+      var reply = await _local.handle(userText, sticky: nextSticky);
+      if (runner.store.isGuest && reply.pending != null) {
+        reply = AgentReply(
+          text: '游客可以随便聊，但改笔记本需要先注册登录。'
+              '点右上角「登录/注册」即可。',
+        );
+      }
+      nextSticky = mergeStickyFromUtterance(
+        nextSticky,
+        userText,
+        pending: reply.pending,
+      );
+      if (packed.rolledSummary != null) {
+        nextSticky.summary = packed.rolledSummary;
+      }
+      final inventory = await runner.runRead('list_notes', {});
+      final usage = packConversation(
+        all: priorMessages,
+        system: systemPrompt,
+        inventory: inventory,
+        sticky: nextSticky,
+        userText: userText,
+        model: settings.effectiveChatModel,
+      ).usage;
+      return AgentTurnResult(reply: reply, sticky: nextSticky, usage: usage);
+    }
+
+    if (runner.store.isLandlord) {
+      final direct = await _local.tryDirectWrite(userText, sticky: nextSticky);
+      if (direct != null && direct.pending != null) {
+        nextSticky = mergeStickyFromUtterance(
+          nextSticky,
+          userText,
+          pending: direct.pending,
+        );
+        final inventory = await runner.runRead('list_notes', {});
+        final usage = packConversation(
+          all: priorMessages,
+          system: systemPrompt,
+          inventory: inventory,
+          sticky: nextSticky,
+          userText: userText,
+          model: settings.effectiveChatModel,
+        ).usage;
+        return AgentTurnResult(reply: direct, sticky: nextSticky, usage: usage);
+      }
+    }
+
+
+    try {
+      final result = await _handleWithLlm(
+        userText: userText,
+        priorMessages: priorMessages,
+        sticky: nextSticky,
+      );
+      nextSticky = mergeStickyFromUtterance(
+        nextSticky,
+        userText,
+        pending: result.reply.pending,
+      );
+      if (result.rolledSummary != null) {
+        nextSticky.summary = result.rolledSummary;
+      }
+      return AgentTurnResult(
+        reply: result.reply,
+        sticky: nextSticky,
+        usage: result.usage,
+      );
+    } catch (e) {
+      final fallback = await _local.handle(userText, sticky: nextSticky);
+      nextSticky = mergeStickyFromUtterance(
+        nextSticky,
+        userText,
+        pending: fallback.pending,
+      );
+      final inventory = await runner.runRead('list_notes', {});
+      final usage = packConversation(
+        all: priorMessages,
+        system: systemPrompt,
+        inventory: inventory,
+        sticky: nextSticky,
+        userText: userText,
+        model: settings.effectiveChatModel,
+      ).usage;
+      if (fallback.pending != null || !fallback.text.contains('还没听懂')) {
+        return AgentTurnResult(
+          reply: AgentReply(
+            text: '大模型调用失败（$e），已改用本地理解：\n${fallback.text}',
+            pending: fallback.pending,
+          ),
+          sticky: nextSticky,
+          usage: usage,
+        );
+      }
+      return AgentTurnResult(
+        reply: AgentReply(
+          text: '大模型调用失败：$e\n也可先用本地说法，发「帮助」查看示例。',
+        ),
+        sticky: nextSticky,
+
+        usage: usage,
+      );
+    }
+  }
+
+  Future<({AgentReply reply, ContextUsage usage, String? rolledSummary})>
+      _handleWithLlm({
+    required String userText,
+    required List<ChatMessage> priorMessages,
+    required SessionSticky sticky,
+  }) async {
+    final inventory = await runner.runRead('list_notes', {});
+    final packed = packConversation(
+      all: priorMessages,
+      system: systemPrompt,
+      inventory: inventory,
+      sticky: sticky,
+      userText: userText,
+      model: settings.effectiveChatModel,
+    );
+
+    final llm = LlmClient(settings);
+    final result = await llm.chat(
+      system: systemPrompt,
+      user: userText,
+      inventoryContext: inventory,
+      sticky: sticky,
+      history: packed.history,
+      rolledSummary: packed.rolledSummary,
+      landlord: runner.store.isLandlord,
+    );
+
+    if (result.toolCalls.isEmpty) {
+      return (
+        reply: AgentReply(
+          text: (result.content == null || result.content!.trim().isEmpty)
+              ? '可以说得更具体一点，或让我「记一下…」「列出笔记」。'
+              : result.content!.trim(),
+        ),
+        usage: packed.usage,
+        rolledSummary: packed.rolledSummary,
+      );
+    }
+
+    final call = result.toolCalls.first;
+    if (!writeTools.contains(call.name)) {
+      final out = await runner.runRead(call.name, call.arguments);
+      final prefix = (result.content == null || result.content!.trim().isEmpty)
+          ? ''
+          : '${result.content!.trim()}\n\n';
+
+      return (
+        reply: AgentReply(text: '$prefix$out'),
+        usage: packed.usage,
+        rolledSummary: packed.rolledSummary,
+      );
+    }
+
+    if (runner.store.isGuest) {
+      return (
+        reply: AgentReply(
+          text: '游客可以随便聊，但改笔记本需要先注册登录。'
+              '点右上角「登录/注册」即可。',
+        ),
+        usage: packed.usage,
+        rolledSummary: packed.rolledSummary,
+      );
+    }
+
+    final action = PendingAction(
+      id: _uuid.v4(),
+      tool: call.name,
+      args: call.arguments,
+      summary: runner.summarize(call.name, call.arguments),
+    );
+    final tip = (result.content == null || result.content!.trim().isEmpty)
+        ? '确认要执行吗？'
+        : result.content!.trim();
+    return (
+      reply: AgentReply(text: '$tip\n${action.summary}', pending: action),
+      usage: packed.usage,
+      rolledSummary: packed.rolledSummary,
+    );
+  }
+
+  Future<String> confirm(PendingAction action) => runner.commit(action);
+}
+
+// ===== FILE: lib/agent/agent_settings.dart =====
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../config/baked_env.dart';
+import 'llm_providers.dart';
+
+class AgentSettings {
+  AgentSettings._();
+  static final AgentSettings instance = AgentSettings._();
+
+  static const _kProvider = 'agent_llm_provider';
+  static const _kBaseUrl = 'agent_base_url';
+  static const _kApiKey = '***REDACTED***';
+
+  static const _kModel = 'agent_model';
+  static const _kUseLlm = 'agent_use_llm';
+  static const _kUseCloudAsr = 'agent_use_cloud_asr';
+  static const _kAsrModel = 'agent_asr_model';
+  static const _kAsrBaseUrl = 'agent_asr_base_url';
+  static const _kAsrApiKey = '***REDACTED***';
+  static const _kGroqApiKey = '***REDACTED***';
+  static const _kGroqBaseUrl = 'agent_groq_base_url';
+  static const _kGroqAsrModel = 'agent_groq_asr_model';
+  static const _kBaiduAsrApiKey = '***REDACTED***';
+  static const _kBaiduAsrSecretKey = 'agent_baidu_asr_secret_key';
+  static const _kBaiduLlmApiKey = '***REDACTED***';
+  static const _kBaiduLlmBaseUrl = 'agent_baidu_llm_base_url';
+  static const _kBaiduLlmModel = 'agent_baidu_llm_model';
+  static const _kZhipuChatModel = 'agent_zhipu_chat_model';
+  static const _kSiliconChatModel = 'agent_silicon_chat_model';
+  static const _kOneApiBaseUrl = 'agent_one_api_base_url';
+  static const _kOneApiKey = '***REDACTED***';
+  static const _kOneApiModel = 'agent_one_api_model';
+  static const _kGeminiApiKey = '***REDACTED***';
+  static const _kGeminiVisionModel = 'agent_gemini_vision_model';
+  static const _kZhipuApiKey = '***REDACTED***';
+  static const _kZhipuBaseUrl = 'agent_zhipu_base_url';
+  static const _kZhipuVisionModel = 'agent_zhipu_vision_model';
+  static const _kDeepseekVisionModel = 'agent_deepseek_vision_model';
+  static const _kVisionBaseUrl = 'agent_vision_base_url';
+  static const _kVisionApiKey = '***REDACTED***';
+  static const _kVisionModels = 'agent_vision_models';
+
+  /// auto | zhipu | baidu | silicon | oneapi | deepseek
+  String llmProvider = LlmProviderId.auto;
+
+  /// DeepSeek（高级 / 付费）
+  String baseUrl = LlmProviderDefaults.deepseekBase;
+  String apiKey = '';
+  String model = LlmProviderDefaults.deepseekModel;
+  bool useLlm = false;
+
+  /// 开启后按住说话走云端级联：百度 → Groq → SenseVoice → 系统语音。
+  bool useCloudAsr = true;
+
+  /// 硅基流动 SenseVoice（第三优先）
+  String asrModel = 'FunAudioLLM/SenseVoiceSmall';
+  String asrBaseUrl = LlmProviderDefaults.siliconBase;
+  String asrApiKey = '';
+  String siliconChatModel = LlmProviderDefaults.siliconModel;
+
+  /// Groq Whisper（第二优先）
+  String groqApiKey = '';
+  String groqBaseUrl = 'https://api.groq.com/openai/v1';
+
+  String groqAsrModel = 'whisper-large-v3-turbo';
+
+  /// 百度智能云短语音（第一优先）
+  String baiduAsrApiKey = '';
+  String baiduAsrSecretKey = '';
+
+  /// 百度千帆对话
+  String baiduLlmApiKey = '';
+  String baiduLlmBaseUrl = LlmProviderDefaults.baiduBase;
+  String baiduLlmModel = LlmProviderDefaults.baiduModel;
+
+  /// 附图理解
+  String geminiApiKey = '';
+  String geminiVisionModel = 'gemini-2.5-flash';
+  String zhipuApiKey = '';
+  String zhipuBaseUrl = LlmProviderDefaults.zhipuBase;
+  String zhipuChatModel = LlmProviderDefaults.zhipuModel;
+  String zhipuVisionModel = 'glm-4v-flash';
+  String deepseekVisionModel = 'deepseek-flash';
+  String visionBaseUrl = '';
+  String visionApiKey = '';
+  String visionModels =
+      'deepseek-ai/DeepSeek-OCR,PaddlePaddle/PaddleOCR-VL-1.5';
+
+  /// One API 网关
+  String oneApiBaseUrl = '';
+  String oneApiKey = '';
+  String oneApiModel = '';
+
+  bool get hasLlm => useLlm && resolveEndpoints().isNotEmpty;
+
+  /// 当前实际将调用的模型名（用于上下文窗口估算）。
+  String get effectiveChatModel {
+    final eps = resolveEndpoints();
+    if (eps.isEmpty) return model;
+    final m = eps.first.model;
+    if (m.isEmpty || m == 'default') return model;
+    return m;
+  }
+
+  bool get hasGeminiVision => geminiApiKey.trim().isNotEmpty;
+
+  bool get hasZhipuVision => zhipuApiKey.trim().isNotEmpty;
+
+  bool get hasDeepseekVision =>
+      apiKey.trim().isNotEmpty && baseUrl.toLowerCase().contains('deepseek');
+
+  String get deepseekVisionBaseUrl {
+    final b = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    if (b.contains('deepseek')) return b;
+
+    return 'https://api.deepseek.com';
+  }
+
+  String get effectiveVisionBaseUrl {
+    final v = visionBaseUrl.trim();
+    if (v.isNotEmpty) return v;
+    final asr = asrBaseUrl.trim();
+    if (asr.isNotEmpty && asr.contains('siliconflow')) return asr;
+    if (asr.isNotEmpty && !asr.contains('deepseek')) return asr;
+    return LlmProviderDefaults.siliconBase;
+  }
+
+  String get effectiveVisionApiKey {
+    final v = visionApiKey.trim();
+    if (v.isNotEmpty) return v;
+    return asrApiKey.trim();
+  }
+
+  bool get hasSiliconVision => effectiveVisionApiKey.isNotEmpty;
+
+  List<String> get siliconVisionModels => visionModels
+      .split(',')
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList();
+
+  String get effectiveAsrBaseUrl {
+    final v = asrBaseUrl.trim();
+    if (v.isNotEmpty) return v;
+    return baseUrl;
+  }
+
+  String get effectiveAsrApiKey {
+    final v = asrApiKey.trim();
+    if (v.isNotEmpty) return v;
+    return apiKey.trim();
+  }
+
+  bool get hasBaiduAsr =>
+      useCloudAsr &&
+      baiduAsrApiKey.trim().isNotEmpty &&
+      baiduAsrSecretKey.trim().isNotEmpty;
+
+  bool get hasGroqAsr => useCloudAsr && groqApiKey.trim().isNotEmpty;
+
+  bool get hasSenseVoiceAsr => useCloudAsr && effectiveAsrApiKey.isNotEmpty;
+
+  bool get hasCloudAsr => hasBaiduAsr || hasGroqAsr || hasSenseVoiceAsr;
+
+  bool get providerKeysBundled => BakedEnv.hasBundle;
+
+
+  bool get hasOneApiConfigured =>
+      oneApiBaseUrl.trim().isNotEmpty && oneApiKey.trim().isNotEmpty;
+
+  LlmEndpoint? get _zhipuEndpoint {
+    final key = zhipuApiKey.trim();
+    if (key.isEmpty) return null;
+    return LlmEndpoint(
+      id: LlmProviderId.zhipu,
+      name: '智谱',
+      baseUrl: zhipuBaseUrl.trim().isEmpty
+          ? LlmProviderDefaults.zhipuBase
+          : zhipuBaseUrl.trim(),
+      apiKey: key,
+      model: zhipuChatModel.trim().isEmpty
+          ? LlmProviderDefaults.zhipuModel
+          : zhipuChatModel.trim(),
+    );
+  }
+
+  LlmEndpoint? get _baiduEndpoint {
+    final key = baiduLlmApiKey.trim();
+    if (key.isEmpty) return null;
+    return LlmEndpoint(
+      id: LlmProviderId.baidu,
+      name: '百度千帆',
+      baseUrl: baiduLlmBaseUrl.trim().isEmpty
+          ? LlmProviderDefaults.baiduBase
+          : baiduLlmBaseUrl.trim(),
+      apiKey: key,
+      model: baiduLlmModel.trim().isEmpty
+          ? LlmProviderDefaults.baiduModel
+          : baiduLlmModel.trim(),
+    );
+  }
+
+  LlmEndpoint? get _siliconEndpoint {
+    final key = asrApiKey.trim();
+    if (key.isEmpty) return null;
+    return LlmEndpoint(
+      id: LlmProviderId.silicon,
+      name: '硅基流动',
+      baseUrl: asrBaseUrl.trim().isEmpty
+          ? LlmProviderDefaults.siliconBase
+          : asrBaseUrl.trim(),
+      apiKey: key,
+      model: siliconChatModel.trim().isEmpty
+          ? LlmProviderDefaults.siliconModel
+          : siliconChatModel.trim(),
+    );
+
+  }
+
+  LlmEndpoint? get _oneApiEndpoint {
+    if (!hasOneApiConfigured) return null;
+    final m = oneApiModel.trim();
+    return LlmEndpoint(
+      id: LlmProviderId.oneapi,
+      name: 'One API',
+      baseUrl: oneApiBaseUrl.trim(),
+      apiKey: oneApiKey.trim(),
+      // 网关可空模型名时用占位，由网关默认渠道处理；仍要求非空以便 usable
+      model: m.isEmpty ? 'default' : m,
+    );
+  }
+
+  LlmEndpoint? get _deepseekEndpoint {
+    final key = apiKey.trim();
+    if (key.isEmpty) return null;
+    return LlmEndpoint(
+      id: LlmProviderId.deepseek,
+      name: 'DeepSeek',
+      baseUrl: baseUrl.trim().isEmpty
+          ? LlmProviderDefaults.deepseekBase
+          : baseUrl.trim(),
+      apiKey: key,
+      model: model.trim().isEmpty
+          ? LlmProviderDefaults.deepseekModel
+          : model.trim(),
+    );
+  }
+
+  /// 按当前厂商模式返回有序可调端点（仅 usable）。
+  List<LlmEndpoint> resolveEndpoints() {
+    LlmEndpoint? one(String id) {
+      switch (id) {
+        case LlmProviderId.zhipu:
+          return _zhipuEndpoint;
+        case LlmProviderId.baidu:
+          return _baiduEndpoint;
+        case LlmProviderId.silicon:
+          return _siliconEndpoint;
+        case LlmProviderId.oneapi:
+          return _oneApiEndpoint;
+        case LlmProviderId.deepseek:
+          return _deepseekEndpoint;
+        default:
+          return null;
+      }
+    }
+
+
+    final mode = llmProvider.trim().isEmpty
+        ? LlmProviderId.auto
+        : llmProvider.trim();
+
+    if (mode == LlmProviderId.auto) {
+      // 有网关则只走网关；否则智谱 → 百度 → 硅基
+      final gateway = _oneApiEndpoint;
+      if (gateway != null && gateway.usable) return [gateway];
+      return [
+        _zhipuEndpoint,
+        _baiduEndpoint,
+        _siliconEndpoint,
+      ].whereType<LlmEndpoint>().where((e) => e.usable).toList();
+    }
+
+    final ep = one(mode);
+    if (ep != null && ep.usable) return [ep];
+    return const [];
+  }
+
+  Future<void> load() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    llmProvider = _pick(
+      BakedEnv.llmProvider,
+      prefs.getString(_kProvider),
+      LlmProviderId.auto,
+    );
+    if (!LlmProviderId.visibleChoices.contains(llmProvider) &&
+        llmProvider != LlmProviderId.deepseek) {
+      llmProvider = LlmProviderId.auto;
+    }
+
+    baseUrl = _pick(BakedEnv.llmBaseUrl, prefs.getString(_kBaseUrl), baseUrl);
+    apiKey = _pick(BakedEnv.llmApiKey, prefs.getString(_kApiKey), '');
+    model = _pick(BakedEnv.llmModel, prefs.getString(_kModel), model);
+    asrModel = _pick(BakedEnv.asrModel, prefs.getString(_kAsrModel), asrModel);
+    asrBaseUrl =
+        _pick(BakedEnv.asrBaseUrl, prefs.getString(_kAsrBaseUrl), asrBaseUrl);
+    asrApiKey = _pick(BakedEnv.asrApiKey, prefs.getString(_kAsrApiKey), '');
+    siliconChatModel = _pick(
+      BakedEnv.siliconChatModel,
+      prefs.getString(_kSiliconChatModel),
+      siliconChatModel,
+    );
+    groqApiKey = _pick(BakedEnv.groqApiKey, prefs.getString(_kGroqApiKey), '');
+    groqBaseUrl =
+        _pick(BakedEnv.groqBaseUrl, prefs.getString(_kGroqBaseUrl), groqBaseUrl);
+    groqAsrModel = _pick(
+      BakedEnv.groqAsrModel,
+
+      prefs.getString(_kGroqAsrModel),
+      groqAsrModel,
+    );
+    baiduAsrApiKey = _pick(
+      BakedEnv.baiduAsrApiKey,
+      prefs.getString(_kBaiduAsrApiKey),
+      '',
+    );
+    baiduAsrSecretKey = _pick(
+      BakedEnv.baiduAsrSecretKey,
+      prefs.getString(_kBaiduAsrSecretKey),
+      '',
+    );
+    baiduLlmApiKey = _pick(
+      BakedEnv.baiduLlmApiKey,
+      prefs.getString(_kBaiduLlmApiKey),
+      '',
+    );
+    baiduLlmBaseUrl = _pick(
+      BakedEnv.baiduLlmBaseUrl,
+      prefs.getString(_kBaiduLlmBaseUrl),
+      baiduLlmBaseUrl,
+    );
+    baiduLlmModel = _pick(
+      BakedEnv.baiduLlmModel,
+      prefs.getString(_kBaiduLlmModel),
+      baiduLlmModel,
+    );
+    oneApiBaseUrl = _pick(
+      BakedEnv.oneApiBaseUrl,
+      prefs.getString(_kOneApiBaseUrl),
+      '',
+    );
+    oneApiKey = _pick(BakedEnv.oneApiKey, prefs.getString(_kOneApiKey), '');
+    oneApiModel = _pick(
+      BakedEnv.oneApiModel,
+      prefs.getString(_kOneApiModel),
+      '',
+    );
+    geminiApiKey = _pick(
+      BakedEnv.geminiApiKey,
+      prefs.getString(_kGeminiApiKey),
+      '',
+    );
+    geminiVisionModel = _pick(
+      BakedEnv.geminiVisionModel,
+      prefs.getString(_kGeminiVisionModel),
+      geminiVisionModel,
+    );
+    zhipuApiKey = _pick(
+
+      BakedEnv.zhipuApiKey,
+      prefs.getString(_kZhipuApiKey),
+      '',
+    );
+    zhipuBaseUrl = _pick(
+      BakedEnv.zhipuBaseUrl,
+      prefs.getString(_kZhipuBaseUrl),
+      zhipuBaseUrl,
+    );
+    zhipuChatModel = _pick(
+      BakedEnv.zhipuChatModel,
+      prefs.getString(_kZhipuChatModel),
+      zhipuChatModel,
+    );
+    zhipuVisionModel = _pick(
+      BakedEnv.zhipuVisionModel,
+      prefs.getString(_kZhipuVisionModel),
+      zhipuVisionModel,
+    );
+    deepseekVisionModel = _pick(
+      BakedEnv.deepseekVisionModel,
+      prefs.getString(_kDeepseekVisionModel),
+      deepseekVisionModel,
+    );
+    visionBaseUrl = _pick(
+      BakedEnv.visionBaseUrl,
+      prefs.getString(_kVisionBaseUrl),
+      '',
+    );
+    visionApiKey = _pick(
+      BakedEnv.visionApiKey,
+      prefs.getString(_kVisionApiKey),
+      '',
+    );
+    visionModels = _pick(
+      BakedEnv.visionModels,
+      prefs.getString(_kVisionModels),
+      visionModels,
+    );
+
+    if (prefs.containsKey(_kUseLlm)) {
+      useLlm = prefs.getBool(_kUseLlm) ?? false;
+    } else if (BakedEnv.hasAnyChatLlmKey) {
+      useLlm = BakedEnv.useLlm;
+    } else {
+      useLlm = false;
+    }
+
+    if (prefs.containsKey(_kUseCloudAsr)) {
+      useCloudAsr = prefs.getBool(_kUseCloudAsr) ?? true;
+
+    } else {
+      useCloudAsr = BakedEnv.useCloudAsr;
+    }
+  }
+
+  static String _pick(String baked, String? pref, String fallback) {
+    if (baked.trim().isNotEmpty) return baked.trim();
+    if (pref != null && pref.trim().isNotEmpty) return pref.trim();
+    return fallback;
+  }
+
+  Future<void> save({
+    String? llmProvider,
+    required String baseUrl,
+    required String apiKey,
+    required String model,
+    required bool useLlm,
+    bool? useCloudAsr,
+    String? asrModel,
+    String? asrBaseUrl,
+    String? asrApiKey,
+    String? siliconChatModel,
+    String? groqApiKey,
+    String? groqBaseUrl,
+    String? groqAsrModel,
+    String? baiduAsrApiKey,
+    String? baiduAsrSecretKey,
+    String? baiduLlmApiKey,
+    String? baiduLlmBaseUrl,
+    String? baiduLlmModel,
+    String? zhipuApiKey,
+    String? zhipuBaseUrl,
+    String? zhipuChatModel,
+    String? oneApiBaseUrl,
+    String? oneApiKey,
+    String? oneApiModel,
+    String? geminiApiKey,
+    String? geminiVisionModel,
+    String? visionBaseUrl,
+    String? visionApiKey,
+    String? visionModels,
+  }) async {
+    if (llmProvider != null && llmProvider.trim().isNotEmpty) {
+      this.llmProvider = llmProvider.trim();
+    }
+
+    if (!BakedEnv.hasBundle) {
+      this.baseUrl = baseUrl.trim().isEmpty
+          ? LlmProviderDefaults.deepseekBase
+          : baseUrl.trim();
+
+      this.apiKey = apiKey.trim();
+      this.model = model.trim().isEmpty
+          ? LlmProviderDefaults.deepseekModel
+          : model.trim();
+      if (asrModel != null) {
+        this.asrModel = asrModel.trim().isEmpty
+            ? 'FunAudioLLM/SenseVoiceSmall'
+            : asrModel.trim();
+      }
+      if (asrBaseUrl != null) {
+        this.asrBaseUrl = asrBaseUrl.trim().isEmpty
+            ? LlmProviderDefaults.siliconBase
+            : asrBaseUrl.trim();
+      }
+      if (asrApiKey != null) this.asrApiKey = asrApiKey.trim();
+      if (siliconChatModel != null) {
+        this.siliconChatModel = siliconChatModel.trim().isEmpty
+            ? LlmProviderDefaults.siliconModel
+            : siliconChatModel.trim();
+      }
+      if (groqApiKey != null) this.groqApiKey = groqApiKey.trim();
+      if (groqBaseUrl != null) {
+        this.groqBaseUrl = groqBaseUrl.trim().isEmpty
+            ? 'https://api.groq.com/openai/v1'
+            : groqBaseUrl.trim();
+      }
+      if (groqAsrModel != null) {
+        this.groqAsrModel = groqAsrModel.trim().isEmpty
+            ? 'whisper-large-v3-turbo'
+            : groqAsrModel.trim();
+      }
+      if (baiduAsrApiKey != null) {
+        this.baiduAsrApiKey = baiduAsrApiKey.trim();
+      }
+      if (baiduAsrSecretKey != null) {
+        this.baiduAsrSecretKey = baiduAsrSecretKey.trim();
+      }
+      if (baiduLlmApiKey != null) this.baiduLlmApiKey = baiduLlmApiKey.trim();
+      if (baiduLlmBaseUrl != null) {
+        this.baiduLlmBaseUrl = baiduLlmBaseUrl.trim().isEmpty
+            ? LlmProviderDefaults.baiduBase
+            : baiduLlmBaseUrl.trim();
+      }
+      if (baiduLlmModel != null) {
+        this.baiduLlmModel = baiduLlmModel.trim().isEmpty
+            ? LlmProviderDefaults.baiduModel
+            : baiduLlmModel.trim();
+      }
+      if (zhipuApiKey != null) this.zhipuApiKey = zhipuApiKey.trim();
+      if (zhipuBaseUrl != null) {
+
+        this.zhipuBaseUrl = zhipuBaseUrl.trim().isEmpty
+            ? LlmProviderDefaults.zhipuBase
+            : zhipuBaseUrl.trim();
+      }
+      if (zhipuChatModel != null) {
+        this.zhipuChatModel = zhipuChatModel.trim().isEmpty
+            ? LlmProviderDefaults.zhipuModel
+            : zhipuChatModel.trim();
+      }
+      if (oneApiBaseUrl != null) this.oneApiBaseUrl = oneApiBaseUrl.trim();
+      if (oneApiKey != null) this.oneApiKey = oneApiKey.trim();
+      if (oneApiModel != null) this.oneApiModel = oneApiModel.trim();
+      if (geminiApiKey != null) this.geminiApiKey = geminiApiKey.trim();
+      if (geminiVisionModel != null) {
+        this.geminiVisionModel = geminiVisionModel.trim().isEmpty
+            ? 'gemini-2.5-flash'
+            : geminiVisionModel.trim();
+      }
+      if (visionBaseUrl != null) this.visionBaseUrl = visionBaseUrl.trim();
+      if (visionApiKey != null) this.visionApiKey = visionApiKey.trim();
+      if (visionModels != null && visionModels.trim().isNotEmpty) {
+        this.visionModels = visionModels.trim();
+      }
+    }
+
+    this.useLlm = useLlm;
+    if (useCloudAsr != null) this.useCloudAsr = useCloudAsr;
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kProvider, this.llmProvider);
+    if (!BakedEnv.hasBundle) {
+      await prefs.setString(_kBaseUrl, this.baseUrl);
+      await prefs.setString(_kApiKey, this.apiKey);
+      await prefs.setString(_kModel, this.model);
+      await prefs.setString(_kAsrModel, this.asrModel);
+      await prefs.setString(_kAsrBaseUrl, this.asrBaseUrl);
+      await prefs.setString(_kAsrApiKey, this.asrApiKey);
+      await prefs.setString(_kSiliconChatModel, this.siliconChatModel);
+      await prefs.setString(_kGroqApiKey, this.groqApiKey);
+      await prefs.setString(_kGroqBaseUrl, this.groqBaseUrl);
+      await prefs.setString(_kGroqAsrModel, this.groqAsrModel);
+      await prefs.setString(_kBaiduAsrApiKey, this.baiduAsrApiKey);
+      await prefs.setString(_kBaiduAsrSecretKey, this.baiduAsrSecretKey);
+      await prefs.setString(_kBaiduLlmApiKey, this.baiduLlmApiKey);
+      await prefs.setString(_kBaiduLlmBaseUrl, this.baiduLlmBaseUrl);
+      await prefs.setString(_kBaiduLlmModel, this.baiduLlmModel);
+      await prefs.setString(_kZhipuApiKey, this.zhipuApiKey);
+      await prefs.setString(_kZhipuBaseUrl, this.zhipuBaseUrl);
+      await prefs.setString(_kZhipuChatModel, this.zhipuChatModel);
+      await prefs.setString(_kOneApiBaseUrl, this.oneApiBaseUrl);
+
+      await prefs.setString(_kOneApiKey, this.oneApiKey);
+      await prefs.setString(_kOneApiModel, this.oneApiModel);
+      await prefs.setString(_kGeminiApiKey, this.geminiApiKey);
+      await prefs.setString(_kGeminiVisionModel, this.geminiVisionModel);
+      await prefs.setString(_kVisionBaseUrl, this.visionBaseUrl);
+      await prefs.setString(_kVisionApiKey, this.visionApiKey);
+      await prefs.setString(_kVisionModels, this.visionModels);
+    }
+    await prefs.setBool(_kUseLlm, this.useLlm);
+    await prefs.setBool(_kUseCloudAsr, this.useCloudAsr);
+  }
+}
+
+// ===== FILE: lib/agent/agent_tools.dart =====
+import '../domain/ai_text.dart';
+import '../domain/models.dart';
+import '../domain/note_recur.dart';
+import '../state/app_store.dart';
+import 'agent_models.dart';
+
+const writeTools = {
+  'create_note',
+  'update_note',
+  'convert_note_kind',
+  'merge_notes_to_article',
+  'publish_note',
+  'unpublish_note',
+};
+
+/// 游客只下发只读 tools，避免模型提议写操作。
+List<Map<String, dynamic>> toolSchemasFor({required bool landlord}) {
+  if (landlord) return toolSchemas;
+  return toolSchemas.where((t) {
+    final fn = t['function'];
+    if (fn is! Map) return false;
+    final name = '${fn['name']}';
+    return !writeTools.contains(name);
+  }).toList();
+}
+
+/// OpenAI-compatible tools schema（发给大模型用）。
+final List<Map<String, dynamic>> toolSchemas = [
+  {
+    'type': 'function',
+    'function': {
+      'name': 'list_notes',
+      'description': '列出笔记本内容（随笔/备忘/日程/文章）',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+
+          'kind': {
+            'type': 'string',
+            'description': 'note|memo|schedule|article，空=全部',
+          },
+        },
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'create_note',
+      'description':
+          '新建一条笔记。kind: note随笔/memo备忘/schedule日程/article文章。'
+          '写文章时 title+body 都要有实质内容；body 用纯文本（不要 Markdown/代码块/JSON）。'
+          '日程可设 recur_freq(once|daily|weekly|monthly|yearly)、recur_byday、'
+          'recur_until/recur_count（结束，互斥）、remind_offset_min（提前分钟，-1=不提醒）。'
+          'remind_at 仅备忘；禁止设为当前时间之前；不提醒则不传或空串。',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'kind': {'type': 'string'},
+          'title': {'type': 'string'},
+          'body': {'type': 'string'},
+          'schedule_at': {
+            'type': 'string',
+            'description': 'ISO8601 日程时间',
+          },
+          'remind_at': {
+            'type': 'string',
+            'description': 'ISO8601 备忘提醒；空或不传=不提醒；须晚于现在',
+          },
+          'recur_freq': {'type': 'string'},
+          'recur_byday': {'type': 'string'},
+          'recur_until': {'type': 'string'},
+          'recur_count': {'type': 'integer'},
+          'remind_offset_min': {'type': 'integer'},
+        },
+        'required': ['body'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'update_note',
+      'description': '按 note_id 或标题关键词改笔记正文/标题/时间/重复/提醒',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+
+          'note_id': {'type': 'integer'},
+          'title_query': {'type': 'string', 'description': '用标题或正文开头匹配'},
+          'title': {'type': 'string'},
+          'body': {'type': 'string'},
+          'schedule_at': {'type': 'string'},
+          'remind_at': {'type': 'string'},
+          'recur_freq': {'type': 'string'},
+          'recur_byday': {'type': 'string'},
+          'recur_until': {'type': 'string'},
+          'recur_count': {'type': 'integer'},
+          'remind_offset_min': {'type': 'integer'},
+        },
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'convert_note_kind',
+      'description': '把一篇笔记改成另一种形态（随笔/备忘/日程/文章），不自动上架',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'note_id': {'type': 'integer'},
+          'title_query': {'type': 'string'},
+          'new_kind': {'type': 'string'},
+          'schedule_at': {'type': 'string'},
+          'remind_at': {'type': 'string'},
+          'recur_freq': {'type': 'string'},
+          'recur_byday': {'type': 'string'},
+          'recur_until': {'type': 'string'},
+          'recur_count': {'type': 'integer'},
+          'remind_offset_min': {'type': 'integer'},
+        },
+        'required': ['new_kind'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'merge_notes_to_article',
+      'description':
+          '把一篇或多篇笔记整理成一篇新文章；默认保留原文。body 填整理后的正文',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'note_ids': {
+            'type': 'array',
+            'items': {'type': 'integer'},
+
+          },
+          'title_queries': {
+            'type': 'array',
+            'items': {'type': 'string'},
+          },
+          'title': {'type': 'string'},
+          'body': {'type': 'string'},
+          'archive_sources': {
+            'type': 'boolean',
+            'description': 'true 时软删原文，默认 false',
+          },
+        },
+        'required': ['body'],
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'publish_note',
+      'description': '把文章上架到雅集',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'note_id': {'type': 'integer'},
+          'title_query': {'type': 'string'},
+          'city': {'type': 'string'},
+        },
+      },
+    },
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'unpublish_note',
+      'description': '下架雅集文章',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'note_id': {'type': 'integer'},
+          'title_query': {'type': 'string'},
+        },
+      },
+    },
+  },
+];
+
+class AgentToolRunner {
+  AgentToolRunner(this.store);
+
+
+  final AppStore store;
+
+  String summarize(String tool, Map<String, dynamic> args) {
+    switch (tool) {
+      case 'create_note':
+        return '记一条${_kindLabel(args['kind'])}：'
+            '${_snip(args['title'] ?? args['body'])}';
+      case 'update_note':
+        return '更新笔记 ${_snip(args['title_query'] ?? args['note_id'])}';
+      case 'convert_note_kind':
+        return '把笔记改成${_kindLabel(args['new_kind'])}';
+      case 'merge_notes_to_article':
+        return '整理成文章「${_snip(args['title'] ?? '无标题')}」（保留原文）';
+      case 'publish_note':
+        return '上架文章到雅集';
+      case 'unpublish_note':
+        return '下架雅集文章';
+      default:
+        return '执行 $tool';
+    }
+  }
+
+  String _kindLabel(dynamic kind) {
+    switch ('$kind') {
+      case 'memo':
+        return '备忘';
+      case 'schedule':
+        return '日程';
+      case 'article':
+        return '文章';
+      default:
+        return '随笔';
+    }
+  }
+
+  String _snip(dynamic raw) {
+    final s = '$raw'.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (s.isEmpty) return '（无标题）';
+    return s.length > 24 ? '${s.substring(0, 24)}…' : s;
+  }
+
+  Future<String> runRead(String tool, Map<String, dynamic> args) async {
+    switch (tool) {
+      case 'list_notes':
+        return _listNotes(args['kind']?.toString());
+      default:
+        throw StateError('$tool 不是只读工具');
+    }
+  }
+
+
+  Future<String> _listNotes(String? kind) async {
+    final notes = await store.notesOf(
+      kind: (kind == null || kind.trim().isEmpty) ? null : kind.trim(),
+    );
+    if (notes.isEmpty) return '笔记本是空的。';
+    final buf = StringBuffer('笔记列表：\n');
+    for (final n in notes.take(40)) {
+      final extra = noteRecurRemindSummary(n);
+      buf.writeln(
+        '· #${n.id} [${n.kindLabel}] ${n.displayTitle}'
+        '${n.isListed ? '（已上架）' : ''}'
+        '${extra.isEmpty ? '' : ' · $extra'}',
+      );
+    }
+    return buf.toString().trimRight();
+  }
+
+  Future<Note?> _resolveNote(Map<String, dynamic> args) async {
+    final idRaw = args['note_id'];
+    final id = idRaw is int ? idRaw : int.tryParse('$idRaw');
+    if (id != null) return store.db.noteById(id);
+    final q = '${args['title_query'] ?? ''}'.trim();
+    if (q.isEmpty) return null;
+    final all = await store.notesOf();
+    for (final n in all) {
+      if (n.title.contains(q) ||
+          n.body.contains(q) ||
+          n.displayTitle.contains(q)) {
+        return n;
+      }
+    }
+    return null;
+  }
+
+  DateTime? _parseNoteTs(dynamic raw, {bool mustBeFuture = false}) {
+    if (raw == null) return null;
+    final s = '$raw'.trim();
+    if (s.isEmpty) return null;
+    final dt = DateTime.tryParse(s);
+    if (dt == null) return null;
+    final local = dt.isUtc ? dt.toLocal() : dt;
+    if (mustBeFuture) return sanitizeFutureRemind(local);
+    return local;
+  }
+
+  int? _parseIntArg(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is int) return raw;
+    return int.tryParse('$raw'.trim());
+  }
+
+
+  ({
+    String recurFreq,
+    String? recurByday,
+    DateTime? recurUntil,
+    int? recurCount,
+    bool clearUntil,
+    bool clearCount,
+    bool clearByday,
+    int? remindOffsetMin,
+    DateTime? remindAt,
+  }) _parseRecurArgs(
+    Map<String, dynamic> args, {
+    DateTime? scheduleAt,
+    String? kind,
+  }) {
+    final freqRaw = args.containsKey('recur_freq')
+        ? normalizeRecurFreq('${args['recur_freq']}')
+        : null;
+    final freq = freqRaw ?? '';
+    String? byday;
+    var clearByday = false;
+    if (args.containsKey('recur_byday')) {
+      final b = '${args['recur_byday']}'.trim().toUpperCase();
+      if (b.isEmpty) {
+        clearByday = true;
+        byday = null;
+      } else {
+        byday = b;
+      }
+    } else if (freq == kRecurWeekly && scheduleAt != null) {
+      byday = weekdayToByDay(scheduleAt);
+    }
+
+    DateTime? until;
+    int? count;
+    var clearUntil = false;
+    var clearCount = false;
+    final hasUntil = args.containsKey('recur_until');
+    final hasCount = args.containsKey('recur_count');
+    if (hasUntil) {
+      final raw = args['recur_until'];
+      if (raw == null || '$raw'.trim().isEmpty) {
+        clearUntil = true;
+        until = null;
+      } else {
+        until = _parseNoteTs(raw);
+        clearCount = true;
+        count = null;
+      }
+
+    }
+    if (hasCount) {
+      final raw = args['recur_count'];
+      if (raw == null || '$raw'.trim().isEmpty) {
+        clearCount = true;
+        count = null;
+      } else {
+        count = _parseIntArg(raw);
+        clearUntil = true;
+        until = null;
+      }
+    }
+
+    int? offset;
+    DateTime? remind =
+        _parseNoteTs(args['remind_at'], mustBeFuture: true);
+    if (args.containsKey('remind_offset_min')) {
+      final parsed = _parseIntArg(args['remind_offset_min']) ?? 0;
+      // <0：不提醒；否则提前分钟数
+      offset = parsed < 0 ? -1 : parsed;
+      if (kind == kNoteKindSchedule || kind == null) {
+        remind = remindAtFromOffset(scheduleAt, offset);
+        remind = sanitizeFutureRemind(remind);
+        if (remind == null && offset >= 0 && scheduleAt != null) {
+          // 推算出的提醒已过期 → 改为不提醒
+          offset = -1;
+        }
+      }
+    }
+
+    return (
+      recurFreq: freq,
+      recurByday: byday,
+      recurUntil: until,
+      recurCount: count,
+      clearUntil: clearUntil,
+      clearCount: clearCount,
+      clearByday: clearByday,
+      remindOffsetMin: offset,
+      remindAt: remind,
+    );
+  }
+
+  Future<String> commit(PendingAction action) async {
+    if (store.isGuest) {
+      return '游客不能改笔记本。请先注册/登录后再操作。';
+    }
+    final args = action.args;
+    switch (action.tool) {
+      case 'create_note':
+
+        final kind = '${args['kind'] ?? kNoteKindNote}'.trim();
+        final k = kind.isEmpty ? kNoteKindNote : kind;
+        final scheduleAt = _parseNoteTs(args['schedule_at']);
+        final recur = _parseRecurArgs(args, scheduleAt: scheduleAt, kind: k);
+        final remind = recur.remindAt ??
+            _parseNoteTs(args['remind_at'], mustBeFuture: true);
+        final id = await store.addNote(
+          kind: k,
+          title: '${args['title'] ?? ''}'.trim(),
+          body: sanitizeAiPlainText('${args['body'] ?? ''}'),
+          scheduleAt: scheduleAt,
+          remindAt: remind,
+          recurFreq: recur.recurFreq == kRecurOnce ? '' : recur.recurFreq,
+          recurByday: recur.recurByday,
+          recurUntil: recur.recurUntil,
+          recurCount: recur.recurCount,
+          remindOffsetMin: recur.remindOffsetMin ??
+              (k == kNoteKindSchedule && remind == null ? -1 : 0),
+        );
+        return '已记下${_kindLabel(k)} #$id。';
+      case 'update_note':
+        final note = await _resolveNote(args);
+        if (note == null) return '找不到要改的笔记。';
+        final scheduleAt = args.containsKey('schedule_at')
+            ? _parseNoteTs(args['schedule_at'])
+            : note.scheduleAt;
+        final recur = _parseRecurArgs(
+          args,
+          scheduleAt: scheduleAt,
+          kind: note.kind,
+        );
+        await store.saveNote(
+          id: note.id,
+          title: args.containsKey('title') ? '${args['title']}'.trim() : null,
+          body: args.containsKey('body')
+              ? sanitizeAiPlainText('${args['body']}')
+              : null,
+          scheduleAt: args.containsKey('schedule_at') ? scheduleAt : null,
+          clearScheduleAt:
+              args.containsKey('schedule_at') && scheduleAt == null,
+          remindAt: recur.remindAt ??
+              (args.containsKey('remind_at')
+                  ? _parseNoteTs(args['remind_at'], mustBeFuture: true)
+                  : null),
+          clearRemindAt: (args.containsKey('remind_at') &&
+                  (args['remind_at'] == null ||
+                      '${args['remind_at']}'.trim().isEmpty) &&
+                  recur.remindOffsetMin == null) ||
+              recur.remindOffsetMin == -1,
+          recurFreq: args.containsKey('recur_freq')
+
+              ? (recur.recurFreq == kRecurOnce ? '' : recur.recurFreq)
+              : null,
+          recurByday: recur.recurByday,
+          clearRecurByday: recur.clearByday,
+          recurUntil: recur.recurUntil,
+          clearRecurUntil: recur.clearUntil,
+          recurCount: recur.recurCount,
+          clearRecurCount: recur.clearCount,
+          remindOffsetMin: recur.remindOffsetMin,
+        );
+        return '已更新笔记 #${note.id}。';
+      case 'convert_note_kind':
+        final note = await _resolveNote(args);
+        if (note == null) return '找不到要转换的笔记。';
+        final newKind = '${args['new_kind']}'.trim();
+        if (newKind.isEmpty) return '请指定 new_kind。';
+        final scheduleAt = args.containsKey('schedule_at')
+            ? _parseNoteTs(args['schedule_at'])
+            : note.scheduleAt;
+        final recur = _parseRecurArgs(
+          args,
+          scheduleAt: scheduleAt,
+          kind: newKind,
+        );
+        await store.saveNote(
+          id: note.id,
+          kind: newKind,
+          scheduleAt: args.containsKey('schedule_at') ? scheduleAt : null,
+          remindAt: recur.remindAt ??
+              (args.containsKey('remind_at')
+                  ? _parseNoteTs(args['remind_at'], mustBeFuture: true)
+                  : null),
+          clearRemindAt: recur.remindOffsetMin == -1,
+          recurFreq: args.containsKey('recur_freq')
+              ? (recur.recurFreq == kRecurOnce ? '' : recur.recurFreq)
+              : null,
+          recurByday: recur.recurByday,
+          clearRecurByday: recur.clearByday,
+          recurUntil: recur.recurUntil,
+          clearRecurUntil: recur.clearUntil,
+          recurCount: recur.recurCount,
+          clearRecurCount: recur.clearCount,
+          remindOffsetMin: recur.remindOffsetMin,
+        );
+        return '已把 #${note.id} 改成${_kindLabel(newKind)}。';
+      case 'merge_notes_to_article':
+        final ids = <int>{};
+        final idList = args['note_ids'];
+        if (idList is List) {
+          for (final e in idList) {
+
+            final id = e is int ? e : int.tryParse('$e');
+            if (id != null) ids.add(id);
+          }
+        }
+        final queries = args['title_queries'];
+        if (queries is List) {
+          final all = await store.notesOf();
+          for (final q in queries) {
+            final s = '$q'.trim();
+            if (s.isEmpty) continue;
+            for (final n in all) {
+              if (n.title.contains(s) || n.body.contains(s)) ids.add(n.id);
+            }
+          }
+        }
+        final sources = <Note>[];
+        for (final id in ids) {
+          final n = await store.db.noteById(id);
+          if (n != null) sources.add(n);
+        }
+        final body = sanitizeAiPlainText('${args['body'] ?? ''}');
+        if (body.isEmpty) return '整理后的正文不能为空。';
+        final newId = await store.addNote(
+          kind: kNoteKindArticle,
+          title: '${args['title'] ?? ''}'.trim(),
+          body: body,
+          sourceNoteUuids: sources.map((e) => e.uuid).toList(),
+        );
+        if (args['archive_sources'] == true) {
+          for (final s in sources) {
+            await store.removeNote(s.id);
+          }
+        }
+        return '已生成文章 #$newId'
+            '${sources.isEmpty ? '' : '（来源 ${sources.length} 篇，默认保留）'}。';
+      case 'publish_note':
+        final note = await _resolveNote(args);
+        if (note == null) return '找不到文章。';
+        if (note.kind != kNoteKindArticle) {
+          await store.saveNote(id: note.id, kind: kNoteKindArticle);
+        }
+        await store.setNoteListing(
+          noteId: note.id,
+          listed: true,
+          city: args['city']?.toString(),
+        );
+        return '已上架文章 #${note.id}。';
+      case 'unpublish_note':
+        final note = await _resolveNote(args);
+        if (note == null) return '找不到文章。';
+
+        await store.setNoteListing(noteId: note.id, listed: false);
+        return '已下架文章 #${note.id}。';
+      default:
+        return '未知操作：${action.tool}';
+    }
+  }
+}
+
+// ===== FILE: lib/agent/baidu_ocr.dart =====
+import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
+
+import 'package:http/http.dart' as http;
+
+import 'agent_settings.dart';
+
+/// 百度智能云通用文字识别（与短语音共用 API Key / Secret）。
+///
+/// 注意：控制台「开通服务」后，还要在对应接口的「应用授权」里勾选本 Key 所属应用。
+/// 实测很多账号只授了标准版、未授高精度；因此默认走标准版。
+class BaiduOcr {
+  BaiduOcr(this.settings);
+
+  final AgentSettings settings;
+
+  static String? _token;
+  static DateTime? _tokenExpiry;
+
+  bool get available =>
+      _sanitize(settings.baiduAsrApiKey).isNotEmpty &&
+      _sanitize(settings.baiduAsrSecretKey).isNotEmpty;
+
+  String get _keyTail {
+    final ak = _sanitize(settings.baiduAsrApiKey);
+    if (ak.length < 4) return ak;
+    return ak.substring(ak.length - 4);
+  }
+
+  Future<String> recognizeFile(File file) async {
+    if (!available) {
+      throw StateError('未配置百度 API Key（与语音识别同一套 BAIDU_ASR_*）');
+    }
+    final client = http.Client();
+    try {
+      final token = await _accessToken(client);
+      final prepared = await Isolate.run(() => _prepareImage(file.path));
+      final imageB64 = prepared['image'] as String;
+
+      // 标准版：你当前 Key 已实测可调通。高精度未授权时会 error 6，作可选增强。
+
+      try {
+        return await _postOcr(
+          client,
+          token: token,
+          imageB64: imageB64,
+          path: 'rest/2.0/ocr/v1/general_basic',
+          label: '标准版',
+        );
+      } on _OcrApiError catch (e) {
+        if (!e.isPermission) {
+          throw StateError(_formatError(e));
+        }
+        // 若标准版反而无权限，再试高精度（少数账号只授了高精度）
+        try {
+          return await _postOcr(
+            client,
+            token: token,
+            imageB64: imageB64,
+            path: 'rest/2.0/ocr/v1/accurate_basic',
+            label: '高精度版',
+          );
+        } on _OcrApiError catch (e2) {
+          throw StateError(_permissionHint(e2));
+        }
+      }
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<String> _postOcr(
+    http.Client client, {
+    required String token,
+    required String imageB64,
+    required String path,
+    required String label,
+  }) async {
+    final uri = Uri.https('aip.baidubce.com', path, {
+      'access_token': token,
+    });
+    final res = await client
+        .post(
+          uri,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json',
+          },
+          body: {
+            'image': imageB64,
+            'language_type': 'CHN_ENG',
+
+
+========================================================================
+【后部连续页】
+========================================================================
+
+        await store.refreshMarketplace(city: city);
+      } else {
+        store.marketplaceCityReady = true;
+        await store.refreshMarketplace(city: '');
+      }
+    } catch (_) {
+      if (!mounted) return;
+      store.marketplaceCityReady = true;
+      await store.refreshMarketplace(city: '');
+    } finally {
+      if (mounted) setState(() => _locating = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<AppStore>();
+    if (_locating || store.marketplaceLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return ArticleFeedGrid(
+      articles: store.marketplaceArticles,
+      onRefresh: () => store.refreshMarketplace(city: store.marketplaceCity),
+      onOpen: (a) async {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => MarketplaceArticlePage(article: a),
+          ),
+        );
+      },
+      empty: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
+        child: Column(
+          children: [
+            const Text('暂无文章。', textAlign: TextAlign.center),
+            const SizedBox(height: 8),
+            Text(
+              '有内容的用户发布后会出现在这里。登录后可在「我的」发布自己的文章。',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 「我的」：本机文章（不按上架状态过滤）。
+class _MyArticlesBody extends StatelessWidget {
+
+  const _MyArticlesBody({required this.store});
+  final AppStore store;
+
+  List<Note> get _articles => store.notes
+      .where((n) => n.kind == kNoteKindArticle)
+      .toList()
+    ..sort((a, b) {
+      final ta = a.updatedAt;
+      final tb = b.updatedAt;
+      return tb.compareTo(ta);
+    });
+
+  Future<void> _changeAvatar(BuildContext context) async {
+    final uid = AuthService.instance.currentUser?.id ?? '';
+    if (uid.isEmpty) return;
+    try {
+      final url = await pickCropUploadAvatar(context: context, userId: uid);
+      if (url == null || !context.mounted) return;
+      await runBusy(
+        context,
+        message: '更新头像…',
+        task: () => AuthService.instance.updateAvatarUrl(url),
+      );
+      await AuthService.instance.refreshProfile();
+      imageCache.clear();
+      imageCache.clearLiveImages();
+      if (context.mounted) await store.reload();
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('上传失败：$e')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final list = _articles;
+    final user = store.user ?? AuthService.instance.currentUser;
+    final nick = user?.displayName.trim().isNotEmpty == true
+        ? user!.displayName
+        : '我';
+    final avatar = user?.avatarUrl ?? '';
+
+    Widget header = Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
+      child: Column(
+        children: [
+          GestureDetector(
+            onTap: () => _changeAvatar(context),
+
+            child: Column(
+              children: [
+                UserAvatar(url: avatar, nickname: nick, radius: 40),
+                const SizedBox(height: 6),
+                const Text(
+                  '点击更换头像',
+                  style: TextStyle(fontSize: 12, color: Color(0xFF888888)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            nick,
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+
+    final uid = store.user?.id ?? '';
+    final articles = list
+        .map(
+          (n) => MarketplaceArticle(
+            noteUuid: n.uuid,
+            title: n.title,
+            body: n.body,
+            format: n.format,
+            city: n.city,
+            listedAt: n.listedAt,
+            ownerId: uid,
+            recommendCount: 0,
+            commentCount: 0,
+            viewCount: 0,
+          ),
+        )
+        .toList();
+
+    Future<void> openArticle(MarketplaceArticle a) async {
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => MarketplaceArticlePage(article: a),
+        ),
+      );
+    }
+
+    Future<void> deleteArticle(MarketplaceArticle a) async {
+      Note? note;
+      for (final n in list) {
+        if (n.uuid == a.noteUuid) {
+
+          note = n;
+          break;
+        }
+      }
+      if (note == null) return;
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('删除这篇文章？'),
+          content: Text('确认删除「${a.displayTitle}」？删除后无法恢复。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true || !context.mounted) return;
+      await runBusy(
+        context,
+        message: '正在删除…',
+        task: () => store.removeNote(note!.id),
+      );
+    }
+
+    return ArticleFeedGrid(
+      articles: articles,
+      header: Column(
+        children: [
+          header,
+          const Divider(height: 1),
+        ],
+      ),
+      onRefresh: () => store.reload(),
+      onOpen: openArticle,
+      deleteMode: ArticleFeedDeleteMode.always,
+      onDelete: deleteArticle,
+      empty: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 36, 24, 24),
+        child: Column(
+          children: [
+            const Text(
+              '还没有文章。',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 15),
+
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '点右上角「+」写成文章并发布后会出现在这里。',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 20),
+            OutlinedButton(
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => const NoteEditorPage(
+                      initialKind: kNoteKindArticle,
+                    ),
+                  ),
+                );
+              },
+              child: const Text('去写文章'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ===== FILE: lib/ui/social_inbox_page.dart =====
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../domain/models.dart';
+import '../social/social_api.dart';
+import '../social/social_models.dart';
+import '../state/app_store.dart';
+import '../sync/sync_service.dart';
+import 'format.dart';
+import 'marketplace_article_page.dart';
+import 'widgets/user_avatar.dart';
+
+/// 留言（评论 / 回复 / 推荐 / 留意通知）。
+class SocialInboxPage extends StatefulWidget {
+  const SocialInboxPage({super.key, this.embedded = false});
+
+  /// 嵌入阅读 Tab 时不画独立 Scaffold / AppBar。
+  final bool embedded;
+
+  @override
+  State<SocialInboxPage> createState() => _SocialInboxPageState();
+}
+
+
+class _SocialInboxPageState extends State<SocialInboxPage> {
+  bool _loading = true;
+  String? _error;
+  List<SocialNotificationItem> _items = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final list = await SocialApi.instance.listMyNotifications();
+      final filtered = list
+          .where((e) =>
+              e.kind == 'comment' ||
+              e.kind == 'reply' ||
+              e.kind == 'recommend' ||
+              e.kind == 'follow')
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _items = filtered;
+        _loading = false;
+      });
+      final unread = filtered.where((e) => !e.isRead).map((e) => e.id);
+      if (unread.isNotEmpty) {
+        await SocialApi.instance.markNotificationsRead(unread);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  String _title(SocialNotificationItem n) {
+    final who = n.actorNickname.isNotEmpty ? n.actorNickname : '有人';
+    switch (n.kind) {
+      case 'reply':
+        return '$who 回复了你';
+      case 'comment':
+
+        return '$who 留言了你的文章';
+      case 'recommend':
+        return '$who 推荐了你的文章';
+      case 'follow':
+        return '$who 留意了你';
+      default:
+        return who;
+    }
+  }
+
+  Future<void> _open(SocialNotificationItem n) async {
+    final noteId = n.noteId?.trim() ?? '';
+    if (noteId.isEmpty) return;
+    try {
+      final rows = await SyncService(db: context.read<AppStore>().db)
+          .fetchListedArticles();
+      MarketplaceArticle? hit;
+      for (final a in rows) {
+        if (a.noteUuid == noteId) {
+          hit = a;
+          break;
+        }
+      }
+      hit ??= MarketplaceArticle(
+        noteUuid: noteId,
+        title: n.noteTitle,
+        body: '',
+        format: 'plain',
+      );
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => MarketplaceArticlePage(
+            article: hit!,
+            highlightCommentId: n.commentId,
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('打开失败：$e')),
+      );
+    }
+  }
+
+  Widget _body(bool loggedIn) {
+    if (!loggedIn) {
+      return const Center(child: Text('登录后可查看互动消息'));
+    }
+
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(child: Text(_error!));
+    }
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: _items.isEmpty
+          ? ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: const [
+                SizedBox(height: 80),
+                Center(child: Text('暂无留言或回复')),
+              ],
+            )
+          : ListView.separated(
+              itemCount: _items.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (context, i) {
+                final n = _items[i];
+                return ListTile(
+                  leading: UserAvatar(
+                    url: null,
+                    nickname: n.actorNickname,
+                    radius: 22,
+                  ),
+                  title: Text(_title(n)),
+                  subtitle: Text(
+                    [
+                      if (n.noteTitle.isNotEmpty) n.noteTitle,
+                      if (n.body.isNotEmpty) n.body,
+                      formatFriendlyWhen(n.createdAt),
+                    ].where((e) => e.trim().isNotEmpty).join('\n'),
+                    maxLines: 4,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  isThreeLine: true,
+                  onTap: () => _open(n),
+                );
+              },
+            ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final loggedIn = context.watch<AppStore>().user != null;
+    if (widget.embedded) return _body(loggedIn);
+    return Scaffold(
+
+      appBar: AppBar(title: const Text('留言')),
+      body: _body(loggedIn),
+    );
+  }
+}
+
+// ===== FILE: lib/ui/sync_dialog.dart =====
+import 'package:flutter/material.dart';
+
+import '../state/app_store.dart';
+
+/// 刷新当前登录用户的云端缓存（增量/全量拉取，市集不在此列）。
+Future<void> runSyncDialog(BuildContext context, AppStore store) async {
+  final progress = ValueNotifier<String>('正在刷新…');
+  showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => AlertDialog(
+      title: const Text('刷新数据'),
+      content: SizedBox(
+        width: 280,
+        child: ValueListenableBuilder<String>(
+          valueListenable: progress,
+          builder: (_, msg, __) {
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const LinearProgressIndicator(),
+                const SizedBox(height: 16),
+                Text(msg, style: const TextStyle(fontSize: 15)),
+              ],
+            );
+          },
+        ),
+      ),
+    ),
+  );
+  Object? err;
+  try {
+    final r = await store.refreshMyCache(
+      onProgress: (m) => progress.value = m,
+    );
+    if (!r.ok) err = r.error ?? '刷新失败';
+  } catch (e) {
+    err = e;
+  }
+  if (!context.mounted) return;
+  Navigator.of(context, rootNavigator: true).pop();
+  progress.dispose();
+
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      content: Text(err != null ? '刷新失败：$err' : '已刷新为我的最新云端数据'),
+      duration: const Duration(seconds: 3),
+    ),
+  );
+}
+
+// ===== FILE: lib/ui/voice_input_bar.dart =====
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+
+import '../agent/voice_capture.dart';
+import '../agent/voice_dictation.dart';
+
+/// 找 AI / 笔记 AI 共用的底部输入：按住说话 · 附图 · 键盘切换。
+class VoiceInputBar extends StatelessWidget {
+  const VoiceInputBar({
+    super.key,
+    required this.voice,
+    required this.voiceMode,
+    required this.onToggleVoiceMode,
+    required this.input,
+    required this.onSend,
+    required this.onAttachImage,
+    this.busy = false,
+    this.pendingImage,
+    this.onClearImage,
+    this.hintText = '随便说…',
+    this.darkChrome = false,
+  });
+
+  final VoiceCapture voice;
+  final bool voiceMode;
+  final VoidCallback onToggleVoiceMode;
+  final TextEditingController input;
+  final VoidCallback onSend;
+  final VoidCallback onAttachImage;
+  final bool busy;
+  final File? pendingImage;
+  final VoidCallback? onClearImage;
+  final String hintText;
+  final bool darkChrome;
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = darkChrome ? const Color(0xFF111111) : const Color(0xFFE8E8E8);
+    final fg = darkChrome ? Colors.white : const Color(0xFF111111);
+    final muted = darkChrome ? Colors.white70 : const Color(0xFF666666);
+
+
+    return Material(
+      color: bg,
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (voice.listening || voice.transcribing)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      voice.statusLine,
+                      style: TextStyle(color: muted, fontSize: 12),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: List.generate(12, (i) {
+                        final threshold = (i + 1) / 12;
+                        final active = voice.soundLevel >= threshold * 0.85;
+                        final h =
+                            6.0 + (active ? voice.soundLevel * 18 : voice.soundLevel * 4);
+                        return Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 1.5),
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 60),
+                              height: h.clamp(4, 24),
+                              decoration: BoxDecoration(
+                                color: active ? fg : muted.withOpacity(0.35),
+                                borderRadius: BorderRadius.circular(2),
+                              ),
+                            ),
+                          ),
+                        );
+                      }),
+                    ),
+                  ],
+                ),
+              ),
+            if (pendingImage != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Row(
+                  children: [
+
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.file(
+                        pendingImage!,
+                        width: 48,
+                        height: 48,
+                        fit: BoxFit.cover,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        voiceMode ? '已附图 · 按住说话说明后松开' : '已附图 · 写上要求后发送',
+                        style: TextStyle(color: muted, fontSize: 13),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: busy ? null : onClearImage,
+                      icon: Icon(Icons.close, color: muted),
+                    ),
+                  ],
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 6, 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: voiceMode
+                        ? Listener(
+                            behavior: HitTestBehavior.opaque,
+                            onPointerDown: (_) => voice.onHoldStart(),
+                            onPointerUp: (_) =>
+                                voice.onHoldEnd(send: true),
+                            onPointerCancel: (_) =>
+                                voice.onHoldEnd(send: false),
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 120),
+                              height: 48,
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: voice.listening
+                                    ? (darkChrome
+                                        ? const Color(0xFF333333)
+                                        : const Color(0xFFD8D8D8))
+                                    : (darkChrome
+                                        ? Colors.white
+                                        : Colors.white),
+                                borderRadius: BorderRadius.circular(24),
+                                border: darkChrome
+
+                                    ? null
+                                    : Border.all(color: const Color(0xFFCCCCCC)),
+                              ),
+                              child: Text(
+                                voice.listening ? '松开发送…' : '按住说话',
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  color: voice.listening
+                                      ? (darkChrome
+                                          ? Colors.white
+                                          : const Color(0xFF333333))
+                                      : const Color(0xFF111111),
+                                ),
+                              ),
+                            ),
+                          )
+                        : TextField(
+                            controller: input,
+                            minLines: 1,
+                            maxLines: 4,
+                            style: TextStyle(color: fg, fontSize: 15),
+                            cursorColor: fg,
+                            textInputAction: TextInputAction.send,
+                            onSubmitted: (_) => onSend(),
+                            decoration: InputDecoration(
+                              hintText: hintText,
+                              hintStyle: TextStyle(color: muted),
+                              filled: true,
+                              fillColor: darkChrome
+                                  ? const Color(0xFF2A2A2A)
+                                  : Colors.white,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                borderSide: BorderSide.none,
+                              ),
+                              isDense: true,
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 12,
+                              ),
+                            ),
+                          ),
+                  ),
+                  IconButton(
+                    tooltip: '附图',
+                    onPressed:
+                        busy || voice.transcribing ? null : onAttachImage,
+                    icon: Icon(
+                      pendingImage == null
+
+                          ? Icons.image_outlined
+                          : Icons.image,
+                      color: muted,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: voiceMode ? '切换键盘' : '切换语音',
+                    onPressed: busy || voice.transcribing
+                        ? null
+                        : onToggleVoiceMode,
+                    icon: Icon(
+                      voiceMode
+                          ? Icons.keyboard_alt_outlined
+                          : Icons.mic_none,
+                      color: muted,
+                    ),
+                  ),
+                  if (!voiceMode)
+                    TextButton(
+                      onPressed: busy ? null : onSend,
+                      child: Text(
+                        '发送',
+                        style: TextStyle(
+                          color: fg,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 笔记正文旁麦克风：点按切换听写（开麦高亮，说完停顿自动出字，再点关闭）。
+class NoteMicButton extends StatefulWidget {
+  const NoteMicButton({
+    super.key,
+    required this.onText,
+  });
+
+  final void Function(String text) onText;
+
+  @override
+  State<NoteMicButton> createState() => NoteMicButtonState();
+}
+
+
+class NoteMicButtonState extends State<NoteMicButton> {
+  late final VoiceDictation _dictation;
+
+  @override
+  void initState() {
+    super.initState();
+    _dictation = VoiceDictation(
+      onTranscript: widget.onText,
+      onStatus: (msg) {
+        if (!mounted) return;
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
+        );
+      },
+    );
+    _dictation.addListener(_onTick);
+    _dictation.init();
+  }
+
+  void _onTick() {
+    if (mounted) setState(() {});
+  }
+
+  bool get isActive => _dictation.active;
+
+  Future<void> stopIfActive() async {
+    if (_dictation.active) await _dictation.stop();
+  }
+
+  @override
+  void dispose() {
+    _dictation.removeListener(_onTick);
+    _dictation.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final on = _dictation.active;
+    final busy = _dictation.transcribing;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        if (on && _dictation.hint.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4, right: 2),
+            child: Text(
+              busy ? _dictation.hint : '听写中 · 再点结束',
+
+              style: const TextStyle(fontSize: 11, color: Color(0xFF666666)),
+            ),
+          ),
+        Material(
+          color: Colors.transparent,
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: () => _dictation.toggle(),
+            child: Ink(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: on ? const Color(0xFF111111) : const Color(0xFFF0F0F0),
+                border: Border.all(
+                  color: on ? const Color(0xFF111111) : const Color(0xFFCCCCCC),
+                ),
+              ),
+              child: Icon(
+                on ? Icons.mic : Icons.mic_none,
+                size: 22,
+                color: on ? Colors.white : const Color(0xFF666666),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ===== FILE: lib/ui/widgets/user_avatar.dart =====
+import 'package:flutter/material.dart';
+
+/// 默认头像 + 网络头像（带 cacheWidth 减轻内存；URL 含 ?v= 破缓存）。
+class UserAvatar extends StatelessWidget {
+  const UserAvatar({
+    super.key,
+    this.url,
+    this.nickname = '',
+    this.radius = 28,
+  });
+
+  final String? url;
+  final String nickname;
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) {
+    final u = (url ?? '').trim();
+
+    final initials = _initials(nickname);
+    if (u.isEmpty) {
+      return CircleAvatar(
+        radius: radius,
+        backgroundColor: const Color(0xFFE8E8E8),
+        child: Text(
+          initials,
+          style: TextStyle(
+            color: const Color(0xFF666666),
+            fontSize: radius * 0.7,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      );
+    }
+    return CircleAvatar(
+      radius: radius,
+      backgroundColor: const Color(0xFFE8E8E8),
+      backgroundImage: NetworkImage(u),
+      onBackgroundImageError: (_, __) {},
+      child: null,
+    );
+  }
+
+  static String _initials(String name) {
+    final n = name.trim();
+    if (n.isEmpty) return '醍';
+    if (n.length == 1) return n;
+    return n.substring(0, 1);
+  }
+}
+
+// ===== FILE: lib/update/app_update_banner.dart =====
+import 'package:flutter/material.dart';
+import 'package:open_filex/open_filex.dart';
+
+import 'app_update_service.dart';
+
+/// 挂在壳层：仅在「确实有更新要下/要装」时弹窗；无更新时静默，不闪窗。
+class AppUpdateHost extends StatefulWidget {
+  const AppUpdateHost({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<AppUpdateHost> createState() => _AppUpdateHostState();
+}
+
+class _AppUpdateHostState extends State<AppUpdateHost> {
+  final _svc = AppUpdateService.instance;
+
+  var _dialogOpen = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _svc.phase.addListener(_onPhase);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Future<void>.delayed(const Duration(seconds: 3), () {
+        if (!mounted) return;
+        // 后台静默检查；无更新不会弹窗
+        _svc.bootstrap();
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _svc.phase.removeListener(_onPhase);
+    super.dispose();
+  }
+
+  void _onPhase() {
+    if (!mounted) return;
+    final phase = _svc.phase.value;
+    // 不要在 checking 弹窗：每次启动都会检查，无更新时会造成闪一下又关
+    if (phase == AppUpdatePhase.ready ||
+        phase == AppUpdatePhase.downloading ||
+        phase == AppUpdatePhase.failed) {
+      _ensureDialog();
+    } else if (phase == AppUpdatePhase.idle && _dialogOpen) {
+      // 下载过程中若变 idle，由 dialog 内部 pop
+    }
+  }
+
+  void _ensureDialog() {
+    if (_dialogOpen || !mounted) return;
+    _dialogOpen = true;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return WillPopScope(
+          onWillPop: () async {
+            final force = _svc.readyInfo?.force ?? false;
+            final phase = _svc.phase.value;
+            // 强制更新且已就绪/下载中：禁止返回关闭
+            if (force &&
+                (phase == AppUpdatePhase.ready ||
+                    phase == AppUpdatePhase.downloading)) {
+              return false;
+
+            }
+            return phase != AppUpdatePhase.downloading;
+          },
+          child: AnimatedBuilder(
+            animation: Listenable.merge([
+              _svc.phase,
+              _svc.progress,
+              _svc.message,
+            ]),
+            builder: (_, __) {
+              final phase = _svc.phase.value;
+              final info = _svc.readyInfo;
+              final notes = (info?.changelog ?? '').trim();
+              final force = info?.force ?? true;
+
+              if (phase == AppUpdatePhase.idle ||
+                  phase == AppUpdatePhase.checking) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (ctx.mounted) Navigator.of(ctx).pop();
+                });
+              }
+
+              return AlertDialog(
+                title: Text(
+                  phase == AppUpdatePhase.ready
+                      ? '发现新版本 ${info?.versionName ?? ''}'
+                      : phase == AppUpdatePhase.failed
+                          ? '更新失败'
+                          : '正在下载更新',
+                ),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (phase == AppUpdatePhase.downloading) ...[
+                      LinearProgressIndicator(value: _svc.progress.value),
+                      const SizedBox(height: 12),
+                      Text(
+                        _svc.message.value.isEmpty
+                            ? '下载中…'
+                            : _svc.message.value,
+                      ),
+                    ],
+                    if (phase == AppUpdatePhase.ready) ...[
+                      if (notes.isNotEmpty)
+                        Text(notes, style: const TextStyle(height: 1.45))
+                      else
+                        const Text('请安装新版本以继续使用。'),
+                      if (force) ...[
+                        const SizedBox(height: 12),
+
+                        Text(
+                          '当前为必要更新，需安装后才能继续使用。',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Theme.of(ctx).colorScheme.error,
+                          ),
+                        ),
+                      ],
+                    ],
+                    if (phase == AppUpdatePhase.failed)
+                      Text(
+                        _svc.message.value.isEmpty
+                            ? '更新失败'
+                            : _svc.message.value,
+                      ),
+                  ],
+                ),
+                actions: [
+                  if (phase == AppUpdatePhase.ready) ...[
+                    if (!force)
+                      TextButton(
+                        onPressed: () async {
+                          await _svc.skipReady();
+                          if (ctx.mounted) Navigator.of(ctx).pop();
+                        },
+                        child: const Text('稍后'),
+                      ),
+                    FilledButton(
+                      onPressed: () async {
+                        final r = await _svc.installReady();
+                        if (!ctx.mounted) return;
+                        if (r.type != ResultType.done) {
+                          ScaffoldMessenger.of(ctx).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                r.message.trim().isEmpty
+                                    ? '无法打开安装器，请到系统设置允许「安装未知应用」'
+                                    : '安装失败：${r.message}',
+                              ),
+                            ),
+                          );
+                        }
+                      },
+                      child: const Text('立即安装'),
+                    ),
+                  ] else if (phase == AppUpdatePhase.failed) ...[
+                    TextButton(
+                      onPressed: () => _svc.bootstrap(manual: true),
+                      child: const Text('重试'),
+                    ),
+
+                    if (!force)
+                      TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(),
+                        child: const Text('关闭'),
+                      ),
+                  ],
+                ],
+              );
+            },
+          ),
+        );
+      },
+    ).whenComplete(() {
+      _dialogOpen = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
+
+Future<void> runManualUpdateCheck(BuildContext context) async {
+  final svc = AppUpdateService.instance;
+  if (!svc.hasManifest) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('未配置更新源：请在 env.local 配置七牛/R2，或 APP_UPDATE_MANIFEST_URL'),
+      ),
+    );
+    return;
+  }
+  await svc.bootstrap(manual: true);
+  if (!context.mounted) return;
+  if (svc.phase.value == AppUpdatePhase.idle) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          svc.message.value.isEmpty ? '已是最新版本' : svc.message.value,
+        ),
+      ),
+    );
+  }
+}
+
+// ===== FILE: lib/update/app_update_service.dart =====
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:connectivity_plus/connectivity_plus.dart';
+
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+import 'package:open_filex/open_filex.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../config/baked_env.dart';
+import '../media/qiniu_uploader.dart';
+
+class AppUpdateInfo {
+  const AppUpdateInfo({
+    required this.versionCode,
+    required this.versionName,
+    required this.apkUrl,
+    this.force = false,
+    this.changelog = '',
+  });
+
+  final int versionCode;
+  final String versionName;
+  final String apkUrl;
+  final bool force;
+  final String changelog;
+
+  factory AppUpdateInfo.fromJson(Map<String, dynamic> json) {
+    final code = json['versionCode'] ?? json['version_code'] ?? 0;
+    final name = '${json['versionName'] ?? json['version_name'] ?? ''}';
+    final url = '${json['apkUrl'] ?? json['apk_url'] ?? ''}'.trim();
+    // 未写 force 时默认强制更新（前期版本需对齐）；仅显式 false 才可跳过
+    final forceRaw = json['force'];
+    final force = forceRaw == null
+        ? true
+        : forceRaw == true || '$forceRaw'.toLowerCase() == 'true';
+    final notes = '${json['changelog'] ?? json['notes'] ?? ''}'.trim();
+    return AppUpdateInfo(
+      versionCode: code is int ? code : int.tryParse('$code') ?? 0,
+      versionName: name.trim().isEmpty ? '$code' : name.trim(),
+      apkUrl: QiniuUploader.playableUrl(url),
+      force: force,
+      changelog: notes,
+    );
+  }
+}
+
+enum AppUpdatePhase {
+  idle,
+  checking,
+  downloading,
+
+  ready,
+  failed,
+}
+
+/// 应用内更新：后台拉 APK；强制更新时不可跳过。
+class AppUpdateService {
+  AppUpdateService._();
+  static final AppUpdateService instance = AppUpdateService._();
+
+  static const _kSkipped = 'app_update_skipped_code';
+  static const _kReadyCode = 'app_update_ready_code';
+  static const _kReadyName = 'app_update_ready_name';
+  static const _kReadyPath = 'app_update_ready_path';
+  static const _kReadyForce = 'app_update_ready_force';
+  static const _kReadyNotes = 'app_update_ready_notes';
+  static const _kLastCheck = 'app_update_last_check_ms';
+
+  final _phase = ValueNotifier<AppUpdatePhase>(AppUpdatePhase.idle);
+  final _progress = ValueNotifier<double?>(null);
+  final _message = ValueNotifier<String>('');
+  AppUpdateInfo? _ready;
+
+  ValueNotifier<AppUpdatePhase> get phase => _phase;
+  ValueNotifier<double?> get progress => _progress;
+  ValueNotifier<String> get message => _message;
+  AppUpdateInfo? get readyInfo => _ready;
+
+  bool get hasManifest {
+    final u = manifestUrl;
+    return u != null && u.isNotEmpty;
+  }
+
+  String? get manifestUrl {
+    final explicit = BakedEnv.appUpdateManifestUrl.trim();
+    if (explicit.isNotEmpty) return explicit;
+    final q = BakedEnv.qiniuPublicBase.trim().replaceAll(RegExp(r'/+$'), '');
+    if (q.isNotEmpty) return '$q/app/version.json';
+    final r = BakedEnv.r2PublicBase.trim().replaceAll(RegExp(r'/+$'), '');
+    if (r.isNotEmpty) return '$r/app/version.json';
+    return null;
+  }
+
+  /// 启动后静默检查；已下载则直接进入 ready。
+  Future<void> bootstrap({bool manual = false}) async {
+    if (!Platform.isAndroid) return;
+    if (!hasManifest) {
+      if (manual) {
+        _phase.value = AppUpdatePhase.failed;
+        _message.value = '未配置更新地址（需七牛/R2 或 APP_UPDATE_MANIFEST_URL）';
+      }
+
+      return;
+    }
+
+    try {
+      final restored = await _restoreReady();
+      if (restored != null) {
+        _ready = restored;
+        _phase.value = AppUpdatePhase.ready;
+        _message.value = '新版本 ${restored.versionName} 已就绪';
+        _progress.value = 1;
+        return;
+      }
+
+      _phase.value = AppUpdatePhase.checking;
+      _message.value = '正在检查更新…';
+      _progress.value = null;
+
+      // 先拉清单：强制更新每次启动都查；非强制才做间隔节流
+      final remote = await fetchManifest();
+      final prefs = await SharedPreferences.getInstance();
+      if (!manual && remote != null && !remote.force) {
+        final last = prefs.getInt(_kLastCheck) ?? 0;
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - last < const Duration(hours: 6).inMilliseconds) {
+          _phase.value = AppUpdatePhase.idle;
+          _message.value = '';
+          return;
+        }
+      }
+      await prefs.setInt(
+        _kLastCheck,
+        DateTime.now().millisecondsSinceEpoch,
+      );
+
+      if (remote == null) {
+        _phase.value = manual ? AppUpdatePhase.failed : AppUpdatePhase.idle;
+        if (manual) _message.value = '无法读取版本信息';
+        return;
+      }
+
+      final info = await PackageInfo.fromPlatform();
+      final localCode = int.tryParse(info.buildNumber) ?? 0;
+      if (remote.versionCode <= localCode) {
+        _phase.value = AppUpdatePhase.idle;
+        _message.value = manual ? '已是最新版本（${info.version}）' : '';
+        await _clearReady();
+        return;
+      }
+
+      final skipped = prefs.getInt(_kSkipped) ?? 0;
+
+      if (!manual && !remote.force && skipped >= remote.versionCode) {
+        _phase.value = AppUpdatePhase.idle;
+        return;
+      }
+
+      final wifiOk = await _onWifi();
+      if (!wifiOk && !remote.force && !manual) {
+        // 非 Wi‑Fi：非强制才推迟；强制更新仍下载
+        _phase.value = AppUpdatePhase.idle;
+        _message.value = '';
+        return;
+      }
+
+      await _download(remote);
+    } catch (e) {
+      _message.value = '检查更新失败：$e';
+      // 自动检查失败保持静默，避免启动时闪失败窗；手动检查才标 failed
+      _phase.value = manual ? AppUpdatePhase.failed : AppUpdatePhase.idle;
+    }
+  }
+
+  Future<AppUpdateInfo?> fetchManifest() async {
+    final url = manifestUrl;
+    if (url == null || url.isEmpty) return null;
+    final bust = url.contains('?')
+        ? '$url&_=${DateTime.now().millisecondsSinceEpoch}'
+        : '$url?_=${DateTime.now().millisecondsSinceEpoch}';
+    final res = await http.get(Uri.parse(bust)).timeout(
+      const Duration(seconds: 20),
+    );
+    if (res.statusCode < 200 || res.statusCode >= 300) return null;
+    final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+    if (decoded is! Map) return null;
+    final info = AppUpdateInfo.fromJson(Map<String, dynamic>.from(decoded));
+    if (info.versionCode <= 0 || info.apkUrl.isEmpty) return null;
+    return info;
+  }
+
+  Future<void> skipReady() async {
+    final info = _ready;
+    if (info == null) return;
+    // 强制更新不允许跳过
+    if (info.force) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_kSkipped, info.versionCode);
+    _ready = null;
+    _phase.value = AppUpdatePhase.idle;
+    _message.value = '';
+    _progress.value = null;
+  }
+
+
+  Future<OpenResult> installReady() async {
+    final prefs = await SharedPreferences.getInstance();
+    final path = prefs.getString(_kReadyPath) ?? '';
+    if (path.isEmpty || !await File(path).exists()) {
+      _phase.value = AppUpdatePhase.failed;
+      _message.value = '安装包丢失，请重新检查更新';
+      await _clearReady();
+      return OpenResult(type: ResultType.error, message: 'missing apk');
+    }
+    return OpenFilex.open(path, type: 'application/vnd.android.package-archive');
+  }
+
+  Future<void> _download(AppUpdateInfo remote) async {
+    _phase.value = AppUpdatePhase.downloading;
+    _message.value = '正在下载 ${remote.versionName}…';
+    _progress.value = 0;
+
+    final dir = await getTemporaryDirectory();
+    final out = File(p.join(dir.path, 'rent_agent_update_${remote.versionCode}.apk'));
+    final tmp = File('${out.path}.part');
+
+    final client = http.Client();
+    try {
+      final req = http.Request('GET', Uri.parse(remote.apkUrl));
+      final streamed =
+          await client.send(req).timeout(const Duration(minutes: 30));
+      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
+        throw StateError('下载失败 HTTP ${streamed.statusCode}');
+      }
+      final total = streamed.contentLength ?? -1;
+      final sink = tmp.openWrite();
+      var got = 0;
+      var lastReport = DateTime.fromMillisecondsSinceEpoch(0);
+      await for (final chunk in streamed.stream) {
+        sink.add(chunk);
+        got += chunk.length;
+        final now = DateTime.now();
+        if (total > 0 &&
+            now.difference(lastReport).inMilliseconds >= 300) {
+          lastReport = now;
+          _progress.value = (got / total).clamp(0.0, 1.0);
+          _message.value =
+              '正在下载 ${remote.versionName}… ${((got / total) * 100).round()}%';
+        }
+      }
+      await sink.close();
+      if (await out.exists()) await out.delete();
+      await tmp.rename(out.path);
+    } catch (e) {
+
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+      _phase.value = AppUpdatePhase.failed;
+      _message.value = '下载失败：$e';
+      rethrow;
+    } finally {
+      client.close();
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_kReadyCode, remote.versionCode);
+    await prefs.setString(_kReadyName, remote.versionName);
+    await prefs.setString(_kReadyPath, out.path);
+    await prefs.setBool(_kReadyForce, remote.force);
+    await prefs.setString(_kReadyNotes, remote.changelog);
+    // 新版本到来时清掉旧的「稍后」
+    final skipped = prefs.getInt(_kSkipped) ?? 0;
+    if (skipped < remote.versionCode) {
+      await prefs.remove(_kSkipped);
+    }
+
+    _ready = remote;
+    _phase.value = AppUpdatePhase.ready;
+    _progress.value = 1;
+    _message.value = '新版本 ${remote.versionName} 已就绪';
+  }
+
+  Future<AppUpdateInfo?> _restoreReady() async {
+    final prefs = await SharedPreferences.getInstance();
+    final code = prefs.getInt(_kReadyCode) ?? 0;
+    final path = prefs.getString(_kReadyPath) ?? '';
+    if (code <= 0 || path.isEmpty) return null;
+    final info = await PackageInfo.fromPlatform();
+    final localCode = int.tryParse(info.buildNumber) ?? 0;
+    if (code <= localCode) {
+      await _clearReady();
+      return null;
+    }
+    if (!await File(path).exists()) {
+      await _clearReady();
+      return null;
+    }
+    final skipped = prefs.getInt(_kSkipped) ?? 0;
+    final force = prefs.getBool(_kReadyForce) ?? false;
+    if (!force && skipped >= code) return null;
+    return AppUpdateInfo(
+      versionCode: code,
+      versionName: prefs.getString(_kReadyName) ?? '$code',
+      apkUrl: '',
+
+      force: force,
+      changelog: prefs.getString(_kReadyNotes) ?? '',
+    );
+  }
+
+  Future<void> _clearReady() async {
+    final prefs = await SharedPreferences.getInstance();
+    final path = prefs.getString(_kReadyPath);
+    await prefs.remove(_kReadyCode);
+    await prefs.remove(_kReadyName);
+    await prefs.remove(_kReadyPath);
+    await prefs.remove(_kReadyForce);
+    await prefs.remove(_kReadyNotes);
+    if (path != null && path.isNotEmpty) {
+      try {
+        final f = File(path);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
+  }
+
+  Future<bool> _onWifi() async {
+    try {
+      final r = await Connectivity().checkConnectivity();
+      return r == ConnectivityResult.wifi;
+    } catch (_) {
+      // 探测失败时允许下载，避免永远更不了
+      return true;
+    }
+  }
+}
+
+// ===== FILE: lib/util/user_facing_error.dart =====
+/// 把后端 / SDK 英文错误转成对用户可读的中文。
+String userFacingError(
+  Object? error, {
+  String fallback = '操作失败，请稍后重试',
+}) {
+  if (error == null) return fallback;
+  var raw = error.toString().trim();
+  if (raw.isEmpty) return fallback;
+
+  raw = raw
+      .replaceFirst(RegExp(r'^Bad state:\s*', caseSensitive: false), '')
+      .replaceFirst(RegExp(r'^Exception:\s*', caseSensitive: false), '')
+      .replaceFirst(RegExp(r'^StateError:\s*', caseSensitive: false), '')
+      .replaceFirst(RegExp(r'^AuthApiException:\s*', caseSensitive: false), '')
+      .replaceFirst(RegExp(r'^AuthException\(message:\s*', caseSensitive: false), '')
+      .replaceFirst(RegExp(r'^AuthRetryableFetchException:\s*', caseSensitive: false), '')
+      .replaceFirst(RegExp(r',\s*statusCode:.*\)$'), '')
+
+      .replaceFirst(RegExp(r'^Error:\s*', caseSensitive: false), '')
+      .trim();
+
+  // 已是中文为主则原样返回（去掉常见英文前缀后）
+  final mapped = _mapKnown(raw);
+  if (mapped != null) return mapped;
+
+  if (_looksMostlyChinese(raw)) return raw;
+  return fallback;
+}
+
+String? _mapKnown(String raw) {
+  final s = raw.toLowerCase();
+
+  if (s.contains('invalid login credentials') ||
+      s.contains('invalid email or password') ||
+      s.contains('email or password is incorrect')) {
+    return '邮箱或密码不正确';
+  }
+  if (s.contains('email not confirmed') ||
+      s.contains('email address not confirmed')) {
+    return '邮箱尚未验证，请先查收验证码邮件';
+  }
+  if (s.contains('user already registered') ||
+      s.contains('already been registered') ||
+      s.contains('user already exists')) {
+    return '该邮箱已注册，请直接登录';
+  }
+  if (s.contains('user not found')) {
+    return '账号不存在，请先注册';
+  }
+  if (s.contains('password should be at least') ||
+      s.contains('password is too short') ||
+      (s.contains('password') && s.contains('at least 6'))) {
+    return '密码至少 6 位';
+  }
+  if (s.contains('unable to validate email') ||
+      s.contains('invalid email') ||
+      s.contains('email format')) {
+    return '请输入合法邮箱';
+  }
+  if (s.contains('email rate limit') ||
+      s.contains('over_email_send_rate_limit') ||
+      s.contains('rate limit')) {
+    return '发送太频繁，请稍后再试';
+  }
+  if (s.contains('for security purposes') ||
+      s.contains('only request this after')) {
+    return '操作太频繁，请稍后再试';
+  }
+
+  if (s.contains('token has expired') ||
+      s.contains('otp_expired') ||
+      s.contains('email link is invalid or has expired')) {
+    return '验证码已过期，请重新获取';
+  }
+  if (s.contains('token') && (s.contains('invalid') || s.contains('otp'))) {
+    return '验证码不正确或已失效';
+  }
+  if (s.contains('network') ||
+      s.contains('failed to fetch') ||
+      s.contains('socketexception') ||
+      s.contains('connection') ||
+      s.contains('timed out') ||
+      s.contains('timeout')) {
+    return '网络异常，请检查网络后重试';
+  }
+  if (s.contains('jwt expired') ||
+      s.contains('session') && s.contains('expired') ||
+      s.contains('refresh token')) {
+    return '登录已过期，请重新登录';
+  }
+  if (s.contains('supabase') && s.contains('未配置')) {
+    return raw; // 已是我们自己的中文提示
+  }
+  if (s.contains('signup is disabled')) {
+    return '当前未开放注册';
+  }
+  if (s.contains('weak password')) {
+    return '密码过于简单，请换一个更安全的密码';
+  }
+  if (s.contains('same password') ||
+      s.contains('should be different from the old password')) {
+    return '新密码不能与旧密码相同';
+  }
+  return null;
+}
+
+bool _looksMostlyChinese(String s) {
+  var cn = 0;
+  var letters = 0;
+  for (final r in s.runes) {
+    if (r >= 0x4E00 && r <= 0x9FFF) {
+      cn++;
+    } else if ((r >= 0x41 && r <= 0x5A) || (r >= 0x61 && r <= 0x7A)) {
+      letters++;
+    }
+  }
+  return cn > 0 && cn >= letters;
+}

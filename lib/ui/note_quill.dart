@@ -51,6 +51,15 @@ void replaceWithPlain(QuillController controller, String plain) {
   );
 }
 
+/// 在现有正文末尾追加纯文本（不覆盖原文）。
+void appendWithPlain(QuillController controller, String plain) {
+  final add = plain.replaceAll(RegExp(r'\n+$'), '').trim();
+  if (add.isEmpty) return;
+  final cur = bodyPlain(controller).trimRight();
+  final next = cur.isEmpty ? add : '$cur\n$add';
+  replaceWithPlain(controller, next);
+}
+
 void replaceWithDeltaJson(QuillController controller, List<dynamic> delta) {
   replaceDocument(controller, Document.fromJson(delta));
 }

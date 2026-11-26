@@ -8,6 +8,9 @@ import '../auth/auth_service.dart';
 import '../data/app_database.dart';
 import '../state/app_store.dart';
 import 'busy.dart';
+import '../util/user_facing_error.dart';
+
+enum _AuthFlow { tabs, signupOtp, forgot, reset }
 
 class AuthPage extends StatefulWidget {
   const AuthPage({super.key, this.initialRegister = false});
@@ -25,10 +28,13 @@ class _AuthPageState extends State<AuthPage>
   final _password = TextEditingController();
   final _nickname = TextEditingController();
   final _otp = TextEditingController();
+  final _newPassword = TextEditingController();
+  final _confirmPassword = TextEditingController();
   String? _error;
   String? _info;
   bool _obscure = true;
-  bool _awaitingOtp = false;
+  bool _obscureNew = true;
+  _AuthFlow _flow = _AuthFlow.tabs;
   int _cooldown = 0;
   Timer? _coolTimer;
 
@@ -50,6 +56,8 @@ class _AuthPageState extends State<AuthPage>
     _password.dispose();
     _nickname.dispose();
     _otp.dispose();
+    _newPassword.dispose();
+    _confirmPassword.dispose();
     super.dispose();
   }
 
@@ -127,9 +135,16 @@ class _AuthPageState extends State<AuthPage>
       if (!mounted) return;
       await _afterAuthSuccess();
     } catch (e) {
-      if (mounted) {
-        setState(() => _error = e.toString().replaceFirst('Bad state: ', ''));
+      if (!mounted) return;
+      final msg = userFacingError(e);
+      final raw = e.toString().toLowerCase();
+      if (raw.contains('email not confirmed') ||
+          raw.contains('email address not confirmed') ||
+          msg.contains('尚未验证')) {
+        await _goVerifyExisting();
+        return;
       }
+      setState(() => _error = msg);
     }
   }
 
@@ -164,18 +179,52 @@ class _AuthPageState extends State<AuthPage>
         return;
       }
       setState(() {
-        _awaitingOtp = true;
-        _info = '验证码已发送到邮箱，请查收后完成注册';
+        _flow = _AuthFlow.signupOtp;
+        _info = result.otpHint ?? '验证码已发送到邮箱，请查收后完成注册';
       });
       _startCooldown();
     } catch (e) {
       if (mounted) {
-        setState(() => _error = e.toString().replaceFirst('Bad state: ', ''));
+        setState(() => _error = userFacingError(e));
       }
     }
   }
 
-  Future<void> _verifyOtp() async {
+  Future<void> _goVerifyExisting() async {
+    setState(() {
+      _error = null;
+      _info = null;
+    });
+    final e = _email.text.trim();
+    if (e.isEmpty) {
+      setState(() => _error = '请先填写邮箱');
+      return;
+    }
+    try {
+      await runBusy(
+        context,
+        message: '发送中…',
+        task: () => AuthService.instance.beginEmailVerification(e),
+      );
+      if (!mounted) return;
+      setState(() {
+        _flow = _AuthFlow.signupOtp;
+        _info = '验证码已发送到邮箱，请查收后完成验证';
+      });
+      _startCooldown();
+    } catch (err) {
+      if (mounted) {
+        // 即便发送失败也进入验证页，方便输入旧验证码或稍后重发
+        setState(() {
+          _flow = _AuthFlow.signupOtp;
+          _error = userFacingError(err);
+          _info = '若此前已发过验证码，可直接输入；也可稍后重发';
+        });
+      }
+    }
+  }
+
+  Future<void> _verifySignupOtp() async {
     setState(() {
       _error = null;
     });
@@ -195,12 +244,12 @@ class _AuthPageState extends State<AuthPage>
       await _afterAuthSuccess();
     } catch (e) {
       if (mounted) {
-        setState(() => _error = e.toString().replaceFirst('Bad state: ', ''));
+        setState(() => _error = userFacingError(e));
       }
     }
   }
 
-  Future<void> _resendOtp() async {
+  Future<void> _resendSignupOtp() async {
     if (_cooldown > 0) return;
     setState(() => _error = null);
     try {
@@ -214,49 +263,144 @@ class _AuthPageState extends State<AuthPage>
       _startCooldown();
     } catch (e) {
       if (mounted) {
-        setState(() => _error = e.toString().replaceFirst('Bad state: ', ''));
+        setState(() => _error = userFacingError(e));
       }
     }
   }
 
-  Widget _passwordField({required bool isLogin}) {
+  Future<void> _sendResetOtp() async {
+    setState(() {
+      _error = null;
+      _info = null;
+    });
+    try {
+      await runBusy(
+        context,
+        message: '发送中…',
+        task: () => AuthService.instance.sendPasswordResetOtp(_email.text),
+      );
+      if (!mounted) return;
+      setState(() {
+        _flow = _AuthFlow.reset;
+        _otp.clear();
+        _newPassword.clear();
+        _confirmPassword.clear();
+        _info = '若该邮箱已注册，验证码将发送到邮箱';
+      });
+      _startCooldown();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = userFacingError(e));
+      }
+    }
+  }
+
+  Future<void> _resendResetOtp() async {
+    if (_cooldown > 0) return;
+    setState(() => _error = null);
+    try {
+      await runBusy(
+        context,
+        message: '发送中…',
+        task: () => AuthService.instance.sendPasswordResetOtp(_email.text),
+      );
+      if (!mounted) return;
+      setState(() => _info = '验证码已重新发送');
+      _startCooldown();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = userFacingError(e));
+      }
+    }
+  }
+
+  Future<void> _submitReset() async {
+    setState(() {
+      _error = null;
+      _info = null;
+    });
+    final p1 = _newPassword.text.trim();
+    final p2 = _confirmPassword.text.trim();
+    if (p1.length < 6) {
+      setState(() => _error = '新密码至少 6 位');
+      return;
+    }
+    if (p1 != p2) {
+      setState(() => _error = '两次输入的新密码不一致');
+      return;
+    }
+    try {
+      await runBusy(
+        context,
+        message: '正在重置…',
+        task: () => AuthService.instance.resetPasswordWithOtp(
+          email: _email.text,
+          token: _otp.text,
+          newPassword: p1,
+        ),
+      );
+      if (!mounted) return;
+      await _afterAuthSuccess();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = userFacingError(e));
+      }
+    }
+  }
+
+  Widget _passwordField({
+    required TextEditingController controller,
+    required String label,
+    required bool obscure,
+    required VoidCallback onToggle,
+    List<String>? autofillHints,
+    VoidCallback? onSubmitted,
+  }) {
     return TextField(
-      controller: _password,
-      obscureText: _obscure,
-      autofillHints: isLogin
-          ? const [AutofillHints.password]
-          : const [AutofillHints.newPassword],
+      controller: controller,
+      obscureText: obscure,
+      autofillHints: autofillHints,
       decoration: InputDecoration(
-        labelText: '密码',
+        labelText: label,
         border: const OutlineInputBorder(),
         suffixIcon: IconButton(
-          tooltip: _obscure ? '显示密码' : '隐藏密码',
-          onPressed: () => setState(() => _obscure = !_obscure),
+          tooltip: obscure ? '显示密码' : '隐藏密码',
+          onPressed: onToggle,
           icon: Icon(
-            _obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+            obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined,
           ),
         ),
       ),
-      onSubmitted: (_) {
-        if (isLogin) {
-          _login();
-        } else {
-          _register();
-        }
-      },
+      onSubmitted: (_) => onSubmitted?.call(),
+    );
+  }
+
+  Widget _messageBlock() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (_info != null) ...[
+          const SizedBox(height: 12),
+          Text(_info!, style: TextStyle(color: Colors.grey.shade700)),
+        ],
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Text(_error!, style: TextStyle(color: Colors.red.shade700)),
+        ],
+      ],
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_awaitingOtp) {
+    if (_flow == _AuthFlow.signupOtp) {
       return Scaffold(
         appBar: AppBar(
           title: const Text('验证邮箱'),
           leading: IconButton(
             icon: const Icon(Icons.arrow_back),
             onPressed: () => setState(() {
-              _awaitingOtp = false;
+              _flow = _AuthFlow.tabs;
               _otp.clear();
               _error = null;
             }),
@@ -279,26 +423,132 @@ class _AuthPageState extends State<AuthPage>
               autofillHints: const [AutofillHints.oneTimeCode],
               decoration: const InputDecoration(
                 labelText: '验证码',
-                hintText: '6 位验证码',
+                hintText: '邮件中的验证码',
                 border: OutlineInputBorder(),
               ),
-              onSubmitted: (_) => _verifyOtp(),
+              onSubmitted: (_) => _verifySignupOtp(),
             ),
-            if (_info != null) ...[
-              const SizedBox(height: 12),
-              Text(_info!, style: TextStyle(color: Colors.grey.shade700)),
-            ],
-            if (_error != null) ...[
-              const SizedBox(height: 12),
-              Text(_error!, style: TextStyle(color: Colors.red.shade700)),
-            ],
+            _messageBlock(),
             const SizedBox(height: 24),
             FilledButton(
-              onPressed: _verifyOtp,
-              child: const Text('完成注册'),
+              onPressed: _verifySignupOtp,
+              child: const Text('完成验证'),
             ),
             TextButton(
-              onPressed: _cooldown > 0 ? null : _resendOtp,
+              onPressed: _cooldown > 0 ? null : _resendSignupOtp,
+              child: Text(
+                _cooldown > 0 ? '$_cooldown 秒后可重发' : '重发验证码',
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_flow == _AuthFlow.forgot) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('忘记密码'),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => setState(() {
+              _flow = _AuthFlow.tabs;
+              _error = null;
+              _info = null;
+            }),
+          ),
+        ),
+        body: ListView(
+          padding: const EdgeInsets.all(24),
+          children: [
+            Text(
+              '输入注册邮箱，我们将发送验证码用于重置密码。',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Colors.grey.shade700,
+                  ),
+            ),
+            const SizedBox(height: 24),
+            TextField(
+              controller: _email,
+              keyboardType: TextInputType.emailAddress,
+              autofillHints: const [AutofillHints.email],
+              decoration: const InputDecoration(
+                labelText: '邮箱',
+                border: OutlineInputBorder(),
+              ),
+              onSubmitted: (_) => _sendResetOtp(),
+            ),
+            _messageBlock(),
+            const SizedBox(height: 24),
+            FilledButton(
+              onPressed: _sendResetOtp,
+              child: const Text('发送验证码'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_flow == _AuthFlow.reset) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('重置密码'),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => setState(() {
+              _flow = _AuthFlow.forgot;
+              _otp.clear();
+              _newPassword.clear();
+              _confirmPassword.clear();
+              _error = null;
+            }),
+          ),
+        ),
+        body: ListView(
+          padding: const EdgeInsets.all(24),
+          children: [
+            Text(
+              '验证码已发至 ${_email.text.trim()}。请输入验证码并设置新密码。',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Colors.grey.shade700,
+                  ),
+            ),
+            const SizedBox(height: 24),
+            TextField(
+              controller: _otp,
+              keyboardType: TextInputType.number,
+              autofillHints: const [AutofillHints.oneTimeCode],
+              decoration: const InputDecoration(
+                labelText: '验证码',
+                hintText: '邮件中的验证码',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            _passwordField(
+              controller: _newPassword,
+              label: '新密码',
+              obscure: _obscureNew,
+              onToggle: () => setState(() => _obscureNew = !_obscureNew),
+              autofillHints: const [AutofillHints.newPassword],
+            ),
+            const SizedBox(height: 16),
+            _passwordField(
+              controller: _confirmPassword,
+              label: '确认新密码',
+              obscure: _obscureNew,
+              onToggle: () => setState(() => _obscureNew = !_obscureNew),
+              autofillHints: const [AutofillHints.newPassword],
+              onSubmitted: _submitReset,
+            ),
+            _messageBlock(),
+            const SizedBox(height: 24),
+            FilledButton(
+              onPressed: _submitReset,
+              child: const Text('确认重置'),
+            ),
+            TextButton(
+              onPressed: _cooldown > 0 ? null : _resendResetOtp,
               child: Text(
                 _cooldown > 0 ? '$_cooldown 秒后可重发' : '重发验证码',
               ),
@@ -342,12 +592,34 @@ class _AuthPageState extends State<AuthPage>
                 ),
               ),
               const SizedBox(height: 16),
-              _passwordField(isLogin: true),
+              _passwordField(
+                controller: _password,
+                label: '密码',
+                obscure: _obscure,
+                onToggle: () => setState(() => _obscure = !_obscure),
+                autofillHints: const [AutofillHints.password],
+                onSubmitted: _login,
+              ),
               if (_error != null && _tabs.index == 0) ...[
                 const SizedBox(height: 12),
                 Text(_error!, style: TextStyle(color: Colors.red.shade700)),
               ],
-              const SizedBox(height: 24),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => setState(() {
+                    _flow = _AuthFlow.forgot;
+                    _error = null;
+                    _info = null;
+                    _otp.clear();
+                    _newPassword.clear();
+                    _confirmPassword.clear();
+                  }),
+                  child: const Text('忘记密码？'),
+                ),
+              ),
+              const SizedBox(height: 8),
               FilledButton(
                 onPressed: _login,
                 child: const Text('登录'),
@@ -389,7 +661,14 @@ class _AuthPageState extends State<AuthPage>
                 ),
               ),
               const SizedBox(height: 16),
-              _passwordField(isLogin: false),
+              _passwordField(
+                controller: _password,
+                label: '密码',
+                obscure: _obscure,
+                onToggle: () => setState(() => _obscure = !_obscure),
+                autofillHints: const [AutofillHints.newPassword],
+                onSubmitted: _register,
+              ),
               if (_error != null && _tabs.index == 1) ...[
                 const SizedBox(height: 12),
                 Text(_error!, style: TextStyle(color: Colors.red.shade700)),
@@ -398,6 +677,10 @@ class _AuthPageState extends State<AuthPage>
               FilledButton(
                 onPressed: _register,
                 child: const Text('注册'),
+              ),
+              TextButton(
+                onPressed: _goVerifyExisting,
+                child: const Text('已注册未验证？去验证邮箱'),
               ),
               TextButton(
                 onPressed: () => Navigator.pop(context),

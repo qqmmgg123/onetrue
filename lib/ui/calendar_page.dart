@@ -1,92 +1,45 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../domain/calendar_layout.dart';
 import '../domain/models.dart';
 import '../domain/note_recur.dart';
-import '../reminders/reminder_service.dart';
 import '../state/app_store.dart';
+import 'auth_page.dart';
+import 'busy.dart';
 import 'format.dart';
+import 'l2_side_drawer.dart';
 import 'note_editor_page.dart';
 
 class CalendarPage extends StatefulWidget {
-  const CalendarPage({super.key});
+  const CalendarPage({super.key, this.drawerKey});
+
+  final GlobalKey<L2SideDrawerState>? drawerKey;
 
   @override
   State<CalendarPage> createState() => _CalendarPageState();
 }
 
-class _CalendarPageState extends State<CalendarPage>
-    with SingleTickerProviderStateMixin {
+class _CalendarPageState extends State<CalendarPage> {
   static const _hourStart = 6;
   static const _hourEnd = 23;
 
-  late DateTime _month;
   late DateTime _selected;
-  /// three | month — 默认三日在前
-  String _mode = 'three';
-  late final TabController _modeTab;
-  late final PageController _monthPage;
   late final PageController _threePage;
-  static const _monthBase = 120;
   static const _threeBase = 400;
 
   @override
   void initState() {
     super.initState();
     final today = dateOnly(DateTime.now());
-    _month = DateTime(today.year, today.month);
     _selected = today;
-    _modeTab = TabController(length: 2, vsync: this, initialIndex: 0);
-    _modeTab.addListener(_onModeTab);
-    _monthPage = PageController(initialPage: _monthBase);
     _threePage = PageController(initialPage: _threeBase);
-  }
-
-  void _onModeTab() {
-    if (_modeTab.indexIsChanging) return;
-    final next = _modeTab.index == 0 ? 'three' : 'month';
-    if (next == _mode) return;
-    _applyMode(next);
-  }
-
-  void _applyMode(String next) {
-    setState(() => _mode = next);
-    if (next == 'three') {
-      final today = dateOnly(DateTime.now());
-      final delta = dateOnly(_selected).difference(today).inDays;
-      final page = _threeBase + (delta / 3).round();
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_threePage.hasClients) {
-          _threePage.jumpToPage(page);
-        }
-      });
-    } else {
-      final today = dateOnly(DateTime.now());
-      final base = DateTime(today.year, today.month);
-      final page = _monthBase +
-          (_month.year - base.year) * 12 +
-          (_month.month - base.month);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_monthPage.hasClients) {
-          _monthPage.jumpToPage(page);
-        }
-      });
-    }
   }
 
   @override
   void dispose() {
-    _modeTab.removeListener(_onModeTab);
-    _modeTab.dispose();
-    _monthPage.dispose();
     _threePage.dispose();
     super.dispose();
-  }
-
-  DateTime _monthAt(int page) {
-    final today = dateOnly(DateTime.now());
-    final base = DateTime(today.year, today.month);
-    return DateTime(base.year, base.month + (page - _monthBase));
   }
 
   DateTime _threeAnchorAt(int page) {
@@ -109,7 +62,17 @@ class _CalendarPageState extends State<CalendarPage>
     return notesGroupedByDay(notes, from: from, to: to);
   }
 
+  Future<void> _openAuth() {
+    return Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const AuthPage()),
+    );
+  }
+
   Future<void> _openNewSchedule(DateTime at, {String kind = kNoteKindSchedule}) {
+    final store = context.read<AppStore>();
+    if (store.isGuest) {
+      return _openAuth();
+    }
     return Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => NoteEditorPage(
@@ -120,374 +83,413 @@ class _CalendarPageState extends State<CalendarPage>
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final store = context.watch<AppStore>();
-    final reminders = ReminderService.instance;
-    final today = dateOnly(DateTime.now());
-    final monthFrom = DateTime(_month.year, _month.month, 1);
-    final monthTo = DateTime(_month.year, _month.month + 1, 0, 23, 59, 59);
-    final threeMid = _selected;
-    final threeDays = _threeDays(threeMid);
-    final threeFrom = DateTime(
-      threeDays.first.year,
-      threeDays.first.month,
-      threeDays.first.day,
-    );
-    final threeTo = DateTime(
-      threeDays.last.year,
-      threeDays.last.month,
-      threeDays.last.day,
-      23,
-      59,
-      59,
-    );
-    final notesByDay = _notesWindow(
-      store.notes,
-      from: _mode == 'month'
-          ? monthFrom.subtract(const Duration(days: 7))
-          : threeFrom,
-      to: _mode == 'month' ? monthTo.add(const Duration(days: 7)) : threeTo,
-    );
-    final selectedNotes = notesByDay[_selected] ?? const [];
-    final noteAlarms =
-        reminders.scheduled.where((a) => a.id >= 800000).toList();
-
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
-      children: [
-        Text(
-          _mode == 'month'
-              ? '${_month.year}年${_month.month}月'
-              : '${ymd(threeDays.first)} – ${ymd(threeDays.last)}',
-          style: Theme.of(context).textTheme.titleLarge,
-        ),
-        const SizedBox(height: 4),
-        // 下划线 Tab（与求索雅集/陋室同款）；不用 TabBarView，避免与日历左右滑冲突
-        Align(
-          alignment: Alignment.centerLeft,
-          child: TabBar(
-            controller: _modeTab,
-            isScrollable: true,
-            tabs: const [
-              Tab(height: 36, text: '三日'),
-              Tab(height: 36, text: '月历'),
-            ],
-          ),
-        ),
-        const SizedBox(height: 8),
-        Text(
-          _mode == 'month'
-              ? '左右滑换月；点日期看当天备忘日程。'
-              : '左右滑换三日；点空白时段新建日程，长按建备忘。',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-        const SizedBox(height: 12),
-        if (_mode == 'month')
-          SizedBox(
-            height: 320,
-            child: PageView.builder(
-              controller: _monthPage,
-              onPageChanged: (page) {
-                final m = _monthAt(page);
-                setState(() {
-                  _month = m;
-                  if (_selected.month != m.month || _selected.year != m.year) {
-                    final day = _selected.day.clamp(
-                      1,
-                      DateTime(m.year, m.month + 1, 0).day,
-                    );
-                    _selected = DateTime(m.year, m.month, day);
-                  }
-                });
-              },
-              itemBuilder: (context, page) {
-                final m = _monthAt(page);
-                final from = DateTime(m.year, m.month, 1)
-                    .subtract(const Duration(days: 7));
-                final to = DateTime(m.year, m.month + 1, 0, 23, 59, 59)
-                    .add(const Duration(days: 7));
-                final pageNotes = _notesWindow(
-                  store.notes,
-                  from: from,
-                  to: to,
-                );
-                return _MonthGrid(
-                  month: m,
-                  selected: _selected,
-                  today: today,
-                  notesByDay: pageNotes,
-                  onSelect: (d) => setState(() {
-                    _selected = d;
-                    _month = DateTime(d.year, d.month);
-                  }),
-                );
-              },
-            ),
-          )
-        else
-          SizedBox(
-            height: 420,
-            child: PageView.builder(
-              controller: _threePage,
-              onPageChanged: (page) {
-                final mid = _threeAnchorAt(page);
-                setState(() => _selected = mid);
-              },
-              itemBuilder: (context, page) {
-                final mid = _threeAnchorAt(page);
-                final days = _threeDays(mid);
-                final from = DateTime(
-                  days.first.year,
-                  days.first.month,
-                  days.first.day,
-                );
-                final to = DateTime(
-                  days.last.year,
-                  days.last.month,
-                  days.last.day,
-                  23,
-                  59,
-                  59,
-                );
-                final pageNotes = _notesWindow(
-                  store.notes,
-                  from: from,
-                  to: to,
-                );
-                return _ThreeDayView(
-                  days: days,
-                  selected: _selected,
-                  today: today,
-                  hourStart: _hourStart,
-                  hourEnd: _hourEnd,
-                  notesByDay: pageNotes,
-                  onSelectDay: (d) => setState(() => _selected = d),
-                  onTapSlot: (at) => _openNewSchedule(at),
-                  onLongPressSlot: (at) =>
-                      _openNewSchedule(at, kind: kNoteKindMemo),
-                  onTapNote: (n) {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => NoteEditorPage(noteId: n.id),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        const SizedBox(height: 16),
-        Text(
-          '${md(_selected)} 的备忘 / 日程',
-          style: Theme.of(context).textTheme.titleMedium,
-        ),
-        const SizedBox(height: 8),
-        if (selectedNotes.isEmpty)
-          Text(
-            '这一天没有备忘或日程。',
-            style: Theme.of(context).textTheme.bodySmall,
-          )
-        else
-          ...selectedNotes.map(
-            (e) => ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(
-                e.note.kind == kNoteKindSchedule
-                    ? Icons.event_outlined
-                    : Icons.notifications_none,
-              ),
-              title: Text(e.note.displayTitle),
-              subtitle: Text(
-                '${e.note.kindLabel} · '
-                '${e.at.hour.toString().padLeft(2, '0')}:'
-                '${e.at.minute.toString().padLeft(2, '0')}'
-                '${isRecurringFreq(e.note.recurFreq) ? ' · 重复' : ''}',
-              ),
-              onTap: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => NoteEditorPage(noteId: e.note.id),
-                  ),
-                );
-              },
-            ),
-          ),
-        const SizedBox(height: 20),
-        Row(
-          children: [
-            Text('已排日程提醒', style: Theme.of(context).textTheme.titleMedium),
-            const Spacer(),
-            if (!reminders.exactAlarmAllowed)
-              TextButton(
-                onPressed: () => _showExactHint(context),
-                child: const Text('需精确闹钟权限'),
-              ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        if (noteAlarms.isEmpty)
-          Text(
-            '暂无未来日程提醒。在备忘里设好时间后会自动排。',
-            style: Theme.of(context).textTheme.bodySmall,
-          )
-        else
-          ...noteAlarms.take(12).map((a) {
-            return ListTile(
-              contentPadding: EdgeInsets.zero,
-              dense: true,
-              leading: const Icon(Icons.alarm),
-              title: Text(a.title),
-              subtitle: Text(
-                '${ymd(a.when)} ${a.when.hour.toString().padLeft(2, '0')}:'
-                '${a.when.minute.toString().padLeft(2, '0')}'
-                '${a.roomLabel.isEmpty ? '' : ' · ${a.roomLabel}'}',
-              ),
-            );
-          }),
-      ],
+  /// 拖到新时间：按「该实例」相对位移平移整条日程的 scheduleAt（重复系列一并移动）。
+  /// 失败抛错，供三日视图回滚乐观位置。
+  Future<void> _moveSchedule({
+    required Note note,
+    required DateTime fromOccurrence,
+    required DateTime toAt,
+  }) async {
+    final store = context.read<AppStore>();
+    if (store.isGuest) {
+      await _openAuth();
+      throw StateError('需要登录');
+    }
+    final base = note.scheduleAt;
+    if (base == null) return;
+    final localBase = base.isUtc ? base.toLocal() : base;
+    if (toAt.isAtSameMomentAs(fromOccurrence)) return;
+    final newSchedule = localBase.add(toAt.difference(fromOccurrence));
+    final newRemind = remindAtFromOffset(newSchedule, note.remindOffsetMin);
+    if (!mounted) return;
+    await runBusy(
+      context,
+      message: '时间重新设置中…',
+      task: () async {
+        await store.saveNote(
+          id: note.id,
+          scheduleAt: newSchedule,
+          remindAt: newRemind,
+          clearRemindAt: newRemind == null,
+        );
+      },
     );
   }
 
-  void _showExactHint(BuildContext context) {
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('打开精确闹钟'),
-        content: const Text(
-          '小米/Android 12+ 可能禁止精确闹钟，导致日程提醒延迟。\n'
-          '请到系统设置 → 应用 → 醍醐 → 闹钟与提醒（或「使用精确闹钟」）允许。',
+  void _selectDay(DateTime day) {
+    final d = dateOnly(day);
+    setState(() => _selected = d);
+    // 中间日 = today + (page - base)*3
+    final today = dateOnly(DateTime.now());
+    final targetPage =
+        _threeBase + ((d.difference(today).inDays) / 3).round();
+    if (_threePage.hasClients) {
+      _threePage.animateToPage(
+        targetPage,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = context.watch<AppStore>();
+    final today = dateOnly(DateTime.now());
+    final threeDays = _threeDays(_selected);
+    final monthFrom = DateTime(_selected.year, _selected.month - 1, 1);
+    final monthTo = DateTime(_selected.year, _selected.month + 2, 0, 23, 59, 59);
+    final sideNotes = _notesWindow(
+      store.notes,
+      from: monthFrom,
+      to: monthTo,
+    );
+    final selectedNotes = sideNotes[_selected] ?? const [];
+
+    return L2SideDrawer(
+      key: widget.drawerKey,
+      enableEdgeSwipe: false,
+      drawer: _CalendarSidePanel(
+        selected: _selected,
+        today: today,
+        notesByDay: sideNotes,
+        dayNotes: selectedNotes,
+        onSelectDay: (d) {
+          _selectDay(d);
+          widget.drawerKey?.currentState?.close();
+        },
+        onOpenNote: (n) {
+          widget.drawerKey?.currentState?.close();
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => NoteEditorPage(noteId: n.id)),
+          );
+        },
+        onArrange: () {
+          widget.drawerKey?.currentState?.close();
+          final at = DateTime(
+            _selected.year,
+            _selected.month,
+            _selected.day,
+            9,
+          );
+          _openNewSchedule(at);
+        },
+      ),
+      child: RefreshIndicator(
+        onRefresh: () async {
+          if (store.isGuest) return;
+          await store.refreshMyCache();
+        },
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: Text(
+                '${ymd(threeDays.first)} – ${ymd(threeDays.last)}',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+              child: Text(
+                '左右滑换三日；点空白叠卡；长按卡片拖到其他时间。',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+            Expanded(
+              child: PageView.builder(
+                controller: _threePage,
+                onPageChanged: (page) {
+                  final mid = _threeAnchorAt(page);
+                  setState(() => _selected = mid);
+                },
+                itemBuilder: (context, page) {
+                  final mid = _threeAnchorAt(page);
+                  final days = _threeDays(mid);
+                  final from = DateTime(
+                    days.first.year,
+                    days.first.month,
+                    days.first.day,
+                  );
+                  final to = DateTime(
+                    days.last.year,
+                    days.last.month,
+                    days.last.day,
+                    23,
+                    59,
+                    59,
+                  );
+                  final pageNotes = _notesWindow(
+                    store.notes,
+                    from: from,
+                    to: to,
+                  );
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: _ThreeDayView(
+                      days: days,
+                      selected: _selected,
+                      today: today,
+                      hourStart: _hourStart,
+                      hourEnd: _hourEnd,
+                      notesByDay: pageNotes,
+                      onSelectDay: (d) => setState(() => _selected = d),
+                      onTapSlot: (at) => _openNewSchedule(at),
+                      onLongPressSlot: (at) => _openNewSchedule(at),
+                      onTapNote: (n) {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => NoteEditorPage(noteId: n.id),
+                          ),
+                        );
+                      },
+                      onMoveNote: (note, from, to) => _moveSchedule(
+                        note: note,
+                        fromOccurrence: from,
+                        toAt: to,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('知道了'),
-          ),
-        ],
       ),
     );
   }
 }
 
-class _MonthGrid extends StatelessWidget {
-  const _MonthGrid({
-    required this.month,
+class _CalendarSidePanel extends StatefulWidget {
+  const _CalendarSidePanel({
     required this.selected,
     required this.today,
     required this.notesByDay,
-    required this.onSelect,
+    required this.dayNotes,
+    required this.onSelectDay,
+    required this.onOpenNote,
+    required this.onArrange,
   });
 
-  final DateTime month;
   final DateTime selected;
   final DateTime today;
   final Map<DateTime, List<({Note note, DateTime at})>> notesByDay;
-  final ValueChanged<DateTime> onSelect;
+  final List<({Note note, DateTime at})> dayNotes;
+  final ValueChanged<DateTime> onSelectDay;
+  final ValueChanged<Note> onOpenNote;
+  final VoidCallback onArrange;
+
+  @override
+  State<_CalendarSidePanel> createState() => _CalendarSidePanelState();
+}
+
+class _CalendarSidePanelState extends State<_CalendarSidePanel> {
+  late DateTime _month;
+
+  static const _wd = ['一', '二', '三', '四', '五', '六', '日'];
+
+  @override
+  void initState() {
+    super.initState();
+    _month = DateTime(widget.selected.year, widget.selected.month, 1);
+  }
+
+  @override
+  void didUpdateWidget(covariant _CalendarSidePanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.selected.year != widget.selected.year ||
+        oldWidget.selected.month != widget.selected.month) {
+      _month = DateTime(widget.selected.year, widget.selected.month, 1);
+    }
+  }
+
+  List<DateTime> get _cells {
+    final first = _month;
+    final pad = (first.weekday + 6) % 7;
+    final start = first.subtract(Duration(days: pad));
+    return List.generate(42, (i) => dateOnly(start.add(Duration(days: i))));
+  }
 
   @override
   Widget build(BuildContext context) {
-    final first = DateTime(month.year, month.month, 1);
-    final lead = first.weekday - 1;
-    final daysInMonth = DateTime(month.year, month.month + 1, 0).day;
-    final cells = lead + daysInMonth;
-    final rows = ((cells + 6) ~/ 7);
-
-    const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
-
-    return Container(
-      decoration: const BoxDecoration(
-        border: Border(
-          top: BorderSide(color: Color(0xFFE5E5E5)),
-          bottom: BorderSide(color: Color(0xFFE5E5E5)),
+    final cells = _cells;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 10, 8, 6),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: '上一年',
+                onPressed: () => setState(
+                  () => _month = DateTime(_month.year - 1, _month.month, 1),
+                ),
+                icon: const Icon(Icons.keyboard_double_arrow_left, size: 18),
+              ),
+              IconButton(
+                tooltip: '上一月',
+                onPressed: () => setState(
+                  () => _month = DateTime(_month.year, _month.month - 1, 1),
+                ),
+                icon: const Icon(Icons.chevron_left, size: 20),
+              ),
+              Expanded(
+                child: Text(
+                  '${_month.year}年${_month.month}月',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: '下一月',
+                onPressed: () => setState(
+                  () => _month = DateTime(_month.year, _month.month + 1, 1),
+                ),
+                icon: const Icon(Icons.chevron_right, size: 20),
+              ),
+              IconButton(
+                tooltip: '下一年',
+                onPressed: () => setState(
+                  () => _month = DateTime(_month.year + 1, _month.month, 1),
+                ),
+                icon: const Icon(Icons.keyboard_double_arrow_right, size: 18),
+              ),
+            ],
+          ),
         ),
-      ),
-      padding: const EdgeInsets.fromLTRB(8, 10, 8, 8),
-      child: Column(
-        children: [
-          Row(
-            children: weekdays
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          child: Row(
+            children: _wd
                 .map(
                   (w) => Expanded(
                     child: Center(
                       child: Text(
                         w,
-                        style: Theme.of(context).textTheme.labelMedium,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Color(0xFF6B6B6B),
+                        ),
                       ),
                     ),
                   ),
                 )
                 .toList(),
           ),
-          const SizedBox(height: 6),
-          for (var r = 0; r < rows; r++)
-            Row(
-              children: List.generate(7, (c) {
-                final index = r * 7 + c;
-                final dayNum = index - lead + 1;
-                if (dayNum < 1 || dayNum > daysInMonth) {
-                  return const Expanded(child: SizedBox(height: 44));
-                }
-                final date = DateTime(month.year, month.month, dayNum);
-                final dayNotes = notesByDay[date] ?? const [];
-                final isSelected = date == selected;
-                final isToday = date == today;
-                final hasNote = dayNotes.isNotEmpty;
-
-                return Expanded(
-                  child: InkWell(
-                    onTap: () => onSelect(date),
-                    child: Container(
-                      height: 48,
-                      margin: const EdgeInsets.all(2),
-                      decoration: BoxDecoration(
-                        color: isSelected
-                            ? const Color(0xFFEEEEEE)
-                            : (isToday ? const Color(0xFFF5F5F5) : null),
-                        border: isToday && !isSelected
-                            ? Border.all(color: const Color(0xFF111111))
-                            : null,
-                      ),
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Text(
-                            '$dayNum',
-                            style: TextStyle(
-                              fontWeight: isToday || isSelected
-                                  ? FontWeight.w700
-                                  : FontWeight.w500,
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+          child: GridView.count(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            crossAxisCount: 7,
+            children: [
+              for (final d in cells)
+                InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: () => widget.onSelectDay(d),
+                  child: Container(
+                    margin: const EdgeInsets.all(2),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: dateOnly(d) == dateOnly(widget.selected)
+                          ? const Color(0xFF1A1A1A)
+                          : null,
+                    ),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          '${d.day}',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: dateOnly(d) == dateOnly(widget.today)
+                                ? FontWeight.w700
+                                : FontWeight.w400,
+                            color: dateOnly(d) == dateOnly(widget.selected)
+                                ? Colors.white
+                                : (d.month != _month.month
+                                    ? const Color(0xFFC4C4C4)
+                                    : const Color(0xFF1A1A1A)),
+                          ),
+                        ),
+                        if ((widget.notesByDay[d] ?? const []).isNotEmpty)
+                          Container(
+                            width: 3,
+                            height: 3,
+                            margin: const EdgeInsets.only(top: 1),
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: dateOnly(d) == dateOnly(widget.selected)
+                                  ? Colors.white70
+                                  : const Color(0xFF1A1A1A),
                             ),
                           ),
-                          const SizedBox(height: 2),
-                          SizedBox(
-                            height: 6,
-                            child: hasNote
-                                ? Center(
-                                    child: Container(
-                                      width: 5,
-                                      height: 5,
-                                      decoration: const BoxDecoration(
-                                        shape: BoxShape.circle,
-                                        color: Color(0xFF888888),
-                                      ),
-                                    ),
-                                  )
-                                : null,
-                          ),
-                        ],
-                      ),
+                      ],
                     ),
                   ),
-                );
-              }),
-            ),
-        ],
-      ),
+                ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 8, 6),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${widget.selected.month}月${widget.selected.day}日 · 当天日常',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF6B6B6B),
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: widget.onArrange,
+                child: const Text('＋ 安排'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: widget.dayNotes.isEmpty
+              ? const Padding(
+                  padding: EdgeInsets.all(14),
+                  child: Text(
+                    '这一天暂无日常',
+                    style: TextStyle(color: Color(0xFF6B6B6B), fontSize: 13),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(8, 0, 8, 16),
+                  itemCount: widget.dayNotes.length,
+                  itemBuilder: (_, i) {
+                    final e = widget.dayNotes[i];
+                    final hm =
+                        '${e.at.hour.toString().padLeft(2, '0')}:${e.at.minute.toString().padLeft(2, '0')}';
+                    return ListTile(
+                      dense: true,
+                      title: Text(e.note.displayTitle),
+                      subtitle: Text(hm),
+                      onTap: () => widget.onOpenNote(e.note),
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 }
 
-class _ThreeDayView extends StatelessWidget {
+class _ThreeDayView extends StatefulWidget {
   const _ThreeDayView({
     required this.days,
     required this.selected,
@@ -499,6 +501,7 @@ class _ThreeDayView extends StatelessWidget {
     required this.onTapSlot,
     required this.onLongPressSlot,
     required this.onTapNote,
+    required this.onMoveNote,
   });
 
   final List<DateTime> days;
@@ -511,8 +514,189 @@ class _ThreeDayView extends StatelessWidget {
   final ValueChanged<DateTime> onTapSlot;
   final ValueChanged<DateTime> onLongPressSlot;
   final ValueChanged<Note> onTapNote;
+  final Future<void> Function(Note note, DateTime from, DateTime to) onMoveNote;
 
   static const _rowH = 48.0;
+
+  @override
+  State<_ThreeDayView> createState() => _ThreeDayViewState();
+}
+
+class _CalDragPreview {
+  const _CalDragPreview({
+    required this.note,
+    required this.from,
+    required this.day,
+    required this.startMin,
+    required this.durationMin,
+  });
+
+  final Note note;
+  final DateTime from;
+  final DateTime day;
+  final int startMin;
+  final int durationMin;
+}
+
+class _ThreeDayViewState extends State<_ThreeDayView> {
+  late final List<GlobalKey> _colKeys;
+  final Map<String, DateTime> _optimistic = {};
+  _CalDragPreview? _preview;
+  String? _draggingKey;
+  int? _lastPreviewDayIndex;
+  int? _lastPreviewStartMin;
+
+  @override
+  void initState() {
+    super.initState();
+    _colKeys = List.generate(widget.days.length, (_) => GlobalKey());
+  }
+
+  @override
+  void didUpdateWidget(covariant _ThreeDayView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.days.length != widget.days.length) {
+      _colKeys
+        ..clear()
+        ..addAll(List.generate(widget.days.length, (_) => GlobalKey()));
+    }
+  }
+
+  Map<DateTime, List<({Note note, DateTime at})>> get _effectiveByDay {
+    if (_optimistic.isEmpty) return widget.notesByDay;
+    final next = <DateTime, List<({Note note, DateTime at})>>{
+      for (final e in widget.notesByDay.entries) e.key: List.of(e.value),
+    };
+    for (final entry in _optimistic.entries) {
+      final parts = entry.key.split(':');
+      if (parts.length != 2) continue;
+      final noteId = int.tryParse(parts[0]);
+      final fromTs = int.tryParse(parts[1]);
+      if (noteId == null || fromTs == null) continue;
+      final toAt = entry.value;
+      ({Note note, DateTime at})? moved;
+      for (final list in next.values) {
+        final i = list.indexWhere(
+          (e) =>
+              e.note.id == noteId && e.at.millisecondsSinceEpoch == fromTs,
+        );
+        if (i >= 0) {
+          moved = list.removeAt(i);
+          break;
+        }
+      }
+      if (moved == null) continue;
+      final day = dateOnly(toAt);
+      next.putIfAbsent(day, () => <({Note note, DateTime at})>[]);
+      next[day]!.add((note: moved.note, at: toAt));
+      next[day]!.sort((a, b) => a.at.compareTo(b.at));
+    }
+    return next;
+  }
+
+  DateTime? _snapFromGlobal(Offset global) {
+    int? bestIdx;
+    double bestDist = double.infinity;
+    Offset? bestLocal;
+    for (var i = 0; i < widget.days.length; i++) {
+      final box =
+          _colKeys[i].currentContext?.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      final local = box.globalToLocal(global);
+      if (local.dx >= 0 && local.dx < box.size.width) {
+        final y = local.dy.clamp(0.0, box.size.height);
+        return calendarTimeFromY(
+          day: widget.days[i],
+          localY: y,
+          rowH: _ThreeDayView._rowH,
+          hourStart: widget.hourStart,
+          hourEnd: widget.hourEnd,
+        );
+      }
+      final mid = box.localToGlobal(Offset(box.size.width / 2, 0)).dx;
+      final dist = (global.dx - mid).abs();
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+        bestLocal = Offset(
+          box.size.width / 2,
+          local.dy.clamp(0.0, box.size.height),
+        );
+      }
+    }
+    if (bestIdx == null || bestLocal == null) return null;
+    return calendarTimeFromY(
+      day: widget.days[bestIdx],
+      localY: bestLocal.dy,
+      rowH: _ThreeDayView._rowH,
+      hourStart: widget.hourStart,
+      hourEnd: widget.hourEnd,
+    );
+  }
+
+  void _onDragStart(Note note, DateTime at, int startMin, int endMin) {
+    _draggingKey = calendarOccKey(note.id, at);
+    _lastPreviewDayIndex = null;
+    _lastPreviewStartMin = null;
+    setState(() {
+      _preview = _CalDragPreview(
+        note: note,
+        from: at,
+        day: dateOnly(at),
+        startMin: startMin,
+        durationMin: (endMin - startMin).clamp(15, 24 * 60),
+      );
+    });
+  }
+
+  void _onDragUpdate(Offset global) {
+    final to = _snapFromGlobal(global);
+    if (to == null || _preview == null) return;
+    final dayIdx = widget.days.indexWhere((d) => dateOnly(d) == dateOnly(to));
+    final startMin = to.hour * 60 + to.minute;
+    if (dayIdx == _lastPreviewDayIndex && startMin == _lastPreviewStartMin) {
+      return;
+    }
+    _lastPreviewDayIndex = dayIdx;
+    _lastPreviewStartMin = startMin;
+    setState(() {
+      _preview = _CalDragPreview(
+        note: _preview!.note,
+        from: _preview!.from,
+        day: dateOnly(to),
+        startMin: startMin,
+        durationMin: _preview!.durationMin,
+      );
+    });
+  }
+
+  Future<void> _onDragEnd({required bool cancelled}) async {
+    final preview = _preview;
+    final from = preview?.from;
+    final note = preview?.note;
+    final key = _draggingKey;
+    setState(() {
+      _preview = null;
+      _draggingKey = null;
+    });
+    if (cancelled || preview == null || note == null || from == null) return;
+    final to = DateTime(
+      preview.day.year,
+      preview.day.month,
+      preview.day.day,
+      preview.startMin ~/ 60,
+      preview.startMin % 60,
+    );
+    if (to.isAtSameMomentAs(from)) return;
+    final occ = key ?? calendarOccKey(note.id, from);
+    setState(() => _optimistic[occ] = to);
+    try {
+      await widget.onMoveNote(note, from, to);
+      if (mounted) setState(() => _optimistic.remove(occ));
+    } catch (_) {
+      if (mounted) setState(() => _optimistic.remove(occ));
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -597,6 +781,7 @@ class _ThreeDayView extends StatelessWidget {
                           onTapSlot: onTapSlot,
                           onLongPressSlot: onLongPressSlot,
                           onTapNote: onTapNote,
+                          onMoveNote: onMoveNote,
                         ),
                       ),
                   ],
@@ -610,7 +795,9 @@ class _ThreeDayView extends StatelessWidget {
   }
 }
 
-class _DayColumn extends StatelessWidget {
+typedef _CalDragPayload = ({Note note, DateTime at});
+
+class _DayColumn extends StatefulWidget {
   const _DayColumn({
     required this.day,
     required this.hourStart,
@@ -620,6 +807,7 @@ class _DayColumn extends StatelessWidget {
     required this.onTapSlot,
     required this.onLongPressSlot,
     required this.onTapNote,
+    required this.onMoveNote,
   });
 
   final DateTime day;
@@ -630,65 +818,168 @@ class _DayColumn extends StatelessWidget {
   final ValueChanged<DateTime> onTapSlot;
   final ValueChanged<DateTime> onLongPressSlot;
   final ValueChanged<Note> onTapNote;
+  final void Function(Note note, DateTime from, DateTime to) onMoveNote;
+
+  /// 右侧永久留白，点空白可继续叠卡
+  static const double gutter = 14;
+
+  @override
+  State<_DayColumn> createState() => _DayColumnState();
+}
+
+class _DayColumnState extends State<_DayColumn> {
+  Offset? _lastDragGlobal;
+
+  void _acceptDrop(_CalDragPayload data) {
+    final box = context.findRenderObject() as RenderBox?;
+    final global = _lastDragGlobal;
+    if (box == null || !box.hasSize || global == null) return;
+    final local = box.globalToLocal(global);
+    final y = local.dy + widget.rowH * 0.35;
+    final to = calendarTimeFromY(
+      day: widget.day,
+      localY: y,
+      rowH: widget.rowH,
+      hourStart: widget.hourStart,
+      hourEnd: widget.hourEnd,
+    );
+    widget.onMoveNote(data.note, data.at, to);
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Stack(
-      children: [
-        Column(
-          children: [
-            for (var h = hourStart; h <= hourEnd; h++)
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => onTapSlot(
-                  DateTime(day.year, day.month, day.day, h),
-                ),
-                onLongPress: () => onLongPressSlot(
-                  DateTime(day.year, day.month, day.day, h),
-                ),
-                child: Container(
-                  height: rowH,
-                  decoration: const BoxDecoration(
-                    border: Border(
-                      top: BorderSide(color: Color(0xFFEEEEEE)),
-                      left: BorderSide(color: Color(0xFFEEEEEE)),
-                    ),
-                  ),
-                ),
-              ),
-          ],
-        ),
-        for (final e in events)
-          if (e.at.hour >= hourStart && e.at.hour <= hourEnd)
-            Positioned(
-              top: (e.at.hour - hourStart) * rowH +
-                  (e.at.minute / 60.0) * rowH,
-              left: 2,
-              right: 2,
-              height: rowH - 4,
-              child: Material(
-                color: const Color(0xFF111111),
-                child: InkWell(
-                  onTap: () => onTapNote(e.note),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 4,
-                      vertical: 2,
-                    ),
-                    child: Text(
-                      e.note.displayTitle,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 11,
+    final day = widget.day;
+    final hourStart = widget.hourStart;
+    final hourEnd = widget.hourEnd;
+    final rowH = widget.rowH;
+    final visible = [
+      for (final e in widget.events)
+        if (e.at.hour >= hourStart && e.at.hour <= hourEnd) e,
+    ];
+    final laid = layoutCalendarEvents<({Note note, DateTime at})>(
+      visible,
+      startMinuteOf: (e) => e.at.hour * 60 + e.at.minute,
+    );
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final usableW =
+            (constraints.maxWidth - _DayColumn.gutter).clamp(0.0, double.infinity);
+        return DragTarget<_CalDragPayload>(
+          onWillAccept: (_) => true,
+          onMove: (details) {
+            _lastDragGlobal = details.offset;
+          },
+          onAccept: _acceptDrop,
+          builder: (context, candidate, rejected) {
+            return Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Column(
+                  children: [
+                    for (var h = hourStart; h <= hourEnd; h++)
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => widget.onTapSlot(
+                          DateTime(day.year, day.month, day.day, h),
+                        ),
+                        onLongPress: () => widget.onLongPressSlot(
+                          DateTime(day.year, day.month, day.day, h),
+                        ),
+                        child: Container(
+                          height: rowH,
+                          decoration: BoxDecoration(
+                            color: candidate.isNotEmpty
+                                ? const Color(0x08000000)
+                                : null,
+                            border: const Border(
+                              top: BorderSide(color: Color(0xFFEEEEEE)),
+                              left: BorderSide(color: Color(0xFFEEEEEE)),
+                            ),
+                          ),
+                        ),
                       ),
+                  ],
+                ),
+                for (final item in laid)
+                  Positioned(
+                    top: (item.startMin / 60.0 - hourStart) * rowH,
+                    left: 2.0 + item.leftFrac * usableW,
+                    width: (item.widthFrac * usableW - 4).clamp(18.0, usableW),
+                    height: ((item.endMin - item.startMin) / 60.0 * rowH - 4)
+                        .clamp(22.0, rowH * 8),
+                    child: _EventChip(
+                      note: item.data.note,
+                      at: item.data.at,
+                      onTap: () => widget.onTapNote(item.data.note),
                     ),
                   ),
-                ),
-              ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _EventChip extends StatelessWidget {
+  const _EventChip({
+    required this.note,
+    required this.at,
+    required this.onTap,
+  });
+
+  final Note note;
+  final DateTime at;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final chip = Material(
+      color: const Color(0xFF111111),
+      borderRadius: BorderRadius.circular(4),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+          child: Text(
+            note.displayTitle,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 11,
             ),
-      ],
+          ),
+        ),
+      ),
+    );
+
+    return LongPressDraggable<_CalDragPayload>(
+      data: (note: note, at: at),
+      hapticFeedbackOnStart: true,
+      delay: const Duration(milliseconds: 180),
+      feedback: Material(
+        elevation: 6,
+        borderRadius: BorderRadius.circular(4),
+        color: const Color(0xFF111111),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 140, minHeight: 36),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Text(
+              note.displayTitle,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 11),
+            ),
+          ),
+        ),
+      ),
+      childWhenDragging: Opacity(opacity: 0.28, child: chip),
+      child: chip,
     );
   }
 }

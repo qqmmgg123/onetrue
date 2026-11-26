@@ -273,15 +273,6 @@ Map<DateTime, List<({Note note, DateTime at})>> notesGroupedByDay(
         final key = _dateOnly(at);
         map.putIfAbsent(key, () => []).add((note: n, at: at));
       }
-      continue;
-    }
-    if (n.kind == kNoteKindMemo) {
-      final raw = n.remindAt;
-      if (raw == null) continue;
-      final at = raw.isUtc ? raw.toLocal() : raw;
-      if (at.isBefore(from) || at.isAfter(to)) continue;
-      final key = _dateOnly(at);
-      map.putIfAbsent(key, () => []).add((note: n, at: at));
     }
   }
   return map;

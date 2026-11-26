@@ -1,15 +1,38 @@
 package com.local.rent.rent_agent
 
+import android.app.KeyguardManager
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Bundle
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import me.leolin.shortcutbadger.ShortcutBadger
 
 class MainActivity : FlutterActivity() {
     private val channelName = "rent_agent/recorder"
+    private val badgeChannelName = "rent_agent/badge"
     private var recorder: MediaRecorder? = null
     private var currentPath: String? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // 全屏闹钟意图：锁屏上也能亮屏展示
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+            val keyguard = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
+            keyguard?.requestDismissKeyguard(this, null)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD,
+            )
+        }
+        super.onCreate(savedInstanceState)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -42,6 +65,29 @@ class MainActivity : FlutterActivity() {
                     }
                     "amplitude" -> {
                         result.success(readAmplitude())
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, badgeChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "set" -> {
+                        val count = call.argument<Int>("count") ?: 0
+                        try {
+                            val ok = ShortcutBadger.applyCount(applicationContext, count.coerceAtLeast(0))
+                            result.success(ok)
+                        } catch (e: Exception) {
+                            result.error("badge_set", e.message, null)
+                        }
+                    }
+                    "clear" -> {
+                        try {
+                            val ok = ShortcutBadger.removeCount(applicationContext)
+                            result.success(ok)
+                        } catch (e: Exception) {
+                            result.error("badge_clear", e.message, null)
+                        }
                     }
                     else -> result.notImplemented()
                 }

@@ -6,13 +6,17 @@ import '../social/social_api.dart';
 import '../social/social_models.dart';
 import '../state/app_store.dart';
 import '../sync/sync_service.dart';
+import 'busy.dart';
 import 'format.dart';
-import 'marketplace_article_page.dart';
+import 'open_article.dart';
 import 'widgets/user_avatar.dart';
 
-/// 醍醐 → 评点和回书（类小红书/B站消息流）。
+/// 留言与回复（留言=文章顶层评点；回复=明确回书给我；另含推荐/留意）。
 class SocialInboxPage extends StatefulWidget {
-  const SocialInboxPage({super.key});
+  const SocialInboxPage({super.key, this.embedded = false});
+
+  /// 嵌入阅读 Tab 时不画独立 Scaffold / AppBar。
+  final bool embedded;
 
   @override
   State<SocialInboxPage> createState() => _SocialInboxPageState();
@@ -36,7 +40,6 @@ class _SocialInboxPageState extends State<SocialInboxPage> {
     });
     try {
       final list = await SocialApi.instance.listMyNotifications();
-      // 只展示评论/回复类（关注、推荐也可显示）
       final filtered = list
           .where((e) =>
               e.kind == 'comment' ||
@@ -68,7 +71,7 @@ class _SocialInboxPageState extends State<SocialInboxPage> {
       case 'reply':
         return '$who 回书了你';
       case 'comment':
-        return '$who 评点了你的文章';
+        return '$who 给你的文章留了言';
       case 'recommend':
         return '$who 推荐了你的文章';
       case 'follow':
@@ -78,11 +81,40 @@ class _SocialInboxPageState extends State<SocialInboxPage> {
     }
   }
 
+  Future<void> _remove(SocialNotificationItem n) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('移除这条提醒？'),
+        content: Text('将「${_title(n)}」从留言与回复中移除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('移除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await runBusy(
+      context,
+      message: '正在移除…',
+      task: () => SocialApi.instance.deleteNotification(n.id),
+    );
+    if (!mounted) return;
+    setState(() {
+      _items = _items.where((e) => e.id != n.id).toList();
+    });
+  }
+
   Future<void> _open(SocialNotificationItem n) async {
     final noteId = n.noteId?.trim() ?? '';
     if (noteId.isEmpty) return;
     try {
-      // 拉一篇 listed 文章详情
       final rows = await SyncService(db: context.read<AppStore>().db)
           .fetchListedArticles();
       MarketplaceArticle? hit;
@@ -99,13 +131,10 @@ class _SocialInboxPageState extends State<SocialInboxPage> {
         format: 'plain',
       );
       if (!mounted) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => MarketplaceArticlePage(
-            article: hit!,
-            highlightCommentId: n.commentId,
-          ),
-        ),
+      await openMarketplaceArticle(
+        context,
+        hit,
+        highlightCommentId: n.commentId,
       );
     } catch (e) {
       if (!mounted) return;
@@ -115,55 +144,67 @@ class _SocialInboxPageState extends State<SocialInboxPage> {
     }
   }
 
+  Widget _body(bool loggedIn) {
+    if (!loggedIn) {
+      return const Center(child: Text('登录后可查看互动消息'));
+    }
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(child: Text(_error!));
+    }
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: _items.isEmpty
+          ? ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: const [
+                SizedBox(height: 80),
+                Center(child: Text('暂无留言或回复')),
+              ],
+            )
+          : ListView.separated(
+              itemCount: _items.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (context, i) {
+                final n = _items[i];
+                return ListTile(
+                  leading: UserAvatar(
+                    url: null,
+                    nickname: n.actorNickname,
+                    radius: 22,
+                  ),
+                  title: Text(_title(n)),
+                  subtitle: Text(
+                    [
+                      if (n.noteTitle.isNotEmpty) n.noteTitle,
+                      if (n.body.isNotEmpty) n.body,
+                      formatFriendlyWhen(n.createdAt),
+                    ].where((e) => e.trim().isNotEmpty).join('\n'),
+                    maxLines: 4,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  isThreeLine: true,
+                  trailing: IconButton(
+                    tooltip: '移除',
+                    icon: const Icon(Icons.close, size: 20),
+                    onPressed: () => _remove(n),
+                  ),
+                  onTap: () => _open(n),
+                );
+              },
+            ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final loggedIn = context.watch<AppStore>().user != null;
+    if (widget.embedded) return _body(loggedIn);
     return Scaffold(
-      appBar: AppBar(title: const Text('评点和回书')),
-      body: !loggedIn
-          ? const Center(child: Text('登录后可查看互动消息'))
-          : _loading
-              ? const Center(child: CircularProgressIndicator())
-              : _error != null
-                  ? Center(child: Text(_error!))
-                  : RefreshIndicator(
-                      onRefresh: _load,
-                      child: _items.isEmpty
-                          ? ListView(
-                              physics: const AlwaysScrollableScrollPhysics(),
-                              children: const [
-                                SizedBox(height: 80),
-                                Center(child: Text('暂无评点或回书')),
-                              ],
-                            )
-                          : ListView.separated(
-                              itemCount: _items.length,
-                              separatorBuilder: (_, __) =>
-                                  const Divider(height: 1),
-                              itemBuilder: (context, i) {
-                                final n = _items[i];
-                                return ListTile(
-                                  leading: UserAvatar(
-                                    url: null,
-                                    nickname: n.actorNickname,
-                                    radius: 22,
-                                  ),
-                                  title: Text(_title(n)),
-                                  subtitle: Text(
-                                    [
-                                      if (n.noteTitle.isNotEmpty) n.noteTitle,
-                                      if (n.body.isNotEmpty) n.body,
-                                      formatFriendlyWhen(n.createdAt),
-                                    ].where((e) => e.trim().isNotEmpty).join('\n'),
-                                    maxLines: 4,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                  isThreeLine: true,
-                                  onTap: () => _open(n),
-                                );
-                              },
-                            ),
-                    ),
+      appBar: AppBar(title: const Text('留言')),
+      body: _body(loggedIn),
     );
   }
 }

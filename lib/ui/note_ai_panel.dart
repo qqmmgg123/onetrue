@@ -14,6 +14,8 @@ import '../agent/llm_providers.dart';
 import '../agent/vision_client.dart';
 import '../agent/voice_capture.dart';
 import '../data/app_database.dart';
+import '../domain/ai_text.dart';
+import '../domain/draft_span_edit.dart';
 import 'busy.dart';
 import 'voice_input_bar.dart';
 
@@ -27,6 +29,7 @@ typedef NoteDraftGetters = ({
 typedef NoteDraftSetters = ({
   void Function(String title) setTitle,
   void Function(String plain) replacePlain,
+  void Function(String plain) appendPlain,
   void Function(List<dynamic> delta) replaceDelta,
   void Function(Map<String, dynamic> ops) applyFormat,
   void Function(Map<String, dynamic> options) setOptions,
@@ -41,6 +44,7 @@ class NoteAiPanel extends StatefulWidget {
     required this.refKey,
     required this.expanded,
     required this.onExpandedChanged,
+    this.onBusyChanged,
   });
 
   final NoteDraftGetters getters;
@@ -50,6 +54,7 @@ class NoteAiPanel extends StatefulWidget {
   final String refKey;
   final bool expanded;
   final ValueChanged<bool> onExpandedChanged;
+  final ValueChanged<bool>? onBusyChanged;
 
   @override
   State<NoteAiPanel> createState() => _NoteAiPanelState();
@@ -78,16 +83,22 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
 你是「醍醐」笔记编辑助手。上方是用户正在写的草稿及其选项。
 职责：改写/排版正文，以及改当前这篇的形态与选项；不要改其他笔记。
 可用工具（立刻改草稿，无需确认）：
-- set_title：改标题（写文章/生成内容时若需要标题，必须同时用 replace_draft 写入完整正文，禁止只改标题）
-- replace_draft：用「纯文本」替换整篇正文（不要 Markdown、不要代码块、不要 JSON；段落用换行）
-- replace_delta：仅在用户明确要求保留/设置富文本结构时使用
+- set_title：改标题（写文章/生成内容时若需要标题，必须同一轮再调用 replace_draft 写入完整正文，禁止只改标题）
+- replace_draft：用「纯文本」整篇替换正文。参数名必须是 plain。写全新文章/大段重写时用。
+- append_draft：在现有正文末尾追加纯文本（plain 仅为要追加的内容）。
+- edit_span：按原文片段局部增删改。参数：action(replace|delete|insert_after|insert_before)、find(原文句子/段落，尽量照抄)、text(新内容；delete 可不传)、all(可选)。用户说「在某句后面加/删掉某句/把某段改成…」时必须用本工具。
+- replace_delta：仅在用户明确要求保留/设置富文本结构且要整篇重写时使用
 - apply_format：套格式
-- set_note_options：改形态与选项。字段：kind(note|memo|schedule|article)、schedule_at、remind_at(备忘绝对提醒；空串=不提醒；禁止设为当前时间之前)、recur_freq(once|daily|weekly|monthly|yearly)、recur_byday(如MO)、recur_until(结束日，与count互斥)、recur_count(次数)、remind_offset_min(日程提前分钟，0=开始时，-1=不提醒)、listed(文章上架)、city
-重复结束：永不=不传until/count或都空；结束日用recur_until；次数用recur_count。
-重要：
-1) 用户说「写一篇/生成/扩写/润色/纠正正文」等时，必须调用 replace_draft（或 replace_delta）写入正文；不能只 set_title。
-2) 用户说「把正文贴到对话里/发给我看看/读给我」时：把正文写在回复里，禁止调用 replace_draft/replace_delta。
-3) 工具成功后不要在回复里复述大段正文；一句话即可（如「已写入正文」）。
+- set_note_options：改形态与选项。字段：kind(note|memo|schedule|article|admonition)、schedule_at、remind_at、recur_freq、recur_byday、recur_until、recur_count、remind_offset_min、listed、city
+硬性规则：
+1) 写全新全文 → replace_draft；文末追加 → append_draft；局部增删改 → edit_span。
+2) 局部修改禁止用 replace_draft 只写那一句（会覆盖全文）。
+3) edit_span 的 find 必须能在当前正文里匹配到。
+4) 用户一句话里有多处「前面写/后面写/删掉/改成」时：同一轮必须按顺序多次调用 edit_span（或合并为更少次仍覆盖全部改动），禁止只做第一处就结束。
+5) 同一锚点连续「后面写」多次：优先一次 insert_after，text 按用户顺序拼在一起；若分多次，后一次的 find 用上一处刚插入的文字。
+6) 没有成功调用写入类工具之前，禁止说「已写入/已追加/已删除/已完成」。
+7) 用户说「把正文贴到对话里」时：写在回复里，禁止改草稿工具。
+8) 工具成功后不要复述大段正文；一句话即可。
 回复尽量短。
 ''';
 
@@ -109,10 +120,15 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
       'function': {
         'name': 'replace_draft',
         'description':
-            '用纯文本替换整篇正文。plain 不得含 Markdown/代码块/JSON；写文章或纠正正文时必须调用本工具。',
+            '用纯文本整篇替换正文。必须传 plain（完整正文）。写全新文章时用；追加内容请用 append_draft。',
         'parameters': {
           'type': 'object',
-          'properties': {'plain': {'type': 'string'}},
+          'properties': {
+            'plain': {
+              'type': 'string',
+              'description': '完整正文纯文本，段落之间用换行分隔',
+            },
+          },
           'required': ['plain'],
         },
       },
@@ -120,8 +136,61 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
     {
       'type': 'function',
       'function': {
+        'name': 'append_draft',
+        'description':
+            '在现有正文末尾追加纯文本。plain 只含要追加的内容。用户要求「最后加一句/追加」时必须用本工具。',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'plain': {
+              'type': 'string',
+              'description': '仅追加的纯文本',
+            },
+          },
+          'required': ['plain'],
+        },
+      },
+    },
+    {
+      'type': 'function',
+      'function': {
+        'name': 'edit_span',
+        'description':
+            '按原文片段局部编辑：replace 改写、delete 删除、insert_after 在某句后插入、insert_before 在某句前插入。find 须能匹配当前正文。用户要求多处局部修改时，同一轮可多次调用本工具（按顺序）。',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'action': {
+              'type': 'string',
+              'enum': [
+                'replace',
+                'delete',
+                'insert_after',
+                'insert_before',
+              ],
+            },
+            'find': {
+              'type': 'string',
+              'description': '原文中的定位片段（句子或段落，尽量照抄）',
+            },
+            'text': {
+              'type': 'string',
+              'description': 'replace/insert 的新内容；delete 时可省略',
+            },
+            'all': {
+              'type': 'boolean',
+              'description': 'true 时修改全部匹配处，默认只改第一处',
+            },
+          },
+          'required': ['action', 'find'],
+        },
+      },
+    },
+    {
+      'type': 'function',
+      'function': {
         'name': 'replace_delta',
-        'description': '用 Quill Delta JSON 替换整篇正文',
+        'description': '用 Quill Delta JSON 整篇替换正文（不要用于追加一句）',
         'parameters': {
           'type': 'object',
           'properties': {
@@ -491,6 +560,7 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
       _pendingImage = null;
       _busy = true;
     });
+    widget.onBusyChanged?.call(true);
 
     await _db.insertChatMessage(
       StoredChatMessage(
@@ -507,6 +577,23 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
       final endpoints = AgentSettings.instance.resolveEndpoints();
       if (endpoints.isEmpty) {
         throw StateError('未配置对话模型');
+      }
+
+      // 改类型 / 写备忘·文章·日常：先切形态
+      final inferredKind = inferKindFromUserText(textForAgent);
+      final applied = <String>[];
+      if (inferredKind != null) {
+        try {
+          final opts = jsonDecode(widget.getters.optionsJson());
+          final kind = opts is Map ? '${opts['kind'] ?? ''}' : '';
+          if (kind != inferredKind) {
+            widget.setters.setOptions({'kind': inferredKind});
+            applied.add('已更新笔记选项');
+          }
+        } catch (_) {
+          widget.setters.setOptions({'kind': inferredKind});
+          applied.add('已更新笔记选项');
+        }
       }
 
       final draftCtx = StringBuffer()
@@ -531,22 +618,265 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
       }
       if (message == null) throw lastErr ?? StateError('模型不可用');
 
-      final content = (message['content'] as String?)?.trim() ?? '';
-      final rawTools = message['tool_calls'] as List<dynamic>? ?? const [];
-      final applied = <String>[];
-      for (final t in rawTools) {
-        final fn = (t as Map)['function'] as Map<String, dynamic>?;
-        if (fn == null) continue;
-        final name = fn['name'] as String? ?? '';
-        Map<String, dynamic> args = {};
-        final argsRaw = fn['arguments'];
-        if (argsRaw is String && argsRaw.isNotEmpty) {
-          args = Map<String, dynamic>.from(jsonDecode(argsRaw) as Map);
-        } else if (argsRaw is Map) {
-          args = Map<String, dynamic>.from(argsRaw);
+      var content = (message['content'] as String?)?.trim() ?? '';
+      final wantAppend = looksLikeAppendRequest(textForAgent);
+      String? applyOneTool(
+        String name,
+        Map<String, dynamic> args, {
+        String rawArgs = '',
+      }) {
+        var n = name;
+        var a = args;
+        if (wantAppend &&
+            (n == 'replace_draft' || n == 'replace_delta')) {
+          var plain = pickDraftPlain(a, rawArgs: rawArgs);
+          if (plain.isEmpty && a['delta'] is List) {
+            final buf = StringBuffer();
+            for (final op in a['delta'] as List) {
+              if (op is Map && op['insert'] is String) {
+                buf.write(op['insert']);
+              }
+            }
+            plain = sanitizeAiPlainText(buf.toString());
+          }
+          n = 'append_draft';
+          a = {'plain': plain};
         }
-        final tip = _runTool(name, args);
-        if (tip != null) applied.add(tip);
+        return _runTool(n, a, rawArgs: rawArgs);
+      }
+
+      void applyParsedCalls(
+        List<({String name, Map<String, dynamic> args, String rawArgs})> parsed,
+      ) {
+        final coalesced = coalesceEditSpanCalls([
+          for (final c in parsed) (name: c.name, args: c.args),
+        ]);
+        // coalesce 后 rawArgs 仅对非合并项有意义；edit_span 不依赖 rawArgs
+        var i = 0;
+        for (final c in coalesced) {
+          String raw = '';
+          if (i < parsed.length &&
+              parsed[i].name == c.name &&
+              c.name != 'edit_span') {
+            raw = parsed[i].rawArgs;
+          }
+          i++;
+          final tip = applyOneTool(c.name, c.args, rawArgs: raw);
+          if (tip != null) applied.add(tip);
+        }
+      }
+
+      void applyMessageToolsRemapped(Map<String, dynamic> msg) {
+        final rawTools = msg['tool_calls'] as List<dynamic>? ?? const [];
+        final parsed =
+            <({String name, Map<String, dynamic> args, String rawArgs})>[];
+        for (final t in rawTools) {
+          final fn = (t as Map)['function'] as Map<String, dynamic>?;
+          if (fn == null) continue;
+          final name = fn['name'] as String? ?? '';
+          final argsRaw = fn['arguments'];
+          final args = parseToolArgsMap(argsRaw);
+          final rawStr = argsRaw is String ? argsRaw : '';
+          parsed.add((name: name, args: args, rawArgs: rawStr));
+        }
+        if (parsed.isNotEmpty) {
+          applyParsedCalls(parsed);
+          return;
+        }
+        final pseudo = extractPseudoToolCalls('${msg['content'] ?? ''}');
+        if (pseudo.calls.isNotEmpty) {
+          applyParsedCalls([
+            for (final c in pseudo.calls)
+              (name: c.name, args: c.args, rawArgs: ''),
+          ]);
+          content = pseudo.cleaned;
+        }
+      }
+
+      final plainBeforeTools = widget.getters.plain();
+      applyMessageToolsRemapped(message);
+
+      // 模型漏插 / 误用 insert_before：按用户话术从改前正文确定性重放
+      void repairSpanFromUserText(String plainBefore) {
+        final intents = extractSpanEditIntents(textForAgent);
+        if (intents.isEmpty) return;
+        final missing =
+            missingSpanInsertTexts(widget.getters.plain(), intents);
+        if (missing.isEmpty) return;
+        final repaired = applySpanEditsSequential(plainBefore, intents);
+        if (repaired.tips.isEmpty) return;
+        widget.setters.replacePlain(repaired.plain);
+        applied.removeWhere(tipIsSpanEdit);
+        applied.addAll(repaired.tips);
+      }
+
+      repairSpanFromUserText(plainBeforeTools);
+
+      bool tipIsWrite(String t) =>
+          t.contains('已写入正文') ||
+          t.contains('富文本写入') ||
+          t.contains('已追加正文') ||
+          t.contains('已删除指定片段') ||
+          t.contains('已改写指定片段') ||
+          t.contains('已在指定句');
+      var wroteBody = applied.any(tipIsWrite);
+      final draftEmpty = widget.getters.plain().trim().isEmpty;
+      final wantWrite = !wantAppend &&
+          (looksLikeWriteRequest(textForAgent) ||
+              (draftEmpty && applied.any((t) => t.contains('已改标题'))));
+      if (wantWrite && !wroteBody) {
+        Map<String, dynamic>? retryMsg;
+        Object? retryErr;
+        const retryUser =
+            '上一次没有真正调用 replace_draft 把完整正文写入编辑器。请立刻调用 replace_draft，在 plain 参数写入完整文章正文（纯文本、多段落）。禁止只改标题，禁止只回复「已写入正文」。';
+        final retryCtx = StringBuffer()
+          ..writeln('当前标题：${widget.getters.title()}')
+          ..writeln('当前选项：${widget.getters.optionsJson()}')
+          ..writeln('当前正文：')
+          ..writeln(widget.getters.plain());
+        for (final ep in endpoints) {
+          try {
+            retryMsg = await _chatOnce(
+              ep: ep,
+              draftCtx: retryCtx.toString(),
+              user: retryUser,
+              priorTurns: [
+                {'role': 'user', 'content': textForAgent},
+                {
+                  'role': 'assistant',
+                  'content': applied.isNotEmpty
+                      ? applied.join('；')
+                      : (content.isNotEmpty ? content : '（未写入正文）'),
+                },
+              ],
+              forceReplaceDraft: true,
+            );
+            break;
+          } catch (e) {
+            retryErr = e;
+          }
+        }
+        if (retryMsg != null) {
+          content = (retryMsg['content'] as String?)?.trim() ?? content;
+          applyMessageToolsRemapped(retryMsg);
+          wroteBody = applied.any(tipIsWrite);
+        } else if (retryErr != null && !wroteBody) {
+          content = '没能写入正文，请再试一次。';
+        }
+      }
+
+      if (wantAppend && !wroteBody) {
+        Map<String, dynamic>? retryMsg;
+        const retryUser =
+            '用户要求在文末追加文字。请调用 append_draft，plain 仅为要追加的那一句/那段；禁止用 replace_draft 覆盖全文。';
+        final retryCtx = StringBuffer()
+          ..writeln('当前标题：${widget.getters.title()}')
+          ..writeln('当前选项：${widget.getters.optionsJson()}')
+          ..writeln('当前正文：')
+          ..writeln(widget.getters.plain());
+        for (final ep in endpoints) {
+          try {
+            retryMsg = await _chatOnce(
+              ep: ep,
+              draftCtx: retryCtx.toString(),
+              user: retryUser,
+              priorTurns: [
+                {'role': 'user', 'content': textForAgent},
+                {
+                  'role': 'assistant',
+                  'content': applied.isNotEmpty
+                      ? applied.join('；')
+                      : (content.isNotEmpty ? content : '（未追加）'),
+                },
+              ],
+              forceReplaceDraft: true,
+            );
+            break;
+          } catch (_) {}
+        }
+        if (retryMsg != null) {
+          content = (retryMsg['content'] as String?)?.trim() ?? content;
+          applyMessageToolsRemapped(retryMsg);
+          wroteBody = applied.any(tipIsWrite);
+        }
+      }
+
+      // 多处局部编辑：模型常只做第一处 —— 按估算次数补全
+      final spanIntents = extractSpanEditIntents(textForAgent);
+      final expectedSpan = spanIntents.isNotEmpty
+          ? spanIntents.length
+          : countLikelySpanEditOps(textForAgent);
+      var spanDone = applied.where(tipIsSpanEdit).length;
+      final spanComplete = spanIntents.isNotEmpty &&
+          missingSpanInsertTexts(widget.getters.plain(), spanIntents).isEmpty;
+      if (!spanComplete && expectedSpan >= 2 && spanDone < expectedSpan) {
+        Future<Map<String, dynamic>?> spanRetry(String retryUser) async {
+          Map<String, dynamic>? retryMsg;
+          final retryCtx = StringBuffer()
+            ..writeln('当前标题：${widget.getters.title()}')
+            ..writeln('当前选项：${widget.getters.optionsJson()}')
+            ..writeln('当前正文：')
+            ..writeln(widget.getters.plain());
+          for (final ep in endpoints) {
+            try {
+              retryMsg = await _chatOnce(
+                ep: ep,
+                draftCtx: retryCtx.toString(),
+                user: retryUser,
+                priorTurns: [
+                  {'role': 'user', 'content': textForAgent},
+                  {
+                    'role': 'assistant',
+                    'content': applied.isNotEmpty
+                        ? applied.join('；')
+                        : (content.isNotEmpty ? content : '（未完成全部局部修改）'),
+                  },
+                ],
+              );
+              break;
+            } catch (_) {}
+          }
+          return retryMsg;
+        }
+
+        final first = await spanRetry(
+          '用户原话要求约 $expectedSpan 处局部修改，目前只完成了 $spanDone 处。'
+          '请立刻对其余步骤继续调用 edit_span（同一轮可多次，按用户顺序）。'
+          '同一锚点连续「后面写」请合并为一次 insert_after（text 按顺序拼接），'
+          '或后一次 find 用上一处刚插入的文字。禁止只回复文字不调工具。',
+        );
+        if (first != null) {
+          content = (first['content'] as String?)?.trim() ?? content;
+          final before = widget.getters.plain();
+          applyMessageToolsRemapped(first);
+          repairSpanFromUserText(before);
+          wroteBody = applied.any(tipIsWrite);
+          spanDone = applied.where(tipIsSpanEdit).length;
+        }
+        if (spanDone < expectedSpan) {
+          final second = await spanRetry(
+            '仍未做完。用户原话：$textForAgent\n请把剩余局部修改全部用 edit_span 做完（可多次调用）。',
+          );
+          if (second != null) {
+            content = (second['content'] as String?)?.trim() ?? content;
+            final before = widget.getters.plain();
+            applyMessageToolsRemapped(second);
+            repairSpanFromUserText(before);
+            wroteBody = applied.any(tipIsWrite);
+          }
+        }
+      }
+
+      // 多轮后仍缺插入文：再以最初正文做一次确定性补全
+      if (spanIntents.isNotEmpty &&
+          missingSpanInsertTexts(widget.getters.plain(), spanIntents)
+              .isNotEmpty) {
+        repairSpanFromUserText(plainBeforeTools);
+      }
+
+      if (!wroteBody &&
+          RegExp(r'已写入正文|已写入|正文已更新|已追加|已删除|已改写').hasMatch(content)) {
+        content = '';
       }
 
       final reply = StringBuffer();
@@ -555,7 +885,12 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
         if (reply.isNotEmpty) reply.writeln();
         reply.writeln(applied.join('\n'));
       }
-      if (reply.isEmpty) reply.write('已处理。');
+      if (reply.isEmpty) {
+        reply.write(wroteBody ? '已写入正文' : '已处理。');
+      } else if (wantWrite && !wroteBody) {
+        reply.writeln();
+        reply.write('未能写入正文，请再试一次或换个说法。');
+      }
 
       final text = reply.toString().trim();
       final aid = await _db.insertChatMessage(
@@ -587,17 +922,36 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
         _messageIds.add(aid);
       });
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() => _busy = false);
+        widget.onBusyChanged?.call(false);
+      } else {
+        widget.onBusyChanged?.call(false);
+      }
     }
   }
 
-  String? _runTool(String name, Map<String, dynamic> args) {
+  String? _runTool(
+    String name,
+    Map<String, dynamic> args, {
+    String rawArgs = '',
+  }) {
     switch (name) {
       case 'set_title':
         widget.setters.setTitle('${args['title'] ?? ''}'.trim());
         return '已改标题';
+      case 'append_draft':
+        final append = pickDraftPlain(args, rawArgs: rawArgs);
+        if (append.isEmpty) return '追加内容为空，未改动';
+        widget.setters.appendPlain(append);
+        return '已追加正文';
+      case 'edit_span':
+        final result = applySpanEdit(widget.getters.plain(), args);
+        if (!result.ok) return result.error ?? '局部编辑失败';
+        widget.setters.replacePlain(result.next ?? '');
+        return result.tip ?? '已局部编辑';
       case 'replace_draft':
-        final plain = '${args['plain'] ?? ''}'.trim();
+        final plain = pickDraftPlain(args, rawArgs: rawArgs);
         if (plain.isEmpty) return '正文为空，未改动';
         widget.setters.replacePlain(plain);
         return '已写入正文';
@@ -612,6 +966,17 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
         widget.setters.applyFormat(args);
         return '已套用格式';
       case 'set_note_options':
+        // kind 中文别名在编辑页 _applyNoteOptions → normalizeNoteKind 处理
+        if (args.containsKey('kind')) {
+          final n = normalizeNoteKind('${args['kind']}', allowAdmonition: true);
+          if (n == null) {
+            return '未识别的类型「${args['kind']}」';
+          }
+          final next = Map<String, dynamic>.from(args);
+          next['kind'] = n;
+          widget.setters.setOptions(next);
+          return '已更新笔记选项';
+        }
         widget.setters.setOptions(args);
         return '已更新笔记选项';
       default:
@@ -623,6 +988,8 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
     required LlmEndpoint ep,
     required String draftCtx,
     required String user,
+    List<Map<String, String>> priorTurns = const [],
+    bool forceReplaceDraft = false,
   }) async {
     final base = ep.baseUrl.replaceAll(RegExp(r'/+$'), '');
     final uri = Uri.parse('$base/chat/completions');
@@ -646,10 +1013,16 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
         {'role': 'system', 'content': _system},
         {'role': 'system', 'content': draftCtx},
         ...history,
+        ...priorTurns,
         {'role': 'user', 'content': user},
       ],
       'tools': _tools,
-      'tool_choice': 'auto',
+      'tool_choice': forceReplaceDraft
+          ? {
+              'type': 'function',
+              'function': {'name': 'replace_draft'},
+            }
+          : 'auto',
     };
     final res = await http
         .post(
@@ -683,7 +1056,7 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
 
   @override
   Widget build(BuildContext context) {
-    const panelBg = Color(0xFFE8E8E8);
+    const panelBg = Color(0xFFF7F7F8);
     return Material(
       color: panelBg,
       child: Column(
@@ -771,19 +1144,20 @@ class _NoteAiPanelState extends State<NoteAiPanel> {
                             ),
                             decoration: BoxDecoration(
                               color: mine
-                                  ? const Color(0xFF111111)
-                                  : const Color(0xFFF5F5F5),
-                              borderRadius: BorderRadius.circular(10),
+                                  ? const Color(0xFFECECF0)
+                                  : Colors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: const Color(0xFFEBEBEB),
+                              ),
                             ),
                             child: Text(
                               m.text,
-                              style: TextStyle(
+                              style: const TextStyle(
                                 fontSize: 14,
                                 height: 1.4,
                                 decoration: TextDecoration.none,
-                                color: mine
-                                    ? Colors.white
-                                    : const Color(0xFF111111),
+                                color: Color(0xFF1A1A1A),
                               ),
                             ),
                           ),

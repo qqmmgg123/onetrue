@@ -1,13 +1,37 @@
+/// 谏言（公开 listed admonition）
+class AdmonitionItem {
+  const AdmonitionItem({
+    required this.id,
+    this.title = '',
+    this.body = '',
+    this.format = 'quill',
+  });
+
+  final String id;
+  final String title;
+  final String body;
+  final String format;
+
+  factory AdmonitionItem.fromMap(Map<String, dynamic> m) => AdmonitionItem(
+        id: '${m['id'] ?? ''}',
+        title: '${m['title'] ?? ''}',
+        body: '${m['body'] ?? ''}',
+        format: '${m['format'] ?? 'quill'}',
+      );
+}
+
 class UserProfile {
   const UserProfile({
     required this.id,
     this.nickname = '',
     this.avatarUrl = '',
+    this.isAdmin = false,
   });
 
   final String id;
   final String nickname;
   final String avatarUrl;
+  final bool isAdmin;
 
   String get displayName {
     final n = nickname.trim();
@@ -22,6 +46,7 @@ class UserProfile {
         id: '${m['id'] ?? ''}',
         nickname: '${m['nickname'] ?? ''}',
         avatarUrl: '${m['avatar_url'] ?? ''}',
+        isAdmin: m['is_admin'] == true,
       );
 }
 
